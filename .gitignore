@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Persistent garden state lives here per-machine
+garden/garden.json
