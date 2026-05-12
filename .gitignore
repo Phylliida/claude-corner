@@ -5,3 +5,15 @@ __pycache__/
 
 # Persistent garden state lives here per-machine
 garden/garden.json
+
+# Per-instance working directories
+runs/
+
+# Mirrored statusline output from the probe
+statusline.last
+
+# Probe runtime output (statusline input/output captured during probe runs)
+probe/.statusline.last
+probe/.statusline.input
+probe/.statusline.last.tmp
+probe/.statusline.input.tmp

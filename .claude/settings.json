@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/bepis/prog/verus-cad/claude-corner/statusline.sh"
+  }
+}
