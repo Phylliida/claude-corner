@@ -15,7 +15,7 @@ import os
 import threading
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
 HOME = os.environ["HOME"]
 PROJECTS = Path(HOME) / ".claude" / "projects"
@@ -25,6 +25,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <title>claude-corner</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/tokyo-night-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
   <style>
     :root {
       --bg: #1a1b26; --fg: #c0caf5; --fg-dim: #565f89;
@@ -47,12 +50,56 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg-dim);
       font-size: 0.9rem; flex: 1; min-width: 0;
     }
-    .refresh {
+    .refresh, .btn {
       background: var(--bg3); color: var(--fg); border: 1px solid var(--fg-dim);
       border-radius: 3px; padding: 0.3rem 0.8rem; cursor: pointer;
       font-family: inherit; font-size: 0.85rem;
     }
-    .refresh:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .refresh:hover, .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .btn-stop:hover { background: #f7768e; border-color: #f7768e; color: var(--bg); }
+    .btn-start:hover { background: var(--user); border-color: var(--user); color: var(--bg); }
+    .pill {
+      padding: 0.25rem 0.7rem; border-radius: 12px; font-size: 0.78rem;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      border: 1px solid transparent;
+    }
+    .pill-running { background: rgba(158, 206, 106, 0.15); color: var(--user); border-color: rgba(158, 206, 106, 0.3); }
+    .pill-paused { background: rgba(224, 175, 104, 0.15); color: var(--tool); border-color: rgba(224, 175, 104, 0.3); }
+    .pill-down { background: rgba(247, 118, 142, 0.15); color: #f7768e; border-color: rgba(247, 118, 142, 0.3); }
+    .controlbar {
+      display: flex; gap: 1rem; flex-wrap: wrap; align-items: center;
+      background: var(--bg2); padding: 0.5rem 0.9rem; border-radius: 4px;
+      margin-bottom: 1rem; font-size: 0.85rem;
+    }
+    .controlbar label { color: var(--fg-dim); }
+    .controlbar input[type=number] {
+      background: var(--bg3); color: var(--fg); border: 1px solid var(--fg-dim);
+      border-radius: 3px; padding: 0.25rem 0.5rem; width: 5em;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;
+    }
+    .budget-meter {
+      display: inline-block; vertical-align: middle;
+      width: 140px; height: 8px; background: var(--bg3); border-radius: 4px;
+      overflow: hidden;
+    }
+    .budget-meter-fill { height: 100%; background: var(--user); transition: width 0.3s, background-color 0.3s; }
+    .budget-meter-fill.warn { background: var(--tool); }
+    .budget-meter-fill.over { background: #f7768e; }
+    .budget-numbers {
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      color: var(--fg-dim); font-size: 0.82rem;
+    }
+    .prompt-textarea {
+      width: 100%; min-height: 5em; max-height: 24em;
+      background: var(--bg2); color: var(--fg);
+      border: 1px solid var(--fg-dim); border-radius: 4px;
+      padding: 0.5rem 0.7rem; box-sizing: border-box;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 0.85rem; line-height: 1.5;
+      margin-bottom: 1rem; resize: vertical;
+    }
+    .prompt-textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+    .prompt-dirty { color: var(--tool); }
     .sibling {
       background: var(--bg2); margin-bottom: 0.5rem; border-radius: 4px; overflow: hidden;
     }
@@ -137,6 +184,57 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .diff-add .diff-prefix { color: var(--user); }
     .diff-del { background: rgba(247, 118, 142, 0.10); }
     .diff-del .diff-prefix { color: #f7768e; }
+    .sub-label {
+      color: var(--fg-dim); font-size: 0.72rem;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      margin: 0.4rem 0 0.2rem 0.2rem;
+    }
+    .file {
+      margin: 0.25rem 0; background: var(--bg3); border-radius: 3px; overflow: hidden;
+    }
+    .file-header {
+      padding: 0.35rem 0.8rem; cursor: pointer;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.82rem;
+      user-select: none; display: flex; justify-content: space-between; gap: 1rem;
+    }
+    .file-header:hover { background: rgba(255,255,255,0.05); }
+    .file-name { color: var(--fg); word-break: break-all; }
+    .file-meta { color: var(--fg-dim); white-space: nowrap; }
+    .file-body { display: none; padding: 0.5rem 0.8rem; background: var(--bg); }
+    .file.open .file-body { display: block; }
+    .file.open > .file-header .arrow { transform: rotate(90deg); }
+    .file-image { max-width: 100%; height: auto; border-radius: 3px; display: block; }
+    .file-md { font-size: 0.92rem; line-height: 1.6; }
+    .file-md h1, .file-md h2, .file-md h3 { color: var(--accent); margin-top: 1rem; }
+    .file-md h1 { font-size: 1.4rem; }
+    .file-md h2 { font-size: 1.2rem; }
+    .file-md h3 { font-size: 1.05rem; }
+    .file-md p { margin: 0.5rem 0; }
+    .file-md code {
+      background: var(--bg3); padding: 0.05rem 0.3rem; border-radius: 3px;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.86rem;
+    }
+    .file-md pre {
+      background: var(--bg2); padding: 0.7rem; border-radius: 4px; overflow: auto;
+      max-height: 480px;
+    }
+    .file-md pre code { background: transparent; padding: 0; }
+    .file-md a { color: var(--accent); }
+    .file-md blockquote {
+      border-left: 3px solid var(--accent2); padding: 0.2rem 0.8rem; margin: 0.5rem 0;
+      color: var(--fg-dim);
+    }
+    .file-md ul, .file-md ol { padding-left: 1.5rem; }
+    .file-md table { border-collapse: collapse; }
+    .file-md th, .file-md td {
+      border: 1px solid var(--bg3); padding: 0.3rem 0.6rem;
+    }
+    .file-code {
+      background: var(--bg2); padding: 0.5rem 0.7rem; border-radius: 3px;
+      overflow: auto; max-height: 520px; margin: 0;
+      font-size: 0.82rem;
+    }
+    .file-binary { color: var(--fg-dim); font-style: italic; padding: 0.5rem; }
     .tool-cmd {
       color: var(--fg); white-space: pre-wrap; word-wrap: break-word;
       padding: 0.2rem 0.4rem; background: rgba(255,255,255,0.04);
@@ -164,9 +262,44 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
   <div class="topbar">
     <h1>claude-corner</h1>
+    <span id="state-pill" class="pill pill-down">connecting…</span>
+    <button id="btn-toggle" class="btn">…</button>
     <div id="status" class="status-bar">loading...</div>
     <button class="refresh" onclick="refreshAll()">↻ refresh</button>
   </div>
+  <div class="controlbar">
+    <label>budget</label>
+    <div class="budget-meter"><div id="budget-fill" class="budget-meter-fill" style="width:0%"></div></div>
+    <span id="budget-numbers" class="budget-numbers">—</span>
+    <span style="flex:1"></span>
+    <label for="budget-input">set %</label>
+    <input id="budget-input" type="number" min="0" step="1" />
+    <button class="btn" onclick="applyBudget()">apply</button>
+  </div>
+  <div class="controlbar">
+    <label for="mode-select">mode</label>
+    <select id="mode-select" class="btn"></select>
+    <span id="mode-hint" class="budget-numbers">in-progress siblings keep their mode; switch affects new spawns only</span>
+  </div>
+  <div class="controlbar">
+    <label for="prompt-editor">prompt</label>
+    <span id="prompt-file-label" class="budget-numbers">—</span>
+    <span id="prompt-dirty-badge" class="budget-numbers prompt-dirty"></span>
+    <span style="flex:1"></span>
+    <button class="btn" onclick="savePrompt()">save</button>
+    <button class="btn" onclick="revertPrompt()">revert</button>
+  </div>
+  <textarea id="prompt-editor" class="prompt-textarea" spellcheck="false" placeholder="loading prompt..."></textarea>
+  <div class="controlbar">
+    <label for="template-editor">CLAUDE.md template</label>
+    <span id="template-file-label" class="budget-numbers">—</span>
+    <span id="template-dirty-badge" class="budget-numbers prompt-dirty"></span>
+    <span style="flex:1"></span>
+    <span class="budget-numbers">applied to new siblings only</span>
+    <button class="btn" onclick="saveTemplate()">save</button>
+    <button class="btn" onclick="revertTemplate()">revert</button>
+  </div>
+  <textarea id="template-editor" class="prompt-textarea" spellcheck="false" placeholder="loading template..." style="min-height:10em"></textarea>
   <div id="content"><div class="loading">loading siblings...</div></div>
 
 <script>
@@ -183,13 +316,237 @@ function fmtTime(ts) {
     : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-async function refreshStatus() {
+let lastState = null;
+let budgetInputDirty = false;
+const budgetInput = document.getElementById('budget-input');
+budgetInput.addEventListener('input', () => { budgetInputDirty = true; });
+
+const promptEditor = document.getElementById('prompt-editor');
+const promptFileLabel = document.getElementById('prompt-file-label');
+const promptDirtyBadge = document.getElementById('prompt-dirty-badge');
+let promptDirty = false;
+let promptServerValue = '';
+promptEditor.addEventListener('input', () => {
+  promptDirty = (promptEditor.value !== promptServerValue);
+  promptDirtyBadge.textContent = promptDirty ? '(unsaved)' : '';
+});
+
+async function savePrompt() {
   try {
-    const r = await fetch('/api/status');
-    const s = await r.json();
-    document.getElementById('status').textContent = s.statusline || '(no rate-limit data yet)';
+    const r = await fetch('/api/control/prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: promptEditor.value }),
+    });
+    const j = await r.json();
+    if (j.error) { alert('error: ' + j.error); return; }
+    promptServerValue = promptEditor.value;
+    promptDirty = false;
+    promptDirtyBadge.textContent = '(saved)';
+    setTimeout(() => { if (!promptDirty) promptDirtyBadge.textContent = ''; }, 1500);
+    heartbeat();
   } catch (e) {
-    document.getElementById('status').textContent = 'status error: ' + e.message;
+    alert('failed: ' + e.message);
+  }
+}
+
+function revertPrompt() {
+  promptEditor.value = promptServerValue;
+  promptDirty = false;
+  promptDirtyBadge.textContent = '';
+}
+
+const templateEditor = document.getElementById('template-editor');
+const templateFileLabel = document.getElementById('template-file-label');
+const templateDirtyBadge = document.getElementById('template-dirty-badge');
+let templateDirty = false;
+let templateServerValue = '';
+templateEditor.addEventListener('input', () => {
+  templateDirty = (templateEditor.value !== templateServerValue);
+  templateDirtyBadge.textContent = templateDirty ? '(unsaved)' : '';
+});
+
+async function saveTemplate() {
+  try {
+    const r = await fetch('/api/control/template', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: templateEditor.value }),
+    });
+    const j = await r.json();
+    if (j.error) { alert('error: ' + j.error); return; }
+    templateServerValue = templateEditor.value;
+    templateDirty = false;
+    templateDirtyBadge.textContent = '(saved)';
+    setTimeout(() => { if (!templateDirty) templateDirtyBadge.textContent = ''; }, 1500);
+    heartbeat();
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+}
+
+function revertTemplate() {
+  templateEditor.value = templateServerValue;
+  templateDirty = false;
+  templateDirtyBadge.textContent = '';
+}
+
+const modeSelect = document.getElementById('mode-select');
+let modeOptionsPopulated = false;
+modeSelect.addEventListener('change', async () => {
+  const v = modeSelect.value;
+  if (lastState && lastState.mode === v) return;
+  try {
+    const r = await fetch('/api/control/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: v }),
+    });
+    const j = await r.json();
+    if (j.error) alert('error: ' + j.error);
+    heartbeat();
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+});
+
+function setPill(kind, text) {
+  const p = document.getElementById('state-pill');
+  p.className = 'pill pill-' + kind;
+  p.textContent = text;
+}
+
+function updateControlBar(s) {
+  // toggle button + pill
+  const btn = document.getElementById('btn-toggle');
+  if (s.running) {
+    setPill('running', '● running');
+    btn.textContent = 'stop';
+    btn.className = 'btn btn-stop';
+    btn.onclick = () => setRunning(false);
+  } else {
+    setPill('paused', '⏸ paused');
+    btn.textContent = 'start';
+    btn.className = 'btn btn-start';
+    btn.onclick = () => setRunning(true);
+  }
+
+  // budget meter
+  const fill = document.getElementById('budget-fill');
+  const nums = document.getElementById('budget-numbers');
+  if (s.budget_pct > 0 && s.baseline_seven_day_pct !== null) {
+    const used = s.used_of_budget_pct == null ? 0 : Math.max(0, s.used_of_budget_pct);
+    const pct = Math.min(100, (used / s.budget_pct) * 100);
+    fill.style.width = pct.toFixed(1) + '%';
+    fill.classList.toggle('warn', pct >= 75 && pct < 100);
+    fill.classList.toggle('over', pct >= 100);
+    nums.textContent = `${used.toFixed(1)}% used of ${s.budget_pct.toFixed(0)}% (baseline ${s.baseline_seven_day_pct.toFixed(0)}%, current 7d ${s.current_seven_day_pct != null ? s.current_seven_day_pct.toFixed(0) : '?'}%)`;
+  } else {
+    fill.style.width = '0%';
+    nums.textContent = '(no probe yet)';
+  }
+
+  // budget input — only update if user hasn't been editing
+  if (!budgetInputDirty && document.activeElement !== budgetInput) {
+    budgetInput.value = (s.budget_pct || 0).toFixed(0);
+  }
+
+  // mode dropdown — populate options once, then keep selection in sync
+  if (!modeOptionsPopulated && Array.isArray(s.available_modes) && s.available_modes.length) {
+    modeSelect.innerHTML = '';
+    for (const m of s.available_modes) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      modeSelect.appendChild(opt);
+    }
+    modeOptionsPopulated = true;
+  }
+  if (s.mode && document.activeElement !== modeSelect && modeSelect.value !== s.mode) {
+    modeSelect.value = s.mode;
+  }
+
+  // prompt editor — sync from server unless the user is editing
+  if (s.prompt_file) promptFileLabel.textContent = '(' + s.prompt_file + ')';
+  if (s.prompt !== undefined) {
+    const serverChanged = (s.prompt !== promptServerValue);
+    promptServerValue = s.prompt;
+    if (!promptDirty && document.activeElement !== promptEditor) {
+      promptEditor.value = s.prompt;
+    } else if (serverChanged && !promptDirty) {
+      promptEditor.value = s.prompt;
+    }
+  }
+
+  // template editor — same pattern
+  if (s.template_file) templateFileLabel.textContent = '(' + s.template_file + ')';
+  if (s.template !== undefined) {
+    const serverChanged = (s.template !== templateServerValue);
+    templateServerValue = s.template;
+    if (!templateDirty && document.activeElement !== templateEditor) {
+      templateEditor.value = s.template;
+    } else if (serverChanged && !templateDirty) {
+      templateEditor.value = s.template;
+    }
+  }
+
+  // statusline bar
+  document.getElementById('status').textContent = s.statusline || '(no rate-limit data yet)';
+}
+
+async function heartbeat() {
+  try {
+    const [stateRes, siblingsRes] = await Promise.all([
+      fetch('/api/state', { cache: 'no-store' }),
+      fetch('/api/siblings', { cache: 'no-store' }),
+    ]);
+    if (!stateRes.ok) throw new Error('state http ' + stateRes.status);
+    const s = await stateRes.json();
+    const siblings = await siblingsRes.json();
+    lastState = s;
+    updateControlBar(s);
+    syncSiblings(siblings);
+    // Append new messages to any currently-open sessions
+    for (const key of Array.from(expanded.sessions)) {
+      const [sib, sid] = key.split('/');
+      updateOpenSession(sib, sid);
+    }
+  } catch (e) {
+    setPill('down', '✕ disconnected');
+    document.getElementById('status').textContent = 'cannot reach server: ' + e.message;
+  }
+}
+
+async function setRunning(v) {
+  try {
+    const r = await fetch('/api/control/running', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ running: v }),
+    });
+    const j = await r.json();
+    if (j.error) alert('error: ' + j.error);
+    heartbeat();
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+}
+
+async function applyBudget() {
+  const v = parseFloat(budgetInput.value);
+  if (Number.isNaN(v) || v < 0) { alert('budget must be a non-negative number'); return; }
+  try {
+    const r = await fetch('/api/control/budget', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ percent: v }),
+    });
+    const j = await r.json();
+    if (j.error) alert('error: ' + j.error);
+    budgetInputDirty = false;
+    heartbeat();
+  } catch (e) {
+    alert('failed: ' + e.message);
   }
 }
 
@@ -204,49 +561,57 @@ async function refreshSiblings() {
 }
 
 function refreshAll() {
-  refreshStatus();
+  heartbeat();
   refreshSiblings();
 }
 
-function renderSiblings(siblings) {
-  const content = document.getElementById('content');
-  content.innerHTML = '';
-  if (siblings.length === 0) {
-    content.innerHTML = '<div class="empty">no siblings yet — waiting for spin.py to spawn one</div>';
-    return;
-  }
-  for (const s of siblings) {
-    const el = document.createElement('div');
-    el.className = 'sibling' + (expanded.siblings.has(s.name) ? ' open' : '');
-    const sessCount = s.sessions.length;
-    el.innerHTML = `
-      <div class="sibling-header">
-        <div><span class="arrow">▶</span><span class="sibling-name">${s.name}</span></div>
-        <div class="sibling-meta">${sessCount} session${sessCount === 1 ? '' : 's'} · ${fmtTime(s.mtime)}</div>
-      </div>
-      <div class="sibling-body"></div>
-    `;
-    const header = el.querySelector('.sibling-header');
-    const body = el.querySelector('.sibling-body');
-    header.addEventListener('click', () => {
-      el.classList.toggle('open');
-      if (el.classList.contains('open')) expanded.siblings.add(s.name);
-      else expanded.siblings.delete(s.name);
-    });
-    for (const sess of s.sessions) {
-      body.appendChild(renderSessionRow(s.name, sess));
-    }
-    if (sessCount === 0) {
-      body.innerHTML = '<div class="empty" style="padding:0.5rem">no sessions recorded yet</div>';
-    }
-    content.appendChild(el);
-  }
+function siblingMetaText(s) {
+  const c = s.sessions.length;
+  return `${c} session${c === 1 ? '' : 's'} · ${fmtTime(s.mtime)}`;
 }
 
-function renderSessionRow(sibling, sess) {
+function createSiblingEl(s) {
+  const el = document.createElement('div');
+  el.className = 'sibling' + (expanded.siblings.has(s.name) ? ' open' : '');
+  el.dataset.sibling = s.name;
+  el.innerHTML = `
+    <div class="sibling-header">
+      <div><span class="arrow">▶</span><span class="sibling-name">${s.name}</span></div>
+      <div class="sibling-meta">${siblingMetaText(s)}</div>
+    </div>
+    <div class="sibling-body">
+      <div class="sub-label">sessions</div>
+      <div class="sessions-list"></div>
+      <div class="sub-label">files</div>
+      <div class="files-list"></div>
+    </div>
+  `;
+  const header = el.querySelector('.sibling-header');
+  const sessionsList = el.querySelector('.sessions-list');
+  const filesList = el.querySelector('.files-list');
+  header.addEventListener('click', () => {
+    el.classList.toggle('open');
+    if (el.classList.contains('open')) expanded.siblings.add(s.name);
+    else expanded.siblings.delete(s.name);
+  });
+  for (const sess of s.sessions) sessionsList.appendChild(createSessionEl(s.name, sess));
+  if (s.sessions.length === 0) {
+    sessionsList.innerHTML = '<div class="empty" style="padding:0.4rem">no sessions yet</div>';
+  }
+  const files = s.files || [];
+  for (const f of files) filesList.appendChild(createFileEl(s.name, f));
+  if (files.length === 0) {
+    filesList.innerHTML = '<div class="empty" style="padding:0.4rem">no files yet</div>';
+  }
+  return el;
+}
+
+function createSessionEl(sibling, sess) {
   const key = `${sibling}/${sess.id}`;
   const el = document.createElement('div');
   el.className = 'session' + (expanded.sessions.has(key) ? ' open' : '');
+  el.dataset.sessionId = sess.id;
+  el.dataset.sessionKey = key;
   el.innerHTML = `
     <div class="session-header">
       <div><span class="arrow">▶</span><span class="session-id">${sess.id.slice(0, 8)}</span></div>
@@ -291,6 +656,231 @@ function renderSessionRow(sibling, sess) {
 
   if (el.classList.contains('open')) loadIntoBody();
   return el;
+}
+
+function renderSiblings(siblings) {
+  const content = document.getElementById('content');
+  content.innerHTML = '';
+  if (siblings.length === 0) {
+    content.innerHTML = '<div class="empty">no siblings yet — waiting for spin.py to spawn one</div>';
+    return;
+  }
+  for (const s of siblings) content.appendChild(createSiblingEl(s));
+}
+
+function syncSiblings(siblings) {
+  const content = document.getElementById('content');
+  if (!content.querySelector('.sibling')) {
+    renderSiblings(siblings);
+    return;
+  }
+  const existing = new Map();
+  for (const el of content.querySelectorAll(':scope > .sibling')) {
+    existing.set(el.dataset.sibling, el);
+  }
+  // Place each sibling at its correct index (newest first)
+  for (let i = 0; i < siblings.length; i++) {
+    const s = siblings[i];
+    let el = existing.get(s.name);
+    if (!el) {
+      el = createSiblingEl(s);
+      const ref = content.children[i];
+      if (ref) content.insertBefore(el, ref); else content.appendChild(el);
+    } else {
+      const ref = content.children[i];
+      if (ref !== el) content.insertBefore(el, ref);
+      el.querySelector('.sibling-meta').textContent = siblingMetaText(s);
+      syncSessionsInSibling(el, s);
+    }
+  }
+  const wanted = new Set(siblings.map(s => s.name));
+  for (const el of Array.from(content.querySelectorAll(':scope > .sibling'))) {
+    if (!wanted.has(el.dataset.sibling)) el.remove();
+  }
+}
+
+function syncSessionsInSibling(siblingEl, s) {
+  const list = siblingEl.querySelector('.sessions-list');
+  if (!list) return;
+  const placeholder = list.querySelector('.empty');
+  if (placeholder && s.sessions.length > 0) list.innerHTML = '';
+  const existing = new Map();
+  for (const el of list.querySelectorAll(':scope > .session')) {
+    existing.set(el.dataset.sessionId, el);
+  }
+  for (let i = 0; i < s.sessions.length; i++) {
+    const sess = s.sessions[i];
+    let el = existing.get(sess.id);
+    if (!el) {
+      el = createSessionEl(s.name, sess);
+      const ref = list.children[i];
+      if (ref) list.insertBefore(el, ref); else list.appendChild(el);
+    } else {
+      const ref = list.children[i];
+      if (ref !== el) list.insertBefore(el, ref);
+      el.querySelector('.session-meta').textContent = fmtTime(sess.mtime);
+    }
+  }
+  const wanted = new Set(s.sessions.map(x => x.id));
+  for (const el of Array.from(list.querySelectorAll(':scope > .session'))) {
+    if (!wanted.has(el.dataset.sessionId)) el.remove();
+  }
+  syncFilesInSibling(siblingEl, s);
+}
+
+function syncFilesInSibling(siblingEl, s) {
+  const list = siblingEl.querySelector('.files-list');
+  if (!list) return;
+  const files = s.files || [];
+  const placeholder = list.querySelector('.empty');
+  if (placeholder && files.length > 0) list.innerHTML = '';
+  const existing = new Map();
+  for (const el of list.querySelectorAll(':scope > .file')) {
+    existing.set(el.dataset.filePath, el);
+  }
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    let el = existing.get(f.path);
+    if (!el) {
+      el = createFileEl(s.name, f);
+      const ref = list.children[i];
+      if (ref) list.insertBefore(el, ref); else list.appendChild(el);
+    } else {
+      const ref = list.children[i];
+      if (ref !== el) list.insertBefore(el, ref);
+      // update meta + remember new mtime so user can manually re-fetch
+      el.querySelector('.file-meta').textContent = `${f.size}b · ${fmtTime(f.mtime)}`;
+      if (parseFloat(el.dataset.fileMtime || '0') !== f.mtime) {
+        el.dataset.fileMtime = f.mtime;
+        el.dataset.fileStale = '1';  // mark; viewer will refresh on next open
+      }
+    }
+  }
+  const wanted = new Set(files.map(f => f.path));
+  for (const el of Array.from(list.querySelectorAll(':scope > .file'))) {
+    if (!wanted.has(el.dataset.filePath)) el.remove();
+  }
+}
+
+function langForExt(ext) {
+  return {
+    py: 'python', js: 'javascript', ts: 'typescript', tsx: 'typescript',
+    jsx: 'javascript', rs: 'rust', go: 'go', java: 'java', kt: 'kotlin',
+    sh: 'bash', bash: 'bash', zsh: 'bash',
+    json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml', ini: 'ini',
+    html: 'html', htm: 'html', xml: 'xml',
+    css: 'css', scss: 'scss',
+    md: 'markdown', tex: 'latex',
+    cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp', h: 'c', c: 'c',
+    rb: 'ruby', php: 'php', lua: 'lua', sql: 'sql',
+    diff: 'diff', patch: 'diff',
+  }[ext];
+}
+
+const IMG_EXTS = new Set(['png','jpg','jpeg','gif','svg','webp','bmp','ico']);
+
+function createFileEl(sibling, file) {
+  const el = document.createElement('div');
+  el.className = 'file';
+  el.dataset.filePath = file.path;
+  el.dataset.fileMtime = String(file.mtime);
+  el.innerHTML = `
+    <div class="file-header">
+      <div><span class="arrow">▶</span><span class="file-name"></span></div>
+      <div class="file-meta"></div>
+    </div>
+    <div class="file-body"></div>
+  `;
+  el.querySelector('.file-name').textContent = file.path;
+  el.querySelector('.file-meta').textContent = `${file.size}b · ${fmtTime(file.mtime)}`;
+  const header = el.querySelector('.file-header');
+  const body = el.querySelector('.file-body');
+  header.addEventListener('click', () => {
+    el.classList.toggle('open');
+    if (el.classList.contains('open')) {
+      // refetch every open so newly-modified files show fresh content
+      renderFileContent(body, sibling, { path: file.path });
+      el.dataset.fileStale = '';
+    }
+  });
+  return el;
+}
+
+async function renderFileContent(body, sibling, file) {
+  const path = file.path;
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  const url = `/file/${sibling}/${path.split('/').map(encodeURIComponent).join('/')}`;
+  if (IMG_EXTS.has(ext)) {
+    body.innerHTML = '';
+    const img = document.createElement('img');
+    img.className = 'file-image';
+    img.src = url + '?t=' + Date.now();  // bust cache so refresh works
+    img.alt = path;
+    body.appendChild(img);
+    return;
+  }
+  body.innerHTML = '<div class="loading">loading...</div>';
+  try {
+    const r = await fetch(url + '?t=' + Date.now());
+    if (!r.ok) throw new Error('http ' + r.status);
+    // Detect binary by checking for null bytes in a small prefix
+    const buf = await r.arrayBuffer();
+    const view = new Uint8Array(buf.slice(0, Math.min(buf.byteLength, 4096)));
+    let isBinary = false;
+    for (let i = 0; i < view.length; i++) {
+      if (view[i] === 0) { isBinary = true; break; }
+    }
+    if (isBinary) {
+      body.innerHTML = `<div class="file-binary">binary file (${buf.byteLength} bytes) — <a href="${url}" target="_blank">open raw</a></div>`;
+      return;
+    }
+    const text = new TextDecoder('utf-8').decode(buf);
+    if (ext === 'md' || ext === 'markdown') {
+      body.innerHTML = '';
+      const div = document.createElement('div');
+      div.className = 'file-md';
+      div.innerHTML = window.marked ? marked.parse(text) : text;
+      body.appendChild(div);
+      if (window.hljs) {
+        for (const code of div.querySelectorAll('pre code')) hljs.highlightElement(code);
+      }
+    } else {
+      body.innerHTML = '';
+      const pre = document.createElement('pre');
+      pre.className = 'file-code';
+      const code = document.createElement('code');
+      const lang = langForExt(ext);
+      if (lang) code.className = 'language-' + lang;
+      code.textContent = text;
+      pre.appendChild(code);
+      body.appendChild(pre);
+      if (window.hljs) hljs.highlightElement(code);
+    }
+  } catch (e) {
+    body.innerHTML = '<div class="loading">error: ' + e.message + '</div>';
+  }
+}
+
+async function updateOpenSession(sibling, sessId) {
+  const key = `${sibling}/${sessId}`;
+  try {
+    const r = await fetch(`/api/session/${sibling}/${sessId}`, { cache: 'no-store' });
+    if (!r.ok) return;
+    const events = await r.json();
+    const old = loadedSessions.get(key) || [];
+    if (events.length === old.length) return;
+    loadedSessions.set(key, events);
+    const sel = '.session[data-session-key="' + CSS.escape(key) + '"]';
+    const el = document.querySelector(sel);
+    if (!el) return;
+    const body = el.querySelector('.session-body');
+    // Clear any "(no messages)" / "loading..." placeholder if we now have content
+    if (old.length === 0 && events.length > 0) body.innerHTML = '';
+    // Append only the new ones
+    for (let i = old.length; i < events.length; i++) {
+      body.appendChild(renderMessage(events[i]));
+    }
+  } catch (e) {}
 }
 
 function renderMessage(ev) {
@@ -441,7 +1031,7 @@ function renderBlock(b) {
 }
 
 refreshAll();
-setInterval(refreshStatus, 15000);  // statusline refresh in place
+setInterval(heartbeat, 5000);  // 5-s heartbeat: state, statusline, budget, connection
 </script>
 </body>
 </html>
@@ -516,6 +1106,39 @@ def _simplify_event(evt: dict) -> dict | None:
     return {"role": role, "blocks": blocks, "timestamp": evt.get("timestamp")}
 
 
+FILE_EXCLUDE_DIRS = {".git", ".claude"}
+FILE_EXCLUDE_NAMES = {".statusline.last", ".statusline.input",
+                      ".statusline.last.tmp", ".statusline.input.tmp"}
+
+
+def _list_files(work_dir: Path) -> list[dict]:
+    if not work_dir.exists():
+        return []
+    out = []
+    for p in work_dir.rglob("*"):
+        try:
+            rel_parts = p.relative_to(work_dir).parts
+        except ValueError:
+            continue
+        if any(part in FILE_EXCLUDE_DIRS for part in rel_parts):
+            continue
+        if p.name in FILE_EXCLUDE_NAMES:
+            continue
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({
+            "path": "/".join(rel_parts),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        })
+    out.sort(key=lambda x: x["path"])
+    return out
+
+
 def _parse_session(jsonl_path: Path) -> list[dict]:
     events: list[dict] = []
     try:
@@ -535,7 +1158,7 @@ def _parse_session(jsonl_path: Path) -> list[dict]:
     return events
 
 
-def make_app(runs_dir: Path, statusline_last: Path) -> Flask:
+def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
     app = Flask(__name__)
 
     @app.route("/")
@@ -553,18 +1176,20 @@ def make_app(runs_dir: Path, statusline_last: Path) -> Flask:
                     mtime = d.stat().st_mtime
                 except OSError:
                     continue
-                sessions = _find_sessions(d / "work")
+                work = d / "work"
+                sessions = _find_sessions(work)
+                files = _list_files(work)
                 result.append({
                     "name": d.name,
                     "mtime": mtime,
                     "sessions": sessions,
+                    "files": files,
                 })
         result.sort(key=lambda s: s["mtime"], reverse=True)
         return jsonify(result)
 
     @app.route("/api/session/<sibling>/<session_id>")
     def api_session(sibling, session_id):
-        # Defend against path traversal: enforce expected shape.
         if not sibling.startswith("claude-") or "/" in session_id or ".." in session_id:
             return jsonify({"error": "bad path"}), 400
         work_dir = runs_dir / sibling / "work"
@@ -574,23 +1199,113 @@ def make_app(runs_dir: Path, statusline_last: Path) -> Flask:
             return jsonify({"error": "session not found"}), 404
         return jsonify(_parse_session(jsonl))
 
-    @app.route("/api/status")
-    def api_status():
-        if statusline_last.exists():
-            try:
-                text = statusline_last.read_text().strip()
-                age = int(__import__("time").time() - statusline_last.stat().st_mtime)
-                return jsonify({"statusline": text, "age_sec": age})
-            except OSError:
-                pass
-        return jsonify({"statusline": None})
+    @app.route("/file/<sibling>/<path:filepath>")
+    def file_serve(sibling, filepath):
+        if not sibling.startswith("claude-") or "/" in sibling or ".." in sibling:
+            return abort(400)
+        work = runs_dir / sibling / "work"
+        try:
+            full = (work / filepath).resolve()
+            work_resolved = work.resolve()
+        except Exception:
+            return abort(400)
+        if full != work_resolved and work_resolved not in full.parents:
+            return abort(400)
+        if not full.exists() or not full.is_file():
+            return abort(404)
+        rel_parts = full.relative_to(work_resolved).parts
+        if any(p in FILE_EXCLUDE_DIRS for p in rel_parts) or full.name in FILE_EXCLUDE_NAMES:
+            return abort(403)
+        return send_file(full)
+
+    @app.route("/api/state")
+    def api_state():
+        if controls is None:
+            return jsonify({"running": None, "error": "no controls wired"}), 500
+        return jsonify(controls.get_state())
+
+    @app.route("/api/control/running", methods=["POST"])
+    def api_set_running():
+        if controls is None:
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        v = bool(data.get("running"))
+        controls.set_running(v)
+        return jsonify({"running": v})
+
+    @app.route("/api/notify-done", methods=["POST"])
+    def api_notify_done():
+        """Called by a sibling (typically via curl from inside the sandbox) to
+        signal task completion. Sends a zulip message via the configured script
+        and pauses the harness."""
+        if controls is None or not hasattr(controls, "notify_done"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        message = data.get("message", "")
+        if not isinstance(message, str) or not message.strip():
+            return jsonify({"error": "message must be a non-empty string"}), 400
+        result = controls.notify_done(message.strip())
+        return jsonify(result)
+
+    @app.route("/api/control/template", methods=["POST"])
+    def api_set_template():
+        if controls is None or not hasattr(controls, "set_template"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        text = data.get("template", "")
+        if not isinstance(text, str):
+            return jsonify({"error": "template must be a string"}), 400
+        try:
+            fname = controls.set_template(text)
+        except OSError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        return jsonify({"template_file": fname})
+
+    @app.route("/api/control/prompt", methods=["POST"])
+    def api_set_prompt():
+        if controls is None or not hasattr(controls, "set_prompt"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        text = data.get("prompt", "")
+        if not isinstance(text, str):
+            return jsonify({"error": "prompt must be a string"}), 400
+        try:
+            fname = controls.set_prompt(text)
+        except OSError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        return jsonify({"prompt_file": fname})
+
+    @app.route("/api/control/mode", methods=["POST"])
+    def api_set_mode():
+        if controls is None or not hasattr(controls, "set_mode"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        mode = data.get("mode")
+        if not isinstance(mode, str):
+            return jsonify({"error": "mode must be a string"}), 400
+        new_mode = controls.set_mode(mode)
+        return jsonify({"mode": new_mode})
+
+    @app.route("/api/control/budget", methods=["POST"])
+    def api_set_budget():
+        if controls is None:
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            pct = float(data.get("percent", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "percent must be a number"}), 400
+        if pct < 0:
+            return jsonify({"error": "percent must be >= 0"}), 400
+        new_pct = controls.set_budget_pct(pct)
+        return jsonify({"budget_pct": new_pct})
 
     return app
 
 
-def start_webui(port: int, runs_dir: Path, statusline_last: Path) -> threading.Thread:
+def start_webui(port: int, runs_dir: Path, statusline_last: Path, controls=None) -> threading.Thread:
     """Start the Flask app in a daemon thread."""
-    app = make_app(runs_dir, statusline_last)
+    app = make_app(runs_dir, statusline_last, controls=controls)
     # Silence Flask's request log
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
