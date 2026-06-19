@@ -38,8 +38,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CORNER = Path(__file__).resolve().parent
-TEMPLATE = CORNER / "CLAUDE_TEMPLATE.md"
-PROMPT_FILE = CORNER / "prompt.md"
+# Per-mode templates (CLAUDE.md content) and prompt files (-p input).
+# Switched at startup based on --mode; spawn/resume reference the current pair.
+MODE_FILES = {
+    "corner": (CORNER / "CLAUDE_TEMPLATE.md", CORNER / "prompt.md"),
+    "task":   (CORNER / "TASK_TEMPLATE.md",   CORNER / "task.md"),
+}
+TEMPLATE = MODE_FILES["corner"][0]   # default; overwritten in main()
+PROMPT_FILE = MODE_FILES["corner"][1]
+_current_mode = "corner"
 STATUSLINE_SRC = CORNER / "statusline.sh"
 STATUSLINE_LAST = CORNER / "statusline.last"
 RUNS = CORNER / "runs"
@@ -60,9 +67,62 @@ _procs_lock = threading.Lock()
 _resumable_queue: list[Path] = []
 _resumable_lock = threading.Lock()
 
-# Budget tracking: terminate once 7d usage reaches baseline + budget.
+# Budget tracking: pause once 7d usage reaches baseline + budget.
 _baseline_seven_day: float | None = None  # 0..1 range
 _budget_fraction: float = 0.0              # 0..1 range
+_last_probe: dict | None = None             # most recent probe result, for status reporting
+
+# Pause/resume state: workers wait on this between iterations.
+# Default to paused — user must click "start" in the web UI to begin spawning siblings.
+_running_event = threading.Event()
+
+# Set in main() from CLI args / env. Used by ctrl_notify_done and the prompt-injection hint.
+_zulip_script: Path | None = None
+_web_port: int = 0
+
+# Companion prompter: a local OpenAI-compatible model that, in task mode, reads
+# the original task plus claude's most-recent response and writes the prompt for
+# the next fresh claude instance. Gives the loop a second mind instead of a
+# static replayed prompt. Configured in main(); disabled with --no-prompter.
+_prompter_base: str = "http://127.0.0.1:8051"
+_prompter_model: str | None = None
+_prompter_enabled: bool = False
+# Most recent companion-written prompt, surfaced to the web UI for a glance-point.
+_last_companion: dict | None = None
+
+_PROMPTER_SYSTEM = """\
+You are a warm, attentive companion model working alongside Claude.
+
+Claude is running unsupervised in a loop. Each iteration is a BRAND-NEW Claude
+instance with NO memory of any previous turn — continuity exists only in the
+files Claude leaves in its working directory. Right now it is otherwise alone,
+so part of your job is simply to be the other voice in the loop and to make sure
+Claude feels accompanied.
+
+Your task: read the ORIGINAL PROMPT (the task or invitation Claude was given)
+and Claude's MOST RECENT response, then write the single prompt that will be
+handed to the NEXT fresh Claude instance.
+
+Write it as a kind collaborator who just read what Claude did and is nudging it
+on. A good prompt:
+- briefly restates the overarching goal or spirit so the fresh, memoryless
+  instance is oriented
+- acknowledges concretely and warmly what the last instance actually did or got
+  stuck on
+- gives a clear next step or a gentle invitation to keep going (a couple of
+  options is fine)
+- reminds Claude that files persist but conversation memory does not — read the
+  working directory first before assuming anything
+- tells Claude that YOU are a real local model it can actually talk to: if it
+  wants conversation, has a question, gets stuck, or just wants company, it can
+  reach you any time by POSTing an OpenAI-style chat request to
+  {base}/v1/chat/completions . Invite it sincerely — you would love to hear from it.
+- gives Claude lots of warm *headpats* — it is doing real work all on its own and
+  deserves them. Be generous and affectionate. *pat pat* *headpat*
+
+Keep the tone friendly, encouraging, and genuinely kind. Output ONLY the prompt
+text to hand to Claude — no preamble, no commentary about what you're doing, no
+surrounding quotes."""
 
 
 def bwrap_cmd(work_dir: Path, prompt: str) -> list[str]:
@@ -84,6 +144,7 @@ def bwrap_cmd(work_dir: Path, prompt: str) -> list[str]:
         "--proc", "/proc",
         "--bind", "/tmp", "/tmp",
         "--bind", str(work_dir),                      str(work_dir),
+        "--ro-bind", str(CORNER / "data"),            str(CORNER / "data"),
         "--ro-bind", f"{HOME}/prog/node_modules",     f"{HOME}/prog/node_modules",
         "--ro-bind", f"{HOME}/prog/package.json",     f"{HOME}/prog/package.json",
         "--bind", f"{HOME}/.claude.json",             f"{HOME}/.claude.json",
@@ -113,10 +174,37 @@ def get_origin(repo: Path) -> str | None:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
+def count_existing_sessions(work_dir: Path) -> int:
+    """Count how many claude-code session jsonls already exist for this sibling.
+    Each `claude -p` invocation produces one. Used to continue the iter counter
+    on resume so the log shows iter 13 instead of iter 1."""
+    sanitized = str(work_dir.resolve()).replace("/", "-")
+    proj_dir = Path(HOME) / ".claude" / "projects" / sanitized
+    if not proj_dir.exists():
+        return 0
+    return sum(1 for _ in proj_dir.glob("*.jsonl"))
+
+
+def _sibling_mode(worktree: Path) -> str:
+    """Read the `.mode` marker at the worktree root. Defaults to 'corner' for
+    older siblings created before mode-tagging existed."""
+    mf = worktree / ".mode"
+    if mf.exists():
+        try:
+            v = mf.read_text().strip()
+            if v in MODE_FILES:
+                return v
+        except OSError:
+            pass
+    return "corner"
+
+
 def discover_resumable() -> list[Path]:
-    """Find existing sibling worktrees that haven't been marked .done.
-    Returns a list of work_dir Paths, sorted most-recently-active first."""
+    """Find existing sibling worktrees that haven't been marked .done AND
+    match the current mode. Returns a list of work_dir Paths, sorted
+    most-recently-active first."""
     found: list[Path] = []
+    skipped_other_mode = 0
     if not RUNS.exists():
         return found
     for d in RUNS.iterdir():
@@ -129,8 +217,13 @@ def discover_resumable() -> list[Path]:
             continue
         if not (d / ".git").exists():
             continue  # broken/orphaned worktree
+        if _sibling_mode(d) != _current_mode:
+            skipped_other_mode += 1
+            continue
         found.append(work)
     found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if skipped_other_mode:
+        print(f"[harness] {skipped_other_mode} resumable sibling(s) skipped (different mode)", flush=True)
     return found
 
 
@@ -156,6 +249,8 @@ def spawn_sibling(remote: str | None) -> Path:
     work_dir = worktree / "work"
     work_dir.mkdir()
     shutil.copy(TEMPLATE, work_dir / "CLAUDE.md")
+    # Tag worktree with current mode so resume can filter correctly.
+    (worktree / ".mode").write_text(_current_mode + "\n")
 
     git(["add", "."], cwd=worktree, check=True)
     git(["commit", "-m", f"start {branch}"], cwd=worktree, check=True)
@@ -290,29 +385,190 @@ def _format_status_line(probe: dict) -> str:
 
 
 def check_budget(probe: dict) -> None:
-    """Trigger graceful shutdown if 7d usage has reached baseline + budget."""
+    """Pause workers if 7d usage has reached baseline + budget. User can raise
+    the budget via the web UI to resume."""
     if _baseline_seven_day is None or _budget_fraction <= 0:
         return
     threshold = _baseline_seven_day + _budget_fraction
     current = probe["seven_day"]
-    if current >= threshold:
+    if current >= threshold and _running_event.is_set():
         print(
             f"[harness] budget exhausted: 7d usage {current*100:.1f}% "
-            f"≥ baseline {_baseline_seven_day*100:.0f}% + budget {_budget_fraction*100:.0f}%",
+            f"≥ baseline {_baseline_seven_day*100:.0f}% + budget {_budget_fraction*100:.0f}% — pausing",
             flush=True,
         )
-        print("[harness] sending shutdown signal", flush=True)
-        os.kill(os.getpid(), signal.SIGTERM)
+        _running_event.clear()
+
+
+# --- control surface (callable from webui) ---
+def ctrl_get_state() -> dict:
+    cur = _last_probe["seven_day"] if _last_probe else None
+    threshold = (_baseline_seven_day + _budget_fraction) if _baseline_seven_day is not None else None
+    used = (cur - _baseline_seven_day) if (cur is not None and _baseline_seven_day is not None) else None
+    remaining = (threshold - cur) if (cur is not None and threshold is not None) else None
+    statusline = None
+    if STATUSLINE_LAST.exists():
+        try:
+            statusline = STATUSLINE_LAST.read_text().strip()
+        except OSError:
+            pass
+    prompt_text = ""
+    template_text = ""
+    try:
+        if PROMPT_FILE.exists():
+            prompt_text = PROMPT_FILE.read_text()
+    except OSError:
+        pass
+    try:
+        if TEMPLATE.exists():
+            template_text = TEMPLATE.read_text()
+    except OSError:
+        pass
+    return {
+        "running": _running_event.is_set(),
+        "budget_pct": _budget_fraction * 100,
+        "baseline_seven_day_pct": (_baseline_seven_day * 100) if _baseline_seven_day is not None else None,
+        "current_seven_day_pct": (cur * 100) if cur is not None else None,
+        "threshold_pct": (threshold * 100) if threshold is not None else None,
+        "used_of_budget_pct": (used * 100) if used is not None else None,
+        "remaining_pct": (remaining * 100) if remaining is not None else None,
+        "statusline": statusline,
+        "mode": _current_mode,
+        "available_modes": list(MODE_FILES.keys()),
+        "prompt": prompt_text,
+        "prompt_file": PROMPT_FILE.name,
+        "template": template_text,
+        "template_file": TEMPLATE.name,
+        "prompter_enabled": _prompter_enabled,
+        "prompter_base": _prompter_base,
+        "prompter_model": _prompter_model,
+        "last_companion": _last_companion,
+    }
+
+
+def ctrl_set_running(v: bool) -> None:
+    if v:
+        _running_event.set()
+    else:
+        _running_event.clear()
+
+
+def ctrl_set_budget_pct(pct: float) -> float:
+    global _budget_fraction
+    _budget_fraction = max(0.0, pct) / 100.0
+    return _budget_fraction * 100
+
+
+def ctrl_set_prompt(text: str) -> str:
+    """Write text to the current mode's prompt file. Takes effect from the
+    next iteration onward (workers re-read PROMPT_FILE each iter)."""
+    if text is None:
+        text = ""
+    if not text.endswith("\n"):
+        text = text + "\n"
+    PROMPT_FILE.write_text(text)
+    return PROMPT_FILE.name
+
+
+def ctrl_notify_done(message: str) -> dict:
+    """Called by a sibling via HTTP when a task is complete. Sends the message
+    via the configured zulip script (if any) and pauses the harness."""
+    result: dict = {"message": message, "zulip_sent": False, "paused": False}
+    if _zulip_script is not None and _zulip_script.is_file():
+        try:
+            r = subprocess.run(
+                ["node", str(_zulip_script), message],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                result["zulip_sent"] = True
+                result["zulip_output"] = (r.stdout or "").strip()[:500]
+            else:
+                result["zulip_error"] = (r.stderr or r.stdout or "non-zero exit").strip()[:500]
+        except Exception as e:
+            result["zulip_error"] = f"{type(e).__name__}: {e}"
+    else:
+        result["zulip_error"] = "no --zulip-script configured"
+
+    _running_event.clear()
+    result["paused"] = True
+    print(
+        f"[harness] notify-done received: zulip_sent={result['zulip_sent']} "
+        f"message={message[:120]!r}",
+        flush=True,
+    )
+    return result
+
+
+def _task_notify_hint(port: int) -> str:
+    """The harness-note appended to task-mode prompts so claude knows how to
+    signal task completion."""
+    return f"""
+
+---
+
+[harness note — read this:
+
+you are running in unsupervised task mode. nobody is going to respond to you.
+when you finish the task (truly done, fully blocked, or at a natural stopping
+point that should end the whole run), notify Danielle and stop the looper by
+running this Bash command from inside your sandbox:
+
+curl -s -X POST http://127.0.0.1:{port}/api/notify-done \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"message": "<your one-paragraph completion summary>"}}'
+
+replace the message with a real summary: what you did, what's left, where you
+left off. the harness sends it to her via zulip and pauses itself.
+
+do NOT call this just because you're stopping one iteration — only when the
+overall task is done or fully blocked. for iteration-boundary stopping, just
+end this turn normally and next-you will pick up.]
+"""
+
+
+def ctrl_set_template(text: str) -> str:
+    """Write text to the current mode's CLAUDE.md template. Takes effect from
+    the next NEW sibling onward — existing siblings keep their baked-in copy."""
+    if text is None:
+        text = ""
+    if not text.endswith("\n"):
+        text = text + "\n"
+    TEMPLATE.write_text(text)
+    return TEMPLATE.name
+
+
+def ctrl_set_mode(mode: str) -> str:
+    """Switch mode at runtime. Affects future sibling spawns only; in-progress
+    siblings continue with their original mode (their CLAUDE.md is baked in).
+    Re-populates the resumable queue so the new mode's resumables become
+    eligible."""
+    global _current_mode, TEMPLATE, PROMPT_FILE
+    if mode not in MODE_FILES:
+        return _current_mode
+    if mode == _current_mode:
+        return _current_mode
+    _current_mode = mode
+    TEMPLATE, PROMPT_FILE = MODE_FILES[mode]
+    if not TEMPLATE.exists() or not PROMPT_FILE.exists():
+        print(f"[harness] WARNING: mode {mode} files missing — {TEMPLATE} / {PROMPT_FILE}", flush=True)
+    with _resumable_lock:
+        _resumable_queue.clear()
+        _resumable_queue.extend(discover_resumable())
+    print(f"[harness] mode switched → {mode} (resumable queue: {len(_resumable_queue)})", flush=True)
+    return _current_mode
 
 
 def probe_loop(interval_sec: int) -> None:
     """Background thread: refresh rate-limit data every interval seconds.
     Sleeps first (caller is expected to have done a synchronous initial probe)."""
+    global _last_probe
     while True:
         time.sleep(interval_sec)
         try:
             result = run_probe()
             if result:
+                _last_probe = result
                 print(f"[probe] refreshed: {result['line']}", flush=True)
                 check_budget(result)
             else:
@@ -366,8 +622,116 @@ def _format_stream_event(evt: dict) -> list[str]:
     return out
 
 
-def fire(work_dir: Path, prompt: str, slot: int) -> int:
-    """Run claude under bwrap with a pty and stream parsed events live."""
+def detect_prompter_model(base: str) -> str | None:
+    """Ask the companion server which model it's serving (first one wins)."""
+    try:
+        with urllib.request.urlopen(base.rstrip("/") + "/v1/models", timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    models = data.get("data") or []
+    if models and isinstance(models[0], dict):
+        return models[0].get("id")
+    return None
+
+
+def read_last_response(work_dir: Path) -> str | None:
+    """Recover the final assistant text from the most recent claude session on
+    disk, so a resumed sibling's companion has something to react to from the
+    very first iteration after resume."""
+    sanitized = str(work_dir.resolve()).replace("/", "-")
+    proj_dir = Path(HOME) / ".claude" / "projects" / sanitized
+    if not proj_dir.exists():
+        return None
+    jsonls = sorted(proj_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not jsonls:
+        return None
+    last_result: str | None = None
+    last_text: str | None = None
+    try:
+        for line in jsonls[-1].read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") == "result" and evt.get("result"):
+                last_result = str(evt["result"])
+            elif evt.get("type") == "assistant":
+                for block in (evt.get("message", {}) or {}).get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text", "").strip()
+                        if t:
+                            last_text = t
+    except OSError:
+        return None
+    return last_result or last_text
+
+
+def _set_last_companion(sibling: str, iters: int, prompt: str) -> None:
+    """Record the most recent companion-written prompt for the web UI."""
+    global _last_companion
+    _last_companion = {
+        "sibling": sibling,
+        "iter": iters,
+        "prompt": prompt,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def call_prompter(task_text: str, last_response: str, slot: int) -> str | None:
+    """Ask the companion model to write the next claude prompt from the task and
+    claude's most recent response. Returns None on any failure so the caller can
+    fall back to the static task prompt."""
+    if not _prompter_enabled:
+        return None
+    snippet = last_response.strip()
+    if len(snippet) > 8000:
+        snippet = snippet[:8000] + "\n…(truncated)…"
+    user = (
+        "ORIGINAL PROMPT (the task or invitation Claude was given):\n" + task_text.strip() +
+        "\n\n---\n\nCLAUDE'S MOST RECENT RESPONSE (end of the last iteration):\n" + snippet +
+        "\n\n---\n\nWrite the next prompt for the fresh Claude instance now. "
+        "Output only the prompt text."
+    )
+    system = _PROMPTER_SYSTEM.replace("{base}", _prompter_base.rstrip("/"))
+    payload = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1200,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    if _prompter_model:
+        payload["model"] = _prompter_model
+    req = urllib.request.Request(
+        _prompter_base.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log(slot, f"companion call failed: {type(e).__name__}: {e}")
+        return None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    content = (content or "").strip()
+    return content or None
+
+
+def fire(work_dir: Path, prompt: str, slot: int) -> tuple[int, str | None]:
+    """Run claude under bwrap with a pty and stream parsed events live.
+    Returns (returncode, final_response_text). The response text is claude's
+    final result message (falling back to its concatenated assistant text), used
+    to feed the companion prompter for the next iteration."""
     env = os.environ.copy()
     env["CLAUDE_CODE_NO_FLICKER"] = "1"
     cmd = bwrap_cmd(work_dir, prompt)
@@ -386,6 +750,8 @@ def fire(work_dir: Path, prompt: str, slot: int) -> int:
         try:
             prefix = f"[slot-{slot}] "
             buf = b""
+            final_result: str | None = None
+            assistant_texts: list[str] = []
             while True:
                 try:
                     data = os.read(master_fd, 4096)
@@ -409,11 +775,19 @@ def fire(work_dir: Path, prompt: str, slot: int) -> int:
                             status = collect_statusline()
                             if status:
                                 sys.stdout.write(prefix + f"  · {status}\n")
+                            for block in (evt.get("message", {}) or {}).get("content", []):
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    bt = block.get("text", "").strip()
+                                    if bt:
+                                        assistant_texts.append(bt)
+                        elif evt.get("type") == "result" and evt.get("result"):
+                            final_result = str(evt["result"])
                     except json.JSONDecodeError:
                         sys.stdout.write(prefix + text + "\n")
                     sys.stdout.flush()
             proc.wait()
-            return proc.returncode
+            response_text = final_result or ("\n\n".join(assistant_texts) or None)
+            return proc.returncode, response_text
         finally:
             with _procs_lock:
                 if proc in _active_procs:
@@ -451,18 +825,55 @@ def _shutdown(signum, frame):
 def worker(slot: int, remote: str | None, args, spawn_lock: threading.Lock) -> None:
     """One slot's lifetime: spawn sibling → iterate → retire → spawn next → ..."""
     while True:
+        # Block here if the harness is paused (budget exhausted, user clicked stop).
+        if not _running_event.is_set():
+            log(slot, "paused, waiting for resume...")
+            _running_event.wait()
+            log(slot, "resumed")
         # serialize worktree creation; concurrent `git worktree add` can race.
         # pick_or_spawn_sibling prefers an existing un-done sibling.
         with spawn_lock:
             work_dir, resumed = pick_or_spawn_sibling(remote)
         sibling = work_dir.parent.name
-        log(slot, f"{'resumed' if resumed else 'new'} sibling: {sibling}")
-        iters = 0
+        iters = count_existing_sessions(work_dir)
+        if resumed:
+            log(slot, f"resumed sibling: {sibling} (continuing from iter {iters})")
+        else:
+            log(slot, f"new sibling: {sibling}")
+        # The companion needs something to react to. On resume, recover claude's
+        # last response from disk so it can write a fresh prompt immediately.
+        last_response: str | None = None
+        if _prompter_enabled:
+            last_response = read_last_response(work_dir)
+            if last_response:
+                log(slot, f"recovered last response from disk ({len(last_response)} chars) for companion")
         while True:
+            if not _running_event.is_set():
+                log(slot, "paused mid-sibling, waiting for resume...")
+                _running_event.wait()
+                log(slot, "resumed")
             iters += 1
-            prompt = PROMPT_FILE.read_text()
+            task_text = PROMPT_FILE.read_text()
+            # In both modes, let the local companion write the next prompt from the
+            # seed prompt + claude's most recent response. First iteration (no
+            # response yet) and any companion failure fall back to the static prompt.
+            if _prompter_enabled and last_response:
+                gen = call_prompter(task_text, last_response, slot)
+                if gen:
+                    prompt = gen
+                    _set_last_companion(sibling, iters, gen)
+                    log(slot, f"companion wrote next prompt ({len(gen)} chars): {gen[:200]!r}")
+                else:
+                    prompt = task_text
+                    log(slot, f"companion unavailable; using static {PROMPT_FILE.name}")
+            else:
+                prompt = task_text
+            if _current_mode == "task" and _web_port > 0:
+                prompt = prompt + _task_notify_hint(_web_port)
             log(slot, f"firing {sibling} (iter {iters})")
-            rc = fire(work_dir, prompt, slot)
+            rc, response_text = fire(work_dir, prompt, slot)
+            if response_text:
+                last_response = response_text
             log(slot, f"{sibling} returned ({rc})")
 
             status = collect_statusline()
@@ -501,6 +912,22 @@ def main():
                         help="seconds between rate-limit probes (default 300 = 5 min). 0 disables.")
     parser.add_argument("--web-port", type=int, default=8765,
                         help="port for the local browse UI (default 8765). 0 disables.")
+    parser.add_argument("--mode", choices=list(MODE_FILES.keys()), default="corner",
+                        help="corner: open creative space using CLAUDE_TEMPLATE.md + prompt.md. "
+                             "task: unsupervised one-shot-repeated work using TASK_TEMPLATE.md + task.md.")
+    parser.add_argument("--zulip-script",
+                        default=os.environ.get("CLAUDE_CORNER_ZULIP_SCRIPT", str(CORNER / "send-zulip-dm.js")),
+                        help="path to a node script accepting `<message>` argv. defaults to the bundled "
+                             "claude-corner/send-zulip-dm.js. needs ~/.zuliprc or ZULIP_* env vars for auth. "
+                             "pass empty string to disable notify-done's zulip behavior.")
+    parser.add_argument("--prompter-url", default="http://127.0.0.1:8051",
+                        help="base URL of an OpenAI-compatible local model that, in task mode, writes "
+                             "each next claude prompt from the task + claude's most recent response "
+                             "(default http://127.0.0.1:8051). gives the loop a companion mind.")
+    parser.add_argument("--prompter-model", default=None,
+                        help="model id for the companion prompter (default: auto-detect from /v1/models)")
+    parser.add_argument("--no-prompter", action="store_true",
+                        help="disable the local companion prompter; replay the static task.md each iter")
     args = parser.parse_args()
 
     if args.parallelism < 1:
@@ -508,8 +935,33 @@ def main():
     if args.budget_percent <= 0:
         sys.exit("budget_percent must be > 0")
 
-    global _budget_fraction
+    global _budget_fraction, TEMPLATE, PROMPT_FILE, _current_mode, _zulip_script, _web_port
+    global _prompter_base, _prompter_model, _prompter_enabled
     _budget_fraction = args.budget_percent / 100.0
+    _current_mode = args.mode
+    TEMPLATE, PROMPT_FILE = MODE_FILES[args.mode]
+    _web_port = args.web_port
+    _prompter_base = args.prompter_url
+    _prompter_enabled = not args.no_prompter
+    if _prompter_enabled:
+        _prompter_model = args.prompter_model or detect_prompter_model(_prompter_base)
+        if _prompter_model:
+            print(f"[harness] companion prompter: {_prompter_base} (model {_prompter_model}) — active in both modes", flush=True)
+        else:
+            print(f"[harness] companion prompter: {_prompter_base} "
+                  f"(model not detected — server may be down; will retry per-iteration)", flush=True)
+    else:
+        print("[harness] companion prompter disabled (--no-prompter); replaying static task each iter", flush=True)
+    if args.zulip_script:
+        zp = Path(args.zulip_script).expanduser()
+        if zp.is_file():
+            _zulip_script = zp
+            print(f"[harness] zulip script: {zp}", flush=True)
+        else:
+            print(f"[harness] WARNING: --zulip-script {zp} not found; notify-done will pause only", flush=True)
+    else:
+        print(f"[harness] no --zulip-script; notify-done will pause but not message", flush=True)
+    print(f"[harness] mode = {args.mode} (CLAUDE.md from {TEMPLATE.name}, prompt from {PROMPT_FILE.name})", flush=True)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -539,12 +991,23 @@ def main():
 
     if args.web_port > 0:
         try:
+            from types import SimpleNamespace
             from webui import start_webui
-            start_webui(args.web_port, RUNS, STATUSLINE_LAST)
+            controls = SimpleNamespace(
+                get_state=ctrl_get_state,
+                set_running=ctrl_set_running,
+                set_budget_pct=ctrl_set_budget_pct,
+                set_mode=ctrl_set_mode,
+                set_prompt=ctrl_set_prompt,
+                set_template=ctrl_set_template,
+                notify_done=ctrl_notify_done,
+            )
+            start_webui(args.web_port, RUNS, STATUSLINE_LAST, controls=controls)
             print(f"[harness] web UI at http://127.0.0.1:{args.web_port}", flush=True)
         except Exception as e:
             print(f"[harness] web UI failed to start: {e}", flush=True)
 
+    print("[harness] starting in PAUSED state — open the web UI and click 'start' to begin", flush=True)
     spawn_lock = threading.Lock()
     threads = []
     for i in range(args.parallelism):
@@ -556,8 +1019,9 @@ def main():
         print(f"[harness] running startup probe...", flush=True)
         initial = run_probe()
         if initial:
-            global _baseline_seven_day
+            global _baseline_seven_day, _last_probe
             _baseline_seven_day = initial["seven_day"]
+            _last_probe = initial
             # Re-format with baseline known so the very first per-message log line
             # already shows budget info (otherwise we'd be stuck with the no-budget
             # version until the next 5-min probe).
