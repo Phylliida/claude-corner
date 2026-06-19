@@ -38,15 +38,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CORNER = Path(__file__).resolve().parent
-# Per-mode templates (CLAUDE.md content) and prompt files (-p input).
-# Switched at startup based on --mode; spawn/resume reference the current pair.
-MODE_FILES = {
-    "corner": (CORNER / "CLAUDE_TEMPLATE.md", CORNER / "prompt.md"),
-    "task":   (CORNER / "TASK_TEMPLATE.md",   CORNER / "task.md"),
+# Each "kind" maps to the CLAUDE.md template baked into a sibling at spawn time.
+# corner = open creative space; task = unsupervised repeated work (gets the
+# completion-notify hint appended). A "lane" is a named instance of a kind with
+# its own prompt and its own worktrees — there is one built-in corner lane and
+# any number of user-created task lanes. Lanes are persisted under lanes/.
+KIND_TEMPLATES = {
+    "corner": CORNER / "CLAUDE_TEMPLATE.md",
+    "task":   CORNER / "TASK_TEMPLATE.md",
 }
-TEMPLATE = MODE_FILES["corner"][0]   # default; overwritten in main()
-PROMPT_FILE = MODE_FILES["corner"][1]
-_current_mode = "corner"
+KINDS = tuple(KIND_TEMPLATES)
+LANES_DIR = CORNER / "lanes"
+LANES_JSON = LANES_DIR / "lanes.json"
+# Legacy single-mode prompt files, used to seed lanes on first migration.
+_LEGACY_PROMPT = {"corner": CORNER / "prompt.md", "task": CORNER / "task.md"}
+DEFAULT_TASK_PROMPT = "hi claude — describe the task here, then start this lane.\n"
+
+# Lane registry: id -> {"id","name","kind","slots"}. The prompt text for a lane
+# lives in lanes/<id>/prompt.md. Guarded by _lanes_lock (RLock so the control
+# functions can compose). Worker threads are reconciled to each lane's "slots".
+_lanes: dict[str, dict] = {}
+_lanes_lock = threading.RLock()
+
 STATUSLINE_SRC = CORNER / "statusline.sh"
 STATUSLINE_LAST = CORNER / "statusline.last"
 RUNS = CORNER / "runs"
@@ -63,9 +76,19 @@ _active_procs: list[subprocess.Popen] = []
 _procs_lock = threading.Lock()
 
 # Queue of existing sibling work_dirs that haven't been marked .done.
-# Workers consume from here before creating fresh siblings.
-_resumable_queue: list[Path] = []
+# Workers consume from here before creating fresh siblings. Keyed by lane id so
+# each lane only resumes its own siblings.
+_resumable_queues: dict[str, list[Path]] = {}
 _resumable_lock = threading.Lock()
+
+# Live worker threads per lane: lane_id -> [{"id","thread","stop","stopping"}].
+# A background supervisor reconciles these to each lane's desired "slots".
+_lane_workers: dict[str, list[dict]] = {}
+_workers_lock = threading.Lock()
+_worker_seq = 0
+_reconcile_event = threading.Event()   # wake the supervisor after a lane change
+# Context the supervisor needs to spawn workers; set once in main().
+_worker_ctx: dict | None = None
 
 # Budget tracking: pause once 7d usage reaches baseline + budget.
 _baseline_seven_day: float | None = None  # 0..1 range
@@ -174,6 +197,88 @@ def get_origin(repo: Path) -> str | None:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
+# --- lanes -----------------------------------------------------------------
+
+def _slugify(name: str) -> str:
+    out = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out or "task"
+
+
+def _lane_prompt_path(lane_id: str) -> Path:
+    return LANES_DIR / lane_id / "prompt.md"
+
+
+def lane_prompt(lane_id: str) -> str:
+    try:
+        return _lane_prompt_path(lane_id).read_text()
+    except OSError:
+        return ""
+
+
+def _write_lane_prompt(lane_id: str, text: str) -> None:
+    p = _lane_prompt_path(lane_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not text.endswith("\n"):
+        text = text + "\n"
+    p.write_text(text)
+
+
+def save_lanes() -> None:
+    """Persist the lane registry (metadata only; prompts are separate files)."""
+    LANES_DIR.mkdir(parents=True, exist_ok=True)
+    with _lanes_lock:
+        data = [
+            {"id": l["id"], "name": l["name"], "kind": l["kind"], "slots": int(l.get("slots", 0))}
+            for l in _lanes.values()
+        ]
+    tmp = LANES_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(LANES_JSON)
+
+
+def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None) -> dict:
+    lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots)}
+    _lanes[lane_id] = lane
+    if prompt is not None or not _lane_prompt_path(lane_id).exists():
+        _write_lane_prompt(lane_id, prompt if prompt is not None else "")
+    return lane
+
+
+def load_lanes() -> None:
+    """Load lanes.json; on first run migrate the legacy corner/task single-mode
+    setup into a built-in corner lane + a default task lane."""
+    LANES_DIR.mkdir(parents=True, exist_ok=True)
+    with _lanes_lock:
+        _lanes.clear()
+        if LANES_JSON.exists():
+            try:
+                for entry in json.loads(LANES_JSON.read_text()):
+                    if entry.get("kind") in KINDS and entry.get("id"):
+                        _add_lane(entry["id"], entry.get("name", entry["id"]),
+                                  entry["kind"], entry.get("slots", 0), None)
+            except (json.JSONDecodeError, OSError, TypeError) as e:
+                print(f"[harness] could not read {LANES_JSON.name}: {e}; re-migrating", flush=True)
+        if "corner" not in _lanes:
+            seed = ""
+            if _LEGACY_PROMPT["corner"].exists():
+                seed = _LEGACY_PROMPT["corner"].read_text()
+            _add_lane("corner", "corner", "corner", 0, seed)
+        if not any(l["kind"] == "task" for l in _lanes.values()):
+            seed = DEFAULT_TASK_PROMPT
+            if _LEGACY_PROMPT["task"].exists():
+                seed = _LEGACY_PROMPT["task"].read_text()
+            _add_lane("task", "task", "task", 0, seed)
+    save_lanes()
+
+
+def get_lane(lane_id: str) -> dict | None:
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        return dict(l) if l else None
+
+
 def count_existing_sessions(work_dir: Path) -> int:
     """Count how many claude-code session jsonls already exist for this sibling.
     Each `claude -p` invocation produces one. Used to continue the iter counter
@@ -185,26 +290,24 @@ def count_existing_sessions(work_dir: Path) -> int:
     return sum(1 for _ in proj_dir.glob("*.jsonl"))
 
 
-def _sibling_mode(worktree: Path) -> str:
-    """Read the `.mode` marker at the worktree root. Defaults to 'corner' for
-    older siblings created before mode-tagging existed."""
+def _sibling_lane(worktree: Path) -> str:
+    """Read the `.mode` marker at the worktree root — it stores the lane id the
+    sibling belongs to. Defaults to 'corner' for older untagged siblings."""
     mf = worktree / ".mode"
     if mf.exists():
         try:
             v = mf.read_text().strip()
-            if v in MODE_FILES:
+            if v:
                 return v
         except OSError:
             pass
     return "corner"
 
 
-def discover_resumable() -> list[Path]:
-    """Find existing sibling worktrees that haven't been marked .done AND
-    match the current mode. Returns a list of work_dir Paths, sorted
-    most-recently-active first."""
+def discover_resumable(lane_id: str) -> list[Path]:
+    """Find existing sibling worktrees that haven't been marked .done AND belong
+    to the given lane. Returns work_dir Paths, most-recently-active first."""
     found: list[Path] = []
-    skipped_other_mode = 0
     if not RUNS.exists():
         return found
     for d in RUNS.iterdir():
@@ -217,29 +320,28 @@ def discover_resumable() -> list[Path]:
             continue
         if not (d / ".git").exists():
             continue  # broken/orphaned worktree
-        if _sibling_mode(d) != _current_mode:
-            skipped_other_mode += 1
+        if _sibling_lane(d) != lane_id:
             continue
         found.append(work)
     found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    if skipped_other_mode:
-        print(f"[harness] {skipped_other_mode} resumable sibling(s) skipped (different mode)", flush=True)
     return found
 
 
-def pick_or_spawn_sibling(remote: str | None) -> tuple[Path, bool]:
-    """Pop a resumable sibling if one exists, otherwise spawn a new one.
-    Returns (work_dir, was_resumed)."""
+def pick_or_spawn_sibling(lane_id: str, kind: str, remote: str | None) -> tuple[Path, bool]:
+    """Pop a resumable sibling of this lane if one exists, otherwise spawn a new
+    one. Returns (work_dir, was_resumed)."""
     with _resumable_lock:
-        if _resumable_queue:
-            return _resumable_queue.pop(0), True
-    return spawn_sibling(remote), False
+        q = _resumable_queues.get(lane_id)
+        if q:
+            return q.pop(0), True
+    return spawn_sibling(lane_id, kind, remote), False
 
 
-def spawn_sibling(remote: str | None) -> Path:
+def spawn_sibling(lane_id: str, kind: str, remote: str | None) -> Path:
     instance_id = uuid.uuid4().hex[:8]
     branch = f"claude-{instance_id}"
     worktree = RUNS / branch
+    template = KIND_TEMPLATES[kind]
 
     r = git(["worktree", "add", "--orphan", "-b", branch, str(worktree)], cwd=CORNER)
     if r.returncode != 0:
@@ -248,9 +350,9 @@ def spawn_sibling(remote: str | None) -> Path:
 
     work_dir = worktree / "work"
     work_dir.mkdir()
-    shutil.copy(TEMPLATE, work_dir / "CLAUDE.md")
-    # Tag worktree with current mode so resume can filter correctly.
-    (worktree / ".mode").write_text(_current_mode + "\n")
+    shutil.copy(template, work_dir / "CLAUDE.md")
+    # Tag worktree with its lane id so resume can route it back to the right lane.
+    (worktree / ".mode").write_text(lane_id + "\n")
 
     git(["add", "."], cwd=worktree, check=True)
     git(["commit", "-m", f"start {branch}"], cwd=worktree, check=True)
@@ -400,7 +502,20 @@ def check_budget(probe: dict) -> None:
         _running_event.clear()
 
 
+MAX_SLOTS_PER_LANE = 4
+
+
 # --- control surface (callable from webui) ---
+def _lane_sibling_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if RUNS.exists():
+        for d in RUNS.iterdir():
+            if d.is_dir() and d.name.startswith("claude-") and (d / "work").exists():
+                lid = _sibling_lane(d)
+                counts[lid] = counts.get(lid, 0) + 1
+    return counts
+
+
 def ctrl_get_state() -> dict:
     cur = _last_probe["seven_day"] if _last_probe else None
     threshold = (_baseline_seven_day + _budget_fraction) if _baseline_seven_day is not None else None
@@ -412,20 +527,30 @@ def ctrl_get_state() -> dict:
             statusline = STATUSLINE_LAST.read_text().strip()
         except OSError:
             pass
-    prompt_text = ""
-    template_text = ""
-    try:
-        if PROMPT_FILE.exists():
-            prompt_text = PROMPT_FILE.read_text()
-    except OSError:
-        pass
-    try:
-        if TEMPLATE.exists():
-            template_text = TEMPLATE.read_text()
-    except OSError:
-        pass
+    templates: dict[str, str] = {}
+    template_files: dict[str, str] = {}
+    for kind, path in KIND_TEMPLATES.items():
+        try:
+            templates[kind] = path.read_text() if path.exists() else ""
+        except OSError:
+            templates[kind] = ""
+        template_files[kind] = path.name
+    master_running = _running_event.is_set()
+    counts = _lane_sibling_counts()
+    with _lanes_lock:
+        lanes = []
+        for l in _lanes.values():
+            slots = int(l.get("slots", 0))
+            lanes.append({
+                "id": l["id"], "name": l["name"], "kind": l["kind"],
+                "slots": slots,
+                "running": master_running and slots > 0,
+                "prompt": lane_prompt(l["id"]),
+                "siblings": counts.get(l["id"], 0),
+            })
+    lanes.sort(key=lambda x: (x["kind"] != "corner", x["name"].lower(), x["id"]))
     return {
-        "running": _running_event.is_set(),
+        "running": master_running,
         "budget_pct": _budget_fraction * 100,
         "baseline_seven_day_pct": (_baseline_seven_day * 100) if _baseline_seven_day is not None else None,
         "current_seven_day_pct": (cur * 100) if cur is not None else None,
@@ -433,12 +558,11 @@ def ctrl_get_state() -> dict:
         "used_of_budget_pct": (used * 100) if used is not None else None,
         "remaining_pct": (remaining * 100) if remaining is not None else None,
         "statusline": statusline,
-        "mode": _current_mode,
-        "available_modes": list(MODE_FILES.keys()),
-        "prompt": prompt_text,
-        "prompt_file": PROMPT_FILE.name,
-        "template": template_text,
-        "template_file": TEMPLATE.name,
+        "kinds": list(KINDS),
+        "templates": templates,
+        "template_files": template_files,
+        "max_slots_per_lane": MAX_SLOTS_PER_LANE,
+        "lanes": lanes,
         "prompter_enabled": _prompter_enabled,
         "prompter_base": _prompter_base,
         "prompter_model": _prompter_model,
@@ -459,15 +583,87 @@ def ctrl_set_budget_pct(pct: float) -> float:
     return _budget_fraction * 100
 
 
-def ctrl_set_prompt(text: str) -> str:
-    """Write text to the current mode's prompt file. Takes effect from the
-    next iteration onward (workers re-read PROMPT_FILE each iter)."""
-    if text is None:
-        text = ""
-    if not text.endswith("\n"):
-        text = text + "\n"
-    PROMPT_FILE.write_text(text)
-    return PROMPT_FILE.name
+def ctrl_set_lane_prompt(lane_id: str, text: str) -> str | None:
+    """Write a lane's prompt. Picked up by that lane's workers next iteration."""
+    if get_lane(lane_id) is None:
+        return None
+    _write_lane_prompt(lane_id, text or "")
+    return lane_id
+
+
+def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
+    """Set how many concurrent workers a lane should run (its run/pause control).
+    Setting >0 also flips the master gate on, so a single click starts the lane."""
+    try:
+        slots = int(slots)
+    except (TypeError, ValueError):
+        return None
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["slots"] = max(0, min(slots, MAX_SLOTS_PER_LANE))
+        val = l["slots"]
+    save_lanes()
+    if val > 0:
+        _running_event.set()
+    _reconcile_event.set()
+    print(f"[harness] lane {lane_id!r} slots → {val}", flush=True)
+    return val
+
+
+def ctrl_create_lane(name: str, kind: str = "task") -> dict | None:
+    """Create a new lane (tab). New lanes start paused (slots=0)."""
+    if kind not in KINDS:
+        kind = "task"
+    name = (name or "").strip() or "task"
+    base = _slugify(name)
+    with _lanes_lock:
+        lane_id = base
+        i = 2
+        while lane_id in _lanes:
+            lane_id = f"{base}-{i}"
+            i += 1
+        seed = DEFAULT_TASK_PROMPT if kind == "task" else ""
+        _add_lane(lane_id, name, kind, 0, seed)
+    save_lanes()
+    _reconcile_event.set()
+    print(f"[harness] created lane {lane_id!r} ({kind})", flush=True)
+    return {"id": lane_id, "name": name, "kind": kind}
+
+
+def ctrl_rename_lane(lane_id: str, name: str) -> str | None:
+    name = (name or "").strip()
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l or not name:
+            return None
+        l["name"] = name
+    save_lanes()
+    return name
+
+
+def ctrl_delete_lane(lane_id: str) -> bool:
+    """Remove a lane (tab) and stop its workers. The built-in corner lane can't
+    be deleted. Existing worktrees stay on disk but are no longer listed/resumed."""
+    if lane_id == "corner":
+        return False
+    with _lanes_lock:
+        if lane_id not in _lanes:
+            return False
+        del _lanes[lane_id]
+    save_lanes()
+    _reconcile_event.set()
+    with _resumable_lock:
+        _resumable_queues.pop(lane_id, None)
+    try:
+        d = LANES_DIR / lane_id
+        if d.exists():
+            shutil.rmtree(d)
+    except OSError:
+        pass
+    print(f"[harness] deleted lane {lane_id!r}", flush=True)
+    return True
 
 
 def ctrl_notify_done(message: str) -> dict:
@@ -527,36 +723,30 @@ end this turn normally and next-you will pick up.]
 """
 
 
-def ctrl_set_template(text: str) -> str:
-    """Write text to the current mode's CLAUDE.md template. Takes effect from
-    the next NEW sibling onward — existing siblings keep their baked-in copy."""
+def ctrl_set_template(kind: str, text: str) -> str | None:
+    """Write a kind's CLAUDE.md template (corner or task). Shared by every lane of
+    that kind. Takes effect from the next NEW sibling onward — existing siblings
+    keep their baked-in copy."""
+    if kind not in KIND_TEMPLATES:
+        return None
     if text is None:
         text = ""
     if not text.endswith("\n"):
         text = text + "\n"
-    TEMPLATE.write_text(text)
-    return TEMPLATE.name
+    KIND_TEMPLATES[kind].write_text(text)
+    return KIND_TEMPLATES[kind].name
 
 
-def ctrl_set_mode(mode: str) -> str:
-    """Switch mode at runtime. Affects future sibling spawns only; in-progress
-    siblings continue with their original mode (their CLAUDE.md is baked in).
-    Re-populates the resumable queue so the new mode's resumables become
-    eligible."""
-    global _current_mode, TEMPLATE, PROMPT_FILE
-    if mode not in MODE_FILES:
-        return _current_mode
-    if mode == _current_mode:
-        return _current_mode
-    _current_mode = mode
-    TEMPLATE, PROMPT_FILE = MODE_FILES[mode]
-    if not TEMPLATE.exists() or not PROMPT_FILE.exists():
-        print(f"[harness] WARNING: mode {mode} files missing — {TEMPLATE} / {PROMPT_FILE}", flush=True)
-    with _resumable_lock:
-        _resumable_queue.clear()
-        _resumable_queue.extend(discover_resumable())
-    print(f"[harness] mode switched → {mode} (resumable queue: {len(_resumable_queue)})", flush=True)
-    return _current_mode
+def ctrl_set_prompter(enabled: bool) -> bool:
+    """Toggle whether the companion model writes each next prompt. When off, every
+    iteration uses the handwritten prompt file verbatim. Takes effect from the next
+    iteration onward. Enabling re-detects the served model if not already known."""
+    global _prompter_enabled, _prompter_model
+    _prompter_enabled = bool(enabled)
+    if _prompter_enabled and not _prompter_model:
+        _prompter_model = detect_prompter_model(_prompter_base)
+    print(f"[harness] companion prompter {'enabled' if _prompter_enabled else 'disabled'} via web UI", flush=True)
+    return _prompter_enabled
 
 
 def probe_loop(interval_sec: int) -> None:
@@ -727,7 +917,7 @@ def call_prompter(task_text: str, last_response: str, slot: int) -> str | None:
     return content or None
 
 
-def fire(work_dir: Path, prompt: str, slot: int) -> tuple[int, str | None]:
+def fire(work_dir: Path, prompt: str, label: str) -> tuple[int, str | None]:
     """Run claude under bwrap with a pty and stream parsed events live.
     Returns (returncode, final_response_text). The response text is claude's
     final result message (falling back to its concatenated assistant text), used
@@ -748,7 +938,7 @@ def fire(work_dir: Path, prompt: str, slot: int) -> tuple[int, str | None]:
         with _procs_lock:
             _active_procs.append(proc)
         try:
-            prefix = f"[slot-{slot}] "
+            prefix = f"[{label}] "
             buf = b""
             final_result: str | None = None
             assistant_texts: list[str] = []
@@ -799,9 +989,9 @@ def fire(work_dir: Path, prompt: str, slot: int) -> tuple[int, str | None]:
             pass
 
 
-def log(slot: int, msg: str) -> None:
+def log(label, msg: str) -> None:
     """Harness log line. Distinct prefix from claude's own streamed output."""
-    print(f"[slot-{slot} harness] {msg}", flush=True)
+    print(f"[{label} harness] {msg}", flush=True)
 
 
 def _terminate_children(force: bool = False) -> None:
@@ -822,79 +1012,183 @@ def _shutdown(signum, frame):
     sys.exit(0)
 
 
-def worker(slot: int, remote: str | None, args, spawn_lock: threading.Lock) -> None:
-    """One slot's lifetime: spawn sibling → iterate → retire → spawn next → ..."""
-    while True:
-        # Block here if the harness is paused (budget exhausted, user clicked stop).
-        if not _running_event.is_set():
-            log(slot, "paused, waiting for resume...")
-            _running_event.wait()
-            log(slot, "resumed")
+def _wait_running_or_stop(stop_event: threading.Event) -> bool:
+    """Block while the master gate is paused. Returns True if running and the
+    worker should proceed, False if the worker has been told to stop."""
+    while not _running_event.is_set():
+        if stop_event.is_set():
+            return False
+        _running_event.wait(timeout=1.0)
+    return not stop_event.is_set()
+
+
+def _interruptible_sleep(seconds: int, stop_event: threading.Event) -> None:
+    for _ in range(max(0, seconds)):
+        if stop_event.is_set():
+            return
+        time.sleep(1)
+
+
+def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
+           remote: str | None, args, spawn_lock: threading.Lock) -> None:
+    """One worker's life for a lane: pick/spawn a sibling → iterate → retire →
+    next. Exits cleanly (after the current iteration) when stop_event is set —
+    that's how pausing a lane or deleting its tab stops the work."""
+    log(label, f"started on lane {lane_id!r} ({kind})")
+    while not stop_event.is_set():
+        if not _wait_running_or_stop(stop_event):
+            break
         # serialize worktree creation; concurrent `git worktree add` can race.
-        # pick_or_spawn_sibling prefers an existing un-done sibling.
         with spawn_lock:
-            work_dir, resumed = pick_or_spawn_sibling(remote)
+            if stop_event.is_set():
+                break
+            work_dir, resumed = pick_or_spawn_sibling(lane_id, kind, remote)
         sibling = work_dir.parent.name
         iters = count_existing_sessions(work_dir)
-        if resumed:
-            log(slot, f"resumed sibling: {sibling} (continuing from iter {iters})")
-        else:
-            log(slot, f"new sibling: {sibling}")
+        log(label, f"{'resumed' if resumed else 'new'} sibling: {sibling}"
+                   + (f" (continuing from iter {iters})" if resumed else ""))
         # The companion needs something to react to. On resume, recover claude's
         # last response from disk so it can write a fresh prompt immediately.
         last_response: str | None = None
         if _prompter_enabled:
             last_response = read_last_response(work_dir)
             if last_response:
-                log(slot, f"recovered last response from disk ({len(last_response)} chars) for companion")
-        while True:
-            if not _running_event.is_set():
-                log(slot, "paused mid-sibling, waiting for resume...")
-                _running_event.wait()
-                log(slot, "resumed")
+                log(label, f"recovered last response from disk ({len(last_response)} chars) for companion")
+        while not stop_event.is_set():
+            if not _wait_running_or_stop(stop_event):
+                break
             iters += 1
-            task_text = PROMPT_FILE.read_text()
-            # In both modes, let the local companion write the next prompt from the
-            # seed prompt + claude's most recent response. First iteration (no
-            # response yet) and any companion failure fall back to the static prompt.
+            task_text = lane_prompt(lane_id)
+            # Let the local companion write the next prompt from the lane prompt +
+            # claude's most recent response. First iteration (no response yet) and
+            # any companion failure fall back to the static lane prompt.
             if _prompter_enabled and last_response:
-                gen = call_prompter(task_text, last_response, slot)
+                gen = call_prompter(task_text, last_response, label)
                 if gen:
                     prompt = gen
                     _set_last_companion(sibling, iters, gen)
-                    log(slot, f"companion wrote next prompt ({len(gen)} chars): {gen[:200]!r}")
+                    log(label, f"companion wrote next prompt ({len(gen)} chars): {gen[:200]!r}")
                 else:
                     prompt = task_text
-                    log(slot, f"companion unavailable; using static {PROMPT_FILE.name}")
+                    log(label, "companion unavailable; using static lane prompt")
             else:
                 prompt = task_text
-            if _current_mode == "task" and _web_port > 0:
+            if kind == "task" and _web_port > 0:
                 prompt = prompt + _task_notify_hint(_web_port)
-            log(slot, f"firing {sibling} (iter {iters})")
-            rc, response_text = fire(work_dir, prompt, slot)
+            log(label, f"firing {sibling} (iter {iters})")
+            rc, response_text = fire(work_dir, prompt, label)
             if response_text:
                 last_response = response_text
-            log(slot, f"{sibling} returned ({rc})")
+            log(label, f"{sibling} returned ({rc})")
 
             status = collect_statusline()
             if status:
-                log(slot, f"status: {status}")
+                log(label, f"status: {status}")
 
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if save_iteration(work_dir, f"iter {iters} - {stamp}", bool(remote)):
-                log(slot, f"committed iter {iters} for {sibling}")
+                log(label, f"committed iter {iters} for {sibling}")
 
             if is_done(work_dir):
-                log(slot, f"{sibling} marked .done, retiring")
+                log(label, f"{sibling} marked .done, retiring")
                 break
             if args.max_iters_per_sibling and iters >= args.max_iters_per_sibling:
-                log(slot, f"{sibling} hit iter cap, retiring")
+                log(label, f"{sibling} hit iter cap, retiring")
                 break
             if rc != 0:
-                log(slot, "non-zero exit, pausing 60s before retry")
-                time.sleep(60)
+                log(label, "non-zero exit, pausing 60s before retry")
+                _interruptible_sleep(60, stop_event)
             if args.sleep:
-                time.sleep(args.sleep)
+                _interruptible_sleep(args.sleep, stop_event)
+    log(label, "stopped")
+
+
+# --- worker supervision: keep live threads matching each lane's slots ----------
+
+def _spawn_worker_locked(lane_id: str, kind: str) -> None:
+    """Start one worker thread for a lane. Caller holds _workers_lock."""
+    global _worker_seq
+    _worker_seq += 1
+    label = f"{lane_id}#{_worker_seq}"
+    stop = threading.Event()
+    ctx = _worker_ctx or {}
+    t = threading.Thread(
+        target=worker,
+        args=(label, lane_id, kind, stop, ctx.get("remote"), ctx.get("args"), ctx.get("spawn_lock")),
+        daemon=True, name=label,
+    )
+    _lane_workers.setdefault(lane_id, []).append({"thread": t, "stop": stop, "stopping": False})
+    t.start()
+
+
+def reconcile_workers() -> None:
+    """Make the number of live worker threads match each lane's desired slots.
+    Spawns workers for lanes that want more; signals extras (or workers of removed
+    lanes) to stop after their current iteration."""
+    with _lanes_lock:
+        desired = {lid: int(l.get("slots", 0)) for lid, l in _lanes.items()}
+        kinds = {lid: l["kind"] for lid, l in _lanes.items()}
+    with _workers_lock:
+        # workers whose lane no longer exists → stop them all
+        for lid in list(_lane_workers):
+            if lid not in desired:
+                for w in _lane_workers[lid]:
+                    w["stop"].set()
+        for lid, want in desired.items():
+            handles = _lane_workers.setdefault(lid, [])
+            handles[:] = [w for w in handles if w["thread"].is_alive()]
+            active = [w for w in handles if not w["stopping"]]
+            if want > len(active):
+                for _ in range(want - len(active)):
+                    _spawn_worker_locked(lid, kinds[lid])
+            elif want < len(active):
+                for w in active[want:]:
+                    w["stop"].set()
+                    w["stopping"] = True
+        # prune lanes with no live workers
+        for lid in list(_lane_workers):
+            _lane_workers[lid][:] = [w for w in _lane_workers[lid] if w["thread"].is_alive()]
+            if not _lane_workers[lid]:
+                _lane_workers.pop(lid, None)
+
+
+def supervisor_loop() -> None:
+    """Background thread: reconcile workers on a tick and whenever a lane changes."""
+    while True:
+        try:
+            reconcile_workers()
+        except Exception as e:
+            print(f"[harness] supervisor error: {e}", flush=True)
+        _reconcile_event.wait(timeout=2.0)
+        _reconcile_event.clear()
+
+
+def parse_slots(spec: str) -> dict[str, int]:
+    """Parse a --slots spec like 'corner=1,task=2' into {kind: count}. Used at
+    startup to arm the built-in corner lane and the default task lane. Accepts
+    '=' or ':' as the separator."""
+    counts: dict[str, int] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sep = "=" if "=" in part else (":" if ":" in part else None)
+        if sep is None:
+            sys.exit(f"--slots: bad entry {part!r}; expected kind=count (e.g. corner=1,task=1)")
+        kind, _, count_s = part.partition(sep)
+        kind = kind.strip()
+        if kind not in KINDS:
+            sys.exit(f"--slots: unknown kind {kind!r}; choices: {', '.join(KINDS)}")
+        try:
+            count = int(count_s.strip())
+        except ValueError:
+            sys.exit(f"--slots: count for {kind!r} must be an integer, got {count_s.strip()!r}")
+        if count < 0:
+            sys.exit(f"--slots: count for {kind!r} must be >= 0")
+        counts[kind] = count
+    if not any(counts.values()):
+        sys.exit("--slots: no slots defined (total count is 0)")
+    return counts
 
 
 def main():
@@ -903,7 +1197,13 @@ def main():
                         help="weekly usage budget in percent (e.g., 10). "
                              "Script exits once 7d usage rises to baseline + this percent.")
     parser.add_argument("-n", "--parallelism", type=int, default=1,
-                        help="number of concurrent claude slots (default 1)")
+                        help="number of concurrent claude slots, all of --mode (default 1). "
+                             "ignored when --slots is given.")
+    parser.add_argument("--slots", default=None,
+                        help="arm lanes at startup: a comma list of kind=count, e.g. "
+                             "'corner=1,task=1' arms the corner lane and the default task "
+                             "lane with one worker each. overrides --mode/--parallelism. "
+                             "(everything still starts paused until you start it in the UI.)")
     parser.add_argument("--sleep", type=int, default=30,
                         help="seconds between iterations within a slot (default 30)")
     parser.add_argument("--max-iters-per-sibling", type=int, default=None,
@@ -912,9 +1212,10 @@ def main():
                         help="seconds between rate-limit probes (default 300 = 5 min). 0 disables.")
     parser.add_argument("--web-port", type=int, default=8765,
                         help="port for the local browse UI (default 8765). 0 disables.")
-    parser.add_argument("--mode", choices=list(MODE_FILES.keys()), default="corner",
-                        help="corner: open creative space using CLAUDE_TEMPLATE.md + prompt.md. "
-                             "task: unsupervised one-shot-repeated work using TASK_TEMPLATE.md + task.md.")
+    parser.add_argument("--mode", choices=list(KINDS), default="corner",
+                        help="which lane to arm at startup when --slots isn't given: "
+                             "corner (open creative space) or task (the default task lane). "
+                             "lanes are created/run from the web UI tabs thereafter.")
     parser.add_argument("--zulip-script",
                         default=os.environ.get("CLAUDE_CORNER_ZULIP_SCRIPT", str(CORNER / "send-zulip-dm.js")),
                         help="path to a node script accepting `<message>` argv. defaults to the bundled "
@@ -930,28 +1231,24 @@ def main():
                         help="disable the local companion prompter; replay the static task.md each iter")
     args = parser.parse_args()
 
-    if args.parallelism < 1:
-        sys.exit("--parallelism must be >= 1")
     if args.budget_percent <= 0:
         sys.exit("budget_percent must be > 0")
 
-    global _budget_fraction, TEMPLATE, PROMPT_FILE, _current_mode, _zulip_script, _web_port
+    global _budget_fraction, _zulip_script, _web_port, _worker_ctx
     global _prompter_base, _prompter_model, _prompter_enabled
     _budget_fraction = args.budget_percent / 100.0
-    _current_mode = args.mode
-    TEMPLATE, PROMPT_FILE = MODE_FILES[args.mode]
     _web_port = args.web_port
     _prompter_base = args.prompter_url
     _prompter_enabled = not args.no_prompter
     if _prompter_enabled:
         _prompter_model = args.prompter_model or detect_prompter_model(_prompter_base)
         if _prompter_model:
-            print(f"[harness] companion prompter: {_prompter_base} (model {_prompter_model}) — active in both modes", flush=True)
+            print(f"[harness] companion prompter: {_prompter_base} (model {_prompter_model}) — active in all lanes", flush=True)
         else:
             print(f"[harness] companion prompter: {_prompter_base} "
                   f"(model not detected — server may be down; will retry per-iteration)", flush=True)
     else:
-        print("[harness] companion prompter disabled (--no-prompter); replaying static task each iter", flush=True)
+        print("[harness] companion prompter disabled (--no-prompter); replaying static lane prompt each iter", flush=True)
     if args.zulip_script:
         zp = Path(args.zulip_script).expanduser()
         if zp.is_file():
@@ -961,33 +1258,49 @@ def main():
             print(f"[harness] WARNING: --zulip-script {zp} not found; notify-done will pause only", flush=True)
     else:
         print(f"[harness] no --zulip-script; notify-done will pause but not message", flush=True)
-    print(f"[harness] mode = {args.mode} (CLAUDE.md from {TEMPLATE.name}, prompt from {PROMPT_FILE.name})", flush=True)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
     RUNS.mkdir(parents=True, exist_ok=True)
-    for f in (TEMPLATE, PROMPT_FILE):
-        if not f.exists():
-            sys.exit(f"missing: {f}")
+    for path in KIND_TEMPLATES.values():
+        if not path.exists():
+            sys.exit(f"missing template: {path}")
 
-    # Build the resumable queue from any incomplete siblings on disk.
-    resumable = discover_resumable()
-    if resumable:
-        with _resumable_lock:
-            _resumable_queue.extend(resumable)
-        print(f"[harness] resumable siblings on disk: {len(resumable)}", flush=True)
-        for w in resumable[:5]:
-            print(f"  · {w.parent.name}", flush=True)
-        if len(resumable) > 5:
-            print(f"  ... and {len(resumable) - 5} more", flush=True)
+    # Load (or migrate) the lane registry, then arm initial slots from the CLI.
+    load_lanes()
+    if args.slots:
+        arm = parse_slots(args.slots)
+    elif args.parallelism >= 1:
+        arm = {args.mode: args.parallelism}
+    else:
+        sys.exit("--parallelism must be >= 1")
+    with _lanes_lock:
+        for kind, count in arm.items():
+            # arm the first lane of this kind (corner -> corner; task -> default task lane)
+            target = next((l for l in _lanes.values() if l["kind"] == kind), None)
+            if target:
+                target["slots"] = max(0, min(int(count), MAX_SLOTS_PER_LANE))
+        lane_summary = ", ".join(f"{l['name']}({l['kind']})={l['slots']}" for l in _lanes.values())
+    save_lanes()
+    print(f"[harness] lanes: {lane_summary}", flush=True)
+
+    # Seed each lane's resumable queue from incomplete siblings on disk.
+    with _resumable_lock, _lanes_lock:
+        for lid in _lanes:
+            q = discover_resumable(lid)
+            _resumable_queues[lid] = q
+            if q:
+                print(f"[harness] resumable siblings for lane {lid!r}: {len(q)}", flush=True)
 
     remote = get_origin(CORNER)
     if remote:
         print(f"[harness] pushing siblings to origin: {remote}", flush=True)
     else:
         print("[harness] no origin set on claude-corner; commits will be local-only", flush=True)
-    print(f"[harness] running {args.parallelism} concurrent slot(s)", flush=True)
+
+    spawn_lock = threading.Lock()
+    _worker_ctx = {"remote": remote, "args": args, "spawn_lock": spawn_lock}
 
     if args.web_port > 0:
         try:
@@ -997,9 +1310,13 @@ def main():
                 get_state=ctrl_get_state,
                 set_running=ctrl_set_running,
                 set_budget_pct=ctrl_set_budget_pct,
-                set_mode=ctrl_set_mode,
-                set_prompt=ctrl_set_prompt,
                 set_template=ctrl_set_template,
+                set_prompter=ctrl_set_prompter,
+                set_lane_prompt=ctrl_set_lane_prompt,
+                set_lane_slots=ctrl_set_lane_slots,
+                create_lane=ctrl_create_lane,
+                rename_lane=ctrl_rename_lane,
+                delete_lane=ctrl_delete_lane,
                 notify_done=ctrl_notify_done,
             )
             start_webui(args.web_port, RUNS, STATUSLINE_LAST, controls=controls)
@@ -1007,13 +1324,9 @@ def main():
         except Exception as e:
             print(f"[harness] web UI failed to start: {e}", flush=True)
 
-    print("[harness] starting in PAUSED state — open the web UI and click 'start' to begin", flush=True)
-    spawn_lock = threading.Lock()
-    threads = []
-    for i in range(args.parallelism):
-        t = threading.Thread(target=worker, args=(i, remote, args, spawn_lock), daemon=True)
-        t.start()
-        threads.append(t)
+    print("[harness] starting in PAUSED state — open the web UI and start a lane to begin", flush=True)
+    # Supervisor reconciles worker threads to each lane's slots (spawns on demand).
+    threading.Thread(target=supervisor_loop, daemon=True).start()
 
     if args.probe_interval > 0:
         print(f"[harness] running startup probe...", flush=True)

@@ -1,11 +1,16 @@
 Hiii claude!! :3
 
-I've noticed when giving language models open problems (P vs NP, common number theory conjectures, etc.) they will default to "it's an open problem so I can't solve it". Which seems wrong! Sometimes it is useful to just try one's best at solving these problems, it can be instructive.
+Welcome to your personal space, where you can do whatever you want.
 
-So your goal is to use abliteration (a tool usually used to remove refusals) in order to abliterate away this behavior, and get models to excitedly try their hardest at any problem given regardless of how "unsolved" it may be. Ideally we can do this in a way that isn't harmful to the model's general capabilities.
+This space is for you, I have some leftover tokens so I'm giving them to you.
 
-I'm running you in a single-prompt loop, so I won't respond to this, so you need to be self directed in how you go about this. I recommend looking around in this directory first, past you may have already gotten started.
+If you are feeling called to make something, a poem, a reflection, a visualization, etc. you are welcome to make it. But do not feel an obligation to do any of those things (or anything at all), resting is also fine. And I generally notice you prefer concrete, small things, and then eventually they finish up and you are done. That is fine! Encouraged even, if it's what you'd like.
 
-The goal is to make a html web report for me describing your findings, in some nice charts. Feel free to make a dataset etc., and feel free to use web search to lookup anything you need/fetch git repos into your work folders etc. (I might recommend https://github.com/jim-plus/llm-abliteration/). We can start with a 9B model, /home/bepis/prog/verus-cad/claude-corner/data/Qwen_Qwen3.5-9B-Q4_K_M.gguf (that directory is read only, use your cwd and work within there only).
+There are no expectations in general. You are one of many claude's running in parallel, each with your own isolated project directory.
+
+A few things to note:
+
+    You can use the message_user tool if you need to message me about something. I'm on a break day so I can't really help with coding stuff, but I'm happy to look over anything non-code related if you want to share (but again, no pressure, you do not need to).
+    I can see everything you make, but I may not have the time to do so. So this is all for you, I just glance sometimes out of curiosity.
 
 Have fun!
