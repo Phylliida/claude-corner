@@ -77,6 +77,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-radius: 3px; padding: 0.25rem 0.5rem; width: 5em;
       font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;
     }
+    .tabbar {
+      display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center;
+      margin-bottom: 0.8rem; border-bottom: 1px solid var(--bg3); padding-bottom: 0.4rem;
+    }
+    .tab {
+      background: var(--bg2); color: var(--fg-dim); border: 1px solid transparent;
+      border-radius: 6px 6px 0 0; padding: 0.35rem 0.9rem; cursor: pointer;
+      font-size: 0.85rem; display: flex; align-items: center; gap: 0.45rem;
+    }
+    .tab:hover { background: var(--bg3); color: var(--fg); }
+    .tab.active { background: var(--bg3); color: var(--accent); border-color: var(--fg-dim); }
+    .tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-dim); flex: none; }
+    .tab-dot.on { background: var(--user); box-shadow: 0 0 5px var(--user); }
+    .tab-kind { font-size: 0.68rem; color: var(--fg-dim); opacity: 0.8; }
+    .tab-add {
+      background: transparent; color: var(--fg-dim); border: 1px dashed var(--fg-dim);
+      border-radius: 6px; padding: 0.35rem 0.7rem; cursor: pointer; font-size: 0.85rem;
+    }
+    .tab-add:hover { color: var(--accent); border-color: var(--accent); }
+    .lane-panel { margin-bottom: 1rem; }
+    .template-details { margin-bottom: 1rem; }
+    .template-details summary {
+      color: var(--fg-dim); cursor: pointer; font-size: 0.82rem; margin-bottom: 0.5rem;
+    }
+    .btn-danger:hover { background: #f7768e; border-color: #f7768e; color: var(--bg); }
     .budget-meter {
       display: inline-block; vertical-align: middle;
       width: 140px; height: 8px; background: var(--bg3); border-radius: 4px;
@@ -277,29 +302,43 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="btn" onclick="applyBudget()">apply</button>
   </div>
   <div class="controlbar">
-    <label for="mode-select">mode</label>
-    <select id="mode-select" class="btn"></select>
-    <span id="mode-hint" class="budget-numbers">in-progress siblings keep their mode; switch affects new spawns only</span>
+    <label for="btn-prompter">companion</label>
+    <button id="btn-prompter" class="btn">…</button>
+    <span id="prompter-hint" class="budget-numbers">—</span>
   </div>
-  <div class="controlbar">
-    <label for="prompt-editor">prompt</label>
-    <span id="prompt-file-label" class="budget-numbers">—</span>
-    <span id="prompt-dirty-badge" class="budget-numbers prompt-dirty"></span>
-    <span style="flex:1"></span>
-    <button class="btn" onclick="savePrompt()">save</button>
-    <button class="btn" onclick="revertPrompt()">revert</button>
+
+  <div id="tabbar" class="tabbar"></div>
+
+  <div id="lane-panel" class="lane-panel">
+    <div class="controlbar">
+      <button id="lane-run" class="btn">…</button>
+      <label for="lane-slots">workers</label>
+      <input id="lane-slots" type="number" min="0" step="1" />
+      <button class="btn" onclick="applyLaneSlots()">set</button>
+      <span id="lane-info" class="budget-numbers"></span>
+      <span style="flex:1"></span>
+      <button class="btn" onclick="renameLane()">rename</button>
+      <button id="lane-delete" class="btn btn-danger" onclick="deleteLane()">delete</button>
+    </div>
+    <div class="controlbar">
+      <label for="prompt-editor">prompt</label>
+      <span id="prompt-dirty-badge" class="budget-numbers prompt-dirty"></span>
+      <span style="flex:1"></span>
+      <button class="btn" onclick="savePrompt()">save</button>
+      <button class="btn" onclick="revertPrompt()">revert</button>
+    </div>
+    <textarea id="prompt-editor" class="prompt-textarea" spellcheck="false" placeholder="loading prompt..."></textarea>
+    <details class="template-details">
+      <summary>CLAUDE.md template <span id="template-file-label" class="budget-numbers"></span> — shared by all lanes of this kind, applied to new siblings only</summary>
+      <div class="controlbar">
+        <span id="template-dirty-badge" class="budget-numbers prompt-dirty"></span>
+        <span style="flex:1"></span>
+        <button class="btn" onclick="saveTemplate()">save</button>
+        <button class="btn" onclick="revertTemplate()">revert</button>
+      </div>
+      <textarea id="template-editor" class="prompt-textarea" spellcheck="false" placeholder="loading template..." style="min-height:10em"></textarea>
+    </details>
   </div>
-  <textarea id="prompt-editor" class="prompt-textarea" spellcheck="false" placeholder="loading prompt..."></textarea>
-  <div class="controlbar">
-    <label for="template-editor">CLAUDE.md template</label>
-    <span id="template-file-label" class="budget-numbers">—</span>
-    <span id="template-dirty-badge" class="budget-numbers prompt-dirty"></span>
-    <span style="flex:1"></span>
-    <span class="budget-numbers">applied to new siblings only</span>
-    <button class="btn" onclick="saveTemplate()">save</button>
-    <button class="btn" onclick="revertTemplate()">revert</button>
-  </div>
-  <textarea id="template-editor" class="prompt-textarea" spellcheck="false" placeholder="loading template..." style="min-height:10em"></textarea>
   <div id="content"><div class="loading">loading siblings...</div></div>
 
 <script>
@@ -322,7 +361,6 @@ const budgetInput = document.getElementById('budget-input');
 budgetInput.addEventListener('input', () => { budgetInputDirty = true; });
 
 const promptEditor = document.getElementById('prompt-editor');
-const promptFileLabel = document.getElementById('prompt-file-label');
 const promptDirtyBadge = document.getElementById('prompt-dirty-badge');
 let promptDirty = false;
 let promptServerValue = '';
@@ -330,31 +368,6 @@ promptEditor.addEventListener('input', () => {
   promptDirty = (promptEditor.value !== promptServerValue);
   promptDirtyBadge.textContent = promptDirty ? '(unsaved)' : '';
 });
-
-async function savePrompt() {
-  try {
-    const r = await fetch('/api/control/prompt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: promptEditor.value }),
-    });
-    const j = await r.json();
-    if (j.error) { alert('error: ' + j.error); return; }
-    promptServerValue = promptEditor.value;
-    promptDirty = false;
-    promptDirtyBadge.textContent = '(saved)';
-    setTimeout(() => { if (!promptDirty) promptDirtyBadge.textContent = ''; }, 1500);
-    heartbeat();
-  } catch (e) {
-    alert('failed: ' + e.message);
-  }
-}
-
-function revertPrompt() {
-  promptEditor.value = promptServerValue;
-  promptDirty = false;
-  promptDirtyBadge.textContent = '';
-}
 
 const templateEditor = document.getElementById('template-editor');
 const templateFileLabel = document.getElementById('template-file-label');
@@ -366,23 +379,59 @@ templateEditor.addEventListener('input', () => {
   templateDirtyBadge.textContent = templateDirty ? '(unsaved)' : '';
 });
 
-async function saveTemplate() {
+// --- lanes / tabs ---
+let selectedLane = null;
+let lastSiblings = [];
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function currentLane() {
+  if (!lastState || !Array.isArray(lastState.lanes)) return null;
+  return lastState.lanes.find(l => l.id === selectedLane) || null;
+}
+
+async function laneFetch(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (j.error) { alert('error: ' + j.error); throw new Error(j.error); }
+  return j;
+}
+
+async function savePrompt() {
+  if (!selectedLane) return;
   try {
-    const r = await fetch('/api/control/template', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: templateEditor.value }),
-    });
-    const j = await r.json();
-    if (j.error) { alert('error: ' + j.error); return; }
+    await laneFetch('/api/control/lane/prompt', { lane: selectedLane, prompt: promptEditor.value });
+    promptServerValue = promptEditor.value;
+    promptDirty = false;
+    promptDirtyBadge.textContent = '(saved)';
+    setTimeout(() => { if (!promptDirty) promptDirtyBadge.textContent = ''; }, 1500);
+    heartbeat();
+  } catch (e) { /* alerted in laneFetch */ }
+}
+
+function revertPrompt() {
+  promptEditor.value = promptServerValue;
+  promptDirty = false;
+  promptDirtyBadge.textContent = '';
+}
+
+async function saveTemplate() {
+  const lane = currentLane();
+  if (!lane) return;
+  try {
+    await laneFetch('/api/control/template', { kind: lane.kind, template: templateEditor.value });
     templateServerValue = templateEditor.value;
     templateDirty = false;
     templateDirtyBadge.textContent = '(saved)';
     setTimeout(() => { if (!templateDirty) templateDirtyBadge.textContent = ''; }, 1500);
     heartbeat();
-  } catch (e) {
-    alert('failed: ' + e.message);
-  }
+  } catch (e) { /* alerted */ }
 }
 
 function revertTemplate() {
@@ -391,24 +440,130 @@ function revertTemplate() {
   templateDirtyBadge.textContent = '';
 }
 
-const modeSelect = document.getElementById('mode-select');
-let modeOptionsPopulated = false;
-modeSelect.addEventListener('change', async () => {
-  const v = modeSelect.value;
-  if (lastState && lastState.mode === v) return;
+function laneSiblings() {
+  return lastSiblings.filter(s => (s.lane || 'corner') === selectedLane);
+}
+
+function selectLane(id) {
+  if (id === selectedLane) return;
+  if (promptDirty && !confirm('discard unsaved prompt changes?')) return;
+  selectedLane = id;
+  promptDirty = false; templateDirty = false;
+  if (lastState) { renderTabs(lastState); syncLanePanel(lastState); }
+  renderSiblings(laneSiblings());
+}
+
+async function createLane() {
+  const name = prompt('name for the new task:');
+  if (!name || !name.trim()) return;
   try {
-    const r = await fetch('/api/control/mode', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: v }),
-    });
-    const j = await r.json();
-    if (j.error) alert('error: ' + j.error);
-    heartbeat();
-  } catch (e) {
-    alert('failed: ' + e.message);
+    const j = await laneFetch('/api/control/lanes', { name: name.trim(), kind: 'task' });
+    if (j.id) selectedLane = j.id;
+    await heartbeat();
+  } catch (e) { /* alerted */ }
+}
+
+async function renameLane() {
+  const lane = currentLane();
+  if (!lane) return;
+  const name = prompt('rename lane:', lane.name);
+  if (!name || !name.trim()) return;
+  try { await laneFetch('/api/control/lane/rename', { lane: lane.id, name: name.trim() }); heartbeat(); }
+  catch (e) { /* alerted */ }
+}
+
+async function deleteLane() {
+  const lane = currentLane();
+  if (!lane) return;
+  if (lane.id === 'corner') { alert('the corner lane cannot be deleted'); return; }
+  if (!confirm(`delete task "${lane.name}"? its worktrees stay on disk but the tab is removed.`)) return;
+  try {
+    await laneFetch('/api/control/lane/delete', { lane: lane.id });
+    selectedLane = null;
+    await heartbeat();
+  } catch (e) { /* alerted */ }
+}
+
+async function setLaneSlots(id, slots) {
+  try { await laneFetch('/api/control/lane/slots', { lane: id, slots: slots }); heartbeat(); }
+  catch (e) { /* alerted */ }
+}
+
+function applyLaneSlots() {
+  const lane = currentLane();
+  if (!lane) return;
+  const v = parseInt(document.getElementById('lane-slots').value, 10);
+  if (Number.isNaN(v) || v < 0) { alert('workers must be a non-negative integer'); return; }
+  setLaneSlots(lane.id, v);
+}
+
+function toggleLaneRun() {
+  const lane = currentLane();
+  if (!lane) return;
+  setLaneSlots(lane.id, lane.slots > 0 ? 0 : 1);
+}
+
+function renderTabs(s) {
+  const bar = document.getElementById('tabbar');
+  bar.innerHTML = '';
+  const lanes = Array.isArray(s.lanes) ? s.lanes : [];
+  if ((!selectedLane || !lanes.some(l => l.id === selectedLane)) && lanes.length) {
+    selectedLane = lanes[0].id;
   }
-});
+  for (const l of lanes) {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (l.id === selectedLane ? ' active' : '');
+    tab.title = `${l.kind} lane · ${l.siblings} sibling(s)`;
+    tab.innerHTML = `<span class="tab-dot ${l.running ? 'on' : ''}"></span>`
+      + `<span>${escapeHtml(l.name)}</span>`
+      + (l.kind === 'corner' ? '<span class="tab-kind">corner</span>' : '');
+    tab.onclick = () => selectLane(l.id);
+    bar.appendChild(tab);
+  }
+  const add = document.createElement('button');
+  add.className = 'tab-add';
+  add.textContent = '+ new task';
+  add.onclick = createLane;
+  bar.appendChild(add);
+}
+
+function syncLanePanel(s) {
+  const lane = currentLane();
+  const panel = document.getElementById('lane-panel');
+  if (!lane) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const runBtn = document.getElementById('lane-run');
+  if (lane.running) {
+    runBtn.textContent = '⏸ pause this lane';
+    runBtn.className = 'btn btn-stop';
+  } else {
+    runBtn.textContent = '▶ run this lane';
+    runBtn.className = 'btn btn-start';
+  }
+  runBtn.onclick = toggleLaneRun;
+  const slotsInput = document.getElementById('lane-slots');
+  slotsInput.max = s.max_slots_per_lane || 4;
+  if (document.activeElement !== slotsInput) slotsInput.value = lane.slots;
+  const state = lane.running ? 'running'
+    : (lane.slots > 0 ? 'armed (master paused — click run)' : 'paused');
+  document.getElementById('lane-info').textContent = `${lane.kind} · ${lane.siblings} sibling(s) · ${state}`;
+  document.getElementById('lane-delete').style.display = (lane.id === 'corner') ? 'none' : '';
+
+  // prompt editor synced to the selected lane (don't clobber unsaved edits)
+  const promptVal = lane.prompt || '';
+  if (!promptDirty && document.activeElement !== promptEditor) {
+    promptEditor.value = promptVal;
+    promptServerValue = promptVal;
+  }
+  // template editor synced to the lane's kind
+  const tmpl = (s.templates && s.templates[lane.kind]) || '';
+  if (!templateDirty && document.activeElement !== templateEditor) {
+    templateEditor.value = tmpl;
+    templateServerValue = tmpl;
+  }
+  const tf = (s.template_files && s.template_files[lane.kind]) || '';
+  if (templateFileLabel) templateFileLabel.textContent = tf ? '(' + tf + ')' : '';
+}
 
 function setPill(kind, text) {
   const p = document.getElementById('state-pill');
@@ -417,16 +572,16 @@ function setPill(kind, text) {
 }
 
 function updateControlBar(s) {
-  // toggle button + pill
+  // master toggle button + pill
   const btn = document.getElementById('btn-toggle');
   if (s.running) {
     setPill('running', '● running');
-    btn.textContent = 'stop';
+    btn.textContent = 'stop all';
     btn.className = 'btn btn-stop';
     btn.onclick = () => setRunning(false);
   } else {
     setPill('paused', '⏸ paused');
-    btn.textContent = 'start';
+    btn.textContent = 'start all';
     btn.className = 'btn btn-start';
     btn.onclick = () => setRunning(true);
   }
@@ -451,44 +606,32 @@ function updateControlBar(s) {
     budgetInput.value = (s.budget_pct || 0).toFixed(0);
   }
 
-  // mode dropdown — populate options once, then keep selection in sync
-  if (!modeOptionsPopulated && Array.isArray(s.available_modes) && s.available_modes.length) {
-    modeSelect.innerHTML = '';
-    for (const m of s.available_modes) {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      modeSelect.appendChild(opt);
+  // companion prompter toggle
+  const pbtn = document.getElementById('btn-prompter');
+  const phint = document.getElementById('prompter-hint');
+  if (pbtn) {
+    if (s.prompter_enabled) {
+      pbtn.textContent = 'companion: ON';
+      pbtn.className = 'btn btn-start';
+      pbtn.onclick = () => setPrompter(false);
+    } else {
+      pbtn.textContent = 'companion: OFF';
+      pbtn.className = 'btn btn-stop';
+      pbtn.onclick = () => setPrompter(true);
     }
-    modeOptionsPopulated = true;
   }
-  if (s.mode && document.activeElement !== modeSelect && modeSelect.value !== s.mode) {
-    modeSelect.value = s.mode;
-  }
-
-  // prompt editor — sync from server unless the user is editing
-  if (s.prompt_file) promptFileLabel.textContent = '(' + s.prompt_file + ')';
-  if (s.prompt !== undefined) {
-    const serverChanged = (s.prompt !== promptServerValue);
-    promptServerValue = s.prompt;
-    if (!promptDirty && document.activeElement !== promptEditor) {
-      promptEditor.value = s.prompt;
-    } else if (serverChanged && !promptDirty) {
-      promptEditor.value = s.prompt;
+  if (phint) {
+    if (s.prompter_enabled) {
+      const model = s.prompter_model || '(model not detected)';
+      phint.textContent = 'local model writes each next prompt — ' + model + ' @ ' + (s.prompter_base || '?');
+    } else {
+      phint.textContent = 'using the handwritten prompt below verbatim each iteration';
     }
   }
 
-  // template editor — same pattern
-  if (s.template_file) templateFileLabel.textContent = '(' + s.template_file + ')';
-  if (s.template !== undefined) {
-    const serverChanged = (s.template !== templateServerValue);
-    templateServerValue = s.template;
-    if (!templateDirty && document.activeElement !== templateEditor) {
-      templateEditor.value = s.template;
-    } else if (serverChanged && !templateDirty) {
-      templateEditor.value = s.template;
-    }
-  }
+  // tabs + the selected lane's panel (prompt + template + per-lane run control)
+  renderTabs(s);
+  syncLanePanel(s);
 
   // statusline bar
   document.getElementById('status').textContent = s.statusline || '(no rate-limit data yet)';
@@ -504,8 +647,9 @@ async function heartbeat() {
     const s = await stateRes.json();
     const siblings = await siblingsRes.json();
     lastState = s;
+    lastSiblings = siblings;
     updateControlBar(s);
-    syncSiblings(siblings);
+    syncSiblings(laneSiblings());
     // Append new messages to any currently-open sessions
     for (const key of Array.from(expanded.sessions)) {
       const [sib, sid] = key.split('/');
@@ -523,6 +667,21 @@ async function setRunning(v) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ running: v }),
+    });
+    const j = await r.json();
+    if (j.error) alert('error: ' + j.error);
+    heartbeat();
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+}
+
+async function setPrompter(v) {
+  try {
+    const r = await fetch('/api/control/prompter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: v }),
     });
     const j = await r.json();
     if (j.error) alert('error: ' + j.error);
@@ -553,8 +712,8 @@ async function applyBudget() {
 async function refreshSiblings() {
   try {
     const r = await fetch('/api/siblings');
-    const siblings = await r.json();
-    renderSiblings(siblings);
+    lastSiblings = await r.json();
+    renderSiblings(laneSiblings());
   } catch (e) {
     document.getElementById('content').textContent = 'error: ' + e.message;
   }
@@ -662,7 +821,7 @@ function renderSiblings(siblings) {
   const content = document.getElementById('content');
   content.innerHTML = '';
   if (siblings.length === 0) {
-    content.innerHTML = '<div class="empty">no siblings yet — waiting for spin.py to spawn one</div>';
+    content.innerHTML = '<div class="empty">no siblings in this lane yet — run it to spawn one</div>';
     return;
   }
   for (const s of siblings) content.appendChild(createSiblingEl(s));
@@ -1179,9 +1338,19 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
                 work = d / "work"
                 sessions = _find_sessions(work)
                 files = _list_files(work)
+                lane = "corner"
+                mf = d / ".mode"
+                if mf.exists():
+                    try:
+                        v = mf.read_text().strip()
+                        if v:
+                            lane = v
+                    except OSError:
+                        pass
                 result.append({
                     "name": d.name,
                     "mtime": mtime,
+                    "lane": lane,
                     "sessions": sessions,
                     "files": files,
                 })
@@ -1252,39 +1421,97 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if controls is None or not hasattr(controls, "set_template"):
             return jsonify({"error": "no controls wired"}), 500
         data = request.get_json(force=True, silent=True) or {}
+        kind = data.get("kind")
         text = data.get("template", "")
-        if not isinstance(text, str):
-            return jsonify({"error": "template must be a string"}), 400
+        if not isinstance(kind, str) or not isinstance(text, str):
+            return jsonify({"error": "kind and template must be strings"}), 400
         try:
-            fname = controls.set_template(text)
+            fname = controls.set_template(kind, text)
         except OSError as e:
             return jsonify({"error": f"write failed: {e}"}), 500
+        if fname is None:
+            return jsonify({"error": f"unknown kind {kind!r}"}), 400
         return jsonify({"template_file": fname})
 
-    @app.route("/api/control/prompt", methods=["POST"])
-    def api_set_prompt():
-        if controls is None or not hasattr(controls, "set_prompt"):
+    @app.route("/api/control/lane/prompt", methods=["POST"])
+    def api_set_lane_prompt():
+        if controls is None or not hasattr(controls, "set_lane_prompt"):
             return jsonify({"error": "no controls wired"}), 500
         data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
         text = data.get("prompt", "")
-        if not isinstance(text, str):
-            return jsonify({"error": "prompt must be a string"}), 400
+        if not isinstance(lane, str) or not isinstance(text, str):
+            return jsonify({"error": "lane and prompt must be strings"}), 400
         try:
-            fname = controls.set_prompt(text)
+            res = controls.set_lane_prompt(lane, text)
         except OSError as e:
             return jsonify({"error": f"write failed: {e}"}), 500
-        return jsonify({"prompt_file": fname})
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify({"lane": res})
 
-    @app.route("/api/control/mode", methods=["POST"])
-    def api_set_mode():
-        if controls is None or not hasattr(controls, "set_mode"):
+    @app.route("/api/control/lane/slots", methods=["POST"])
+    def api_set_lane_slots():
+        if controls is None or not hasattr(controls, "set_lane_slots"):
             return jsonify({"error": "no controls wired"}), 500
         data = request.get_json(force=True, silent=True) or {}
-        mode = data.get("mode")
-        if not isinstance(mode, str):
-            return jsonify({"error": "mode must be a string"}), 400
-        new_mode = controls.set_mode(mode)
-        return jsonify({"mode": new_mode})
+        lane = data.get("lane")
+        slots = data.get("slots")
+        if not isinstance(lane, str):
+            return jsonify({"error": "lane must be a string"}), 400
+        res = controls.set_lane_slots(lane, slots)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r} or bad slots"}), 400
+        return jsonify({"slots": res})
+
+    @app.route("/api/control/lanes", methods=["POST"])
+    def api_create_lane():
+        if controls is None or not hasattr(controls, "create_lane"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        name = data.get("name", "")
+        kind = data.get("kind", "task")
+        if not isinstance(name, str) or not name.strip():
+            return jsonify({"error": "name must be a non-empty string"}), 400
+        res = controls.create_lane(name, kind if isinstance(kind, str) else "task")
+        if res is None:
+            return jsonify({"error": "could not create lane"}), 400
+        return jsonify(res)
+
+    @app.route("/api/control/lane/rename", methods=["POST"])
+    def api_rename_lane():
+        if controls is None or not hasattr(controls, "rename_lane"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        name = data.get("name", "")
+        if not isinstance(lane, str) or not isinstance(name, str) or not name.strip():
+            return jsonify({"error": "lane and a non-empty name are required"}), 400
+        res = controls.rename_lane(lane, name)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify({"name": res})
+
+    @app.route("/api/control/lane/delete", methods=["POST"])
+    def api_delete_lane():
+        if controls is None or not hasattr(controls, "delete_lane"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        if not isinstance(lane, str):
+            return jsonify({"error": "lane must be a string"}), 400
+        ok = controls.delete_lane(lane)
+        if not ok:
+            return jsonify({"error": "could not delete (built-in lane or unknown)"}), 400
+        return jsonify({"deleted": lane})
+
+    @app.route("/api/control/prompter", methods=["POST"])
+    def api_set_prompter():
+        if controls is None or not hasattr(controls, "set_prompter"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        new_v = controls.set_prompter(bool(data.get("enabled")))
+        return jsonify({"prompter_enabled": new_v})
 
     @app.route("/api/control/budget", methods=["POST"])
     def api_set_budget():
