@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>InfiniteDraw — infinite zoom + flipbook</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="board"></canvas>
+
+  <!-- Top toolbar -->
+  <div id="toolbar" class="panel">
+    <div class="group" role="group" aria-label="Tools">
+      <button data-tool="pen" class="tool active" title="Pen (P)">✏️</button>
+      <button data-tool="line" class="tool" title="Straight line (L)">📏</button>
+      <button data-tool="rect" class="tool" title="Rectangle (R)">▭</button>
+      <button data-tool="ellipse" class="tool" title="Ellipse (O)">◯</button>
+      <button data-tool="eraser" class="tool" title="Eraser (E)">🧽</button>
+      <button data-tool="eyedropper" class="tool" title="Eyedropper — pick a colour (I)">💧</button>
+      <button data-tool="pan" class="tool" title="Pan / hold Space (H)">✋</button>
+    </div>
+
+    <div class="group">
+      <label class="swatch-label" title="Color (C)">
+        <input type="color" id="color" value="#34d2ff" />
+      </label>
+      <div id="palette" class="palette" aria-label="Quick colors"></div>
+      <label class="swatch-label" title="Background color">
+        <input type="color" id="bg" value="#0d0f15" />
+      </label>
+    </div>
+
+    <div class="group">
+      <label class="slider" title="Brush size — drawn at this many on-screen pixels">
+        <span>Size</span>
+        <input type="range" id="size" min="1" max="80" step="1" value="6" />
+        <output id="sizeOut">6</output>
+      </label>
+      <label class="slider" title="Brush opacity">
+        <span>Opacity</span>
+        <input type="range" id="opacity" min="5" max="100" step="5" value="100" />
+        <output id="opacityOut">100%</output>
+      </label>
+      <label class="chk" title="New strokes keep a constant on-screen width as you zoom">
+        <input type="checkbox" id="zoomDependent" checked />
+        <span>Zoom-aware width</span>
+      </label>
+      <label class="chk" title="Render pen strokes as smooth curves">
+        <input type="checkbox" id="smooth" checked />
+        <span>Smooth</span>
+      </label>
+    </div>
+
+    <div class="group">
+      <button id="undo" title="Undo (Ctrl/⌘+Z)">↶ Undo</button>
+      <button id="redo" title="Redo (Ctrl/⌘+Shift+Z)">↷ Redo</button>
+      <button id="clearFrame" title="Clear current frame">🗑 Clear</button>
+    </div>
+
+    <div class="group">
+      <button id="resetView" title="Reset view (0)">⊙ Reset view</button>
+      <button id="fitView" title="Zoom to fit drawing (F)">⤢ Fit</button>
+      <span id="zoomLabel" class="readout" title="Current zoom">100%</span>
+    </div>
+
+    <div class="group">
+      <button id="save" title="Save to browser storage (Ctrl/⌘+S)">💾 Save</button>
+      <button id="exportJson" title="Export project as .json">⬇ JSON</button>
+      <button id="importJson" title="Import project .json">⬆ JSON</button>
+      <button id="exportPng" title="Export current view as .png">🖼 PNG</button>
+      <button id="exportGif" title="Export animation frames as .gif">🎞 GIF</button>
+      <input type="file" id="importFile" accept="application/json" hidden />
+    </div>
+  </div>
+
+  <!-- Frames / flipbook panel -->
+  <div id="frames" class="panel">
+    <div class="frames-head">
+      <strong>Flipbook</strong>
+      <span id="frameCounter" class="readout">1 / 1</span>
+    </div>
+    <div class="frames-controls">
+      <button id="firstFrame" title="First frame">⏮</button>
+      <button id="prevFrame" title="Previous frame (,)">◀</button>
+      <button id="playPause" title="Play / pause (Enter)">▶ Play</button>
+      <button id="nextFrame" title="Next frame (.)">▶</button>
+      <button id="lastFrame" title="Last frame">⏭</button>
+    </div>
+    <div class="frames-controls">
+      <button id="addFrame" title="Add blank frame (N)">＋ Frame</button>
+      <button id="dupFrame" title="Duplicate frame (D)">⧉ Duplicate</button>
+      <button id="delFrame" title="Delete frame">✕ Delete</button>
+    </div>
+    <div class="frames-controls">
+      <button id="copyFrame" title="Copy this frame's strokes (Ctrl/⌘+C)">⧉ Copy</button>
+      <button id="pasteFrame" title="Paste strokes into this frame (Ctrl/⌘+V)">📋 Paste</button>
+      <button id="reverseFrames" title="Reverse frame order">⇄ Reverse</button>
+    </div>
+    <label class="slider" title="Playback speed">
+      <span>FPS</span>
+      <input type="range" id="fps" min="1" max="30" step="1" value="8" />
+      <output id="fpsOut">8</output>
+    </label>
+    <div class="hold-row" title="Hold the current frame for N playback ticks (stop-motion timing)">
+      <span>Hold this frame</span>
+      <button id="holdMinus" class="mini">−</button>
+      <output id="holdOut">×1</output>
+      <button id="holdPlus" class="mini">+</button>
+    </div>
+    <label class="chk" title="Show neighbouring frames as ghosts (onion skinning)">
+      <input type="checkbox" id="onion" />
+      <span>Onion skin</span>
+    </label>
+    <label class="slider" title="How many neighbour frames to ghost">
+      <span>Onion depth</span>
+      <input type="range" id="onionDepth" min="1" max="5" step="1" value="1" />
+      <output id="onionDepthOut">1</output>
+    </label>
+    <label class="chk" title="Loop playback">
+      <input type="checkbox" id="loop" checked />
+      <span>Loop</span>
+    </label>
+    <label class="chk" title="Bounce back and forth instead of looping">
+      <input type="checkbox" id="pingpong" />
+      <span>Ping-pong</span>
+    </label>
+    <div id="thumbs" class="thumbs" aria-label="Frame thumbnails"></div>
+  </div>
+
+  <!-- Minimap / locator for the infinite canvas -->
+  <div id="minimap" class="panel minimap">
+    <div class="mini-head">
+      <strong>Map</strong>
+      <button id="minimapToggle" class="link" title="Toggle minimap (M)">hide</button>
+    </div>
+    <canvas id="minimapCanvas" width="190" height="120" title="Click to jump there"></canvas>
+  </div>
+
+  <!-- Help / hint -->
+  <div id="hint" class="panel hint">
+    <strong>InfiniteDraw</strong> · scroll = zoom · drag = draw · Space/middle-drag = pan ·
+    <button id="helpToggle" class="link">shortcuts</button>
+    <div id="helpBody" hidden>
+      <div><kbd>P</kbd> pen · <kbd>L</kbd> line · <kbd>R</kbd> rect · <kbd>O</kbd> ellipse · <kbd>E</kbd> eraser · <kbd>H</kbd>/<kbd>Space</kbd> pan</div>
+      <div><kbd>[</kbd>/<kbd>]</kbd> brush size · <kbd>C</kbd> color focus · <kbd>X</kbd> swap recent colors</div>
+      <div><kbd>0</kbd> reset view · <kbd>F</kbd> fit · <kbd>Ctrl/⌘+Z</kbd> undo · <kbd>Shift</kbd> redo</div>
+      <div><kbd>N</kbd> new frame · <kbd>D</kbd> duplicate · <kbd>,</kbd>/<kbd>.</kbd> prev/next · <kbd>Enter</kbd> play</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="gif.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
