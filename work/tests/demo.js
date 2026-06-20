@@ -68,6 +68,27 @@ await page.evaluate(() => {
 });
 await shot('shapes');
 
+// --- rotation showcase: a fan of rotated, translucent bars around one centre ---
+console.log('rotation showcase...');
+await page.evaluate(() => {
+  const A = window.__INFINIZOOM__;
+  A.clear(); A.setCamera({ x: 0, y: 0, scale: 1 }); A.setTool('select');
+  const cols = ['#ff5b6e', '#ffa94d', '#ffd43b', '#69db7c', '#38d9a9', '#4dabf7', '#5b8cff', '#b197fc', '#f783ac'];
+  const ids = [];
+  for (let i = 0; i < cols.length; i++) {
+    // each bar is centred on world (0,0); rotateSelection spins it about that centre
+    const id = A.addRect(-26, -150, 52, 300, { color: cols[i], fill: cols[i], opacity: 0.5 });
+    A.select([id]);
+    A.rotateSelection((i / cols.length) * Math.PI);
+    ids.push(id);
+  }
+  A.select(ids); A.group();           // bind the whole pinwheel into one group
+  A.select([]);
+  A.addText(-360, 250, 'free rotation + groups', { size: 44, color: '#e8e8ef' });
+  A.fitAll();
+});
+await shot('rotation');
+
 // --- recursive-stamp fractal, then a deep zoom into its heart ---
 console.log('stamp-fractal deep zoom...');
 await page.evaluate(() => {

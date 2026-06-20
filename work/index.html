@@ -19,6 +19,7 @@
     <button class="tool" data-tool="ellipse" title="Ellipse (O)">◯</button>
     <button class="tool" data-tool="star"    title="Star / polygon (S)">★</button>
     <button class="tool" data-tool="text"    title="Text (T)">T</button>
+    <button class="tool" data-tool="connector" title="Connector — drag between two objects (C)">⇢</button>
     <button class="tool" data-tool="select"  title="Select (V)">⬚</button>
     <button class="tool" data-tool="eraser"  title="Eraser (E)">🩹</button>
     <button class="tool" data-tool="pan"     title="Pan (H / hold Space)">✋</button>
@@ -67,6 +68,12 @@
       <button id="raise" title="Raise (Ctrl+])">↑</button>
       <button id="toFront" title="Bring to front (])">⤒</button>
     </div>
+    <div class="btn-row">
+      <button id="rotL" title="Rotate −15° (,)">↺</button>
+      <button id="rotR" title="Rotate +15° (.)">↻</button>
+      <button id="groupBtn" title="Group selection (Ctrl+G)">⊞</button>
+      <button id="ungroupBtn" title="Ungroup (Ctrl+Shift+G)">⊟</button>
+    </div>
     <span class="ctl-label">Visible zoom (LOD)</span>
     <div class="btn-row">
       <button id="lodFar" title="Show only when zoomed OUT past now">far</button>
@@ -93,6 +100,8 @@
     <button id="exportJson" title="Export drawing as JSON">💾 JSON</button>
     <button id="importJson" title="Import JSON">📂 Open</button>
     <input type="file" id="importFile" accept="application/json" hidden />
+    <button id="addImageBtn" title="Place an image (or just drag/drop one onto the canvas)">🖼 Image</button>
+    <input type="file" id="imageFile" accept="image/*" hidden />
     <span class="sep-h"></span>
     <div class="grid-row">
       <label class="toggle"><input type="checkbox" id="gridToggle" checked /> Grid</label>

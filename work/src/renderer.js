@@ -1,4 +1,4 @@
-import { itemBBox, lodVisible, polygonVertices } from './scene.js';
+import { itemBBox, lodVisible, polygonVertices, rotCenter, ROTATABLE } from './scene.js';
 import { withAlpha, clamp } from './util.js';
 
 /**
@@ -17,7 +17,46 @@ export class Renderer {
     this.gridStyle = 'lines'; // 'lines' | 'dots'
     this.bg = '#0e0f13';
     this.gridColor = '#ffffff';
+    this._images = new Map(); // src -> { img, loaded, broken }
+    this.onAsyncLoad = null;  // called when a deferred image bitmap finishes loading
     this.resize();
+  }
+
+  /**
+   * Lazily decode an image `src` into a cached HTMLImageElement. Returns the
+   * cache entry immediately; when an async decode completes it flips `loaded`
+   * (or `broken`) and fires `onAsyncLoad` so the app can repaint. Reused across
+   * frames so panning/zooming never re-decodes.
+   */
+  _image(src) {
+    let entry = this._images.get(src);
+    if (entry) return entry;
+    entry = { img: new Image(), loaded: false, broken: false };
+    entry.img.onload = () => { entry.loaded = true; this.onAsyncLoad && this.onAsyncLoad(); };
+    entry.img.onerror = () => { entry.broken = true; this.onAsyncLoad && this.onAsyncLoad(); };
+    entry.img.src = src;
+    // data URLs may already be decoded synchronously in some engines
+    if (entry.img.complete && entry.img.naturalWidth) entry.loaded = true;
+    this._images.set(src, entry);
+    return entry;
+  }
+
+  /** Kick off decoding of every image src in the scene so bitmaps are ready
+   *  before they scroll into view (and so pendingImages is meaningful even when
+   *  an image is currently culled offscreen). */
+  warmImages(scene) {
+    for (const it of scene.items) if (it.type === 'image' && it.src) this._image(it.src);
+  }
+
+  /** How many image items still have an undecoded bitmap (test/UX hook). */
+  pendingImages(scene) {
+    let n = 0;
+    for (const it of scene.items) {
+      if (it.type !== 'image' || !it.src) continue;
+      const e = this._images.get(it.src);
+      if (!e || (!e.loaded && !e.broken)) n++;
+    }
+    return n;
   }
 
   resize() {
@@ -61,6 +100,7 @@ export class Renderer {
     let drawn = 0;
     for (const it of scene.items) {
       if (!lodVisible(it, camera.scale)) continue;          // zoom-dependent visibility
+      if (it.type === 'connector' && (!scene.byId(it.from) || !scene.byId(it.to))) continue; // dangling
       const b = itemBBox(it);
       if (b.maxX < cull.minX || b.minX > cull.maxX || b.maxY < cull.minY || b.minY > cull.maxY) continue;
       this._drawItem(it);
@@ -74,6 +114,7 @@ export class Renderer {
     // Selection chrome & marquee in screen space.
     this._screenSpace();
     if (selected.size) this._drawSelection(scene, selected);
+    if (state.rotHandle) this._drawRotHandle(state.rotHandle);
     if (state.marquee) this._drawMarquee(state.marquee);
     if (state.eraserCursor) this._drawEraserCursor(state.eraserCursor);
   }
@@ -164,6 +205,17 @@ export class Renderer {
     const minWorldWidth = camera.screenToWorldLen(0.75); // keep hairlines visible
     const lw = Math.max(it.width || 1, minWorldWidth);
 
+    // Rotated box items draw in a locally-rotated world frame; point items bake
+    // their rotation into the geometry so they need no transform here.
+    const rotated = !!it.rot && ROTATABLE.has(it.type);
+    if (rotated) {
+      const c = rotCenter(it);
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(it.rot);
+      ctx.translate(-c.x, -c.y);
+    }
+
     switch (it.type) {
       case 'stroke': {
         const p = it.points;
@@ -186,20 +238,12 @@ export class Renderer {
       }
       case 'arrow': {
         const [a, b] = it.points;
-        ctx.strokeStyle = it.color;
-        ctx.fillStyle = it.color;
-        ctx.lineWidth = lw;
-        const ang = Math.atan2(b.y - a.y, b.x - a.x);
-        const len = Math.hypot(b.x - a.x, b.y - a.y);
-        const head = Math.min(len * 0.4, Math.max(lw * 3.5, len * 0.12));
-        // shaft stops short of the head so the tip is crisp
-        const sx = b.x - Math.cos(ang) * head * 0.8, sy = b.y - Math.sin(ang) * head * 0.8;
-        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(sx, sy); ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(b.x, b.y);
-        ctx.lineTo(b.x - Math.cos(ang - 0.5) * head, b.y - Math.sin(ang - 0.5) * head);
-        ctx.lineTo(b.x - Math.cos(ang + 0.5) * head, b.y - Math.sin(ang + 0.5) * head);
-        ctx.closePath(); ctx.fill();
+        this._drawArrowSeg(a, b, it.color, lw, true);
+        break;
+      }
+      case 'connector': {
+        const a = { x: it.ax, y: it.ay }, b = { x: it.bx, y: it.by };
+        this._drawArrowSeg(a, b, it.color, lw, it.arrow !== false);
         break;
       }
       case 'polygon': {
@@ -228,6 +272,20 @@ export class Renderer {
         ctx.strokeStyle = it.color; ctx.lineWidth = lw; ctx.stroke();
         break;
       }
+      case 'image': {
+        const x = Math.min(it.x, it.x + it.w), y = Math.min(it.y, it.y + it.h);
+        const w = Math.abs(it.w), h = Math.abs(it.h);
+        const entry = it.src ? this._image(it.src) : null;
+        if (entry && entry.loaded) {
+          // crisper downscales when an image is shrunk far below native size
+          ctx.imageSmoothingEnabled = true;
+          try { ctx.drawImage(entry.img, x, y, w, h); }
+          catch { this._drawImagePlaceholder(x, y, w, h, true); }
+        } else {
+          this._drawImagePlaceholder(x, y, w, h, entry ? entry.broken : true);
+        }
+        break;
+      }
       case 'text': {
         ctx.fillStyle = it.color;
         ctx.textBaseline = 'top';
@@ -239,8 +297,48 @@ export class Renderer {
         break;
       }
     }
+    if (rotated) ctx.restore();
     if (isDraft) { /* draft uses same styling; hook kept for future ghosting */ }
     ctx.globalAlpha = 1;
+  }
+
+  /** Draw a line a→b, optionally capped with a filled arrowhead at b. */
+  _drawArrowSeg(a, b, color, lw, withHead) {
+    const { ctx } = this;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    const ang = Math.atan2(b.y - a.y, b.x - a.x);
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (!withHead) { ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); return; }
+    ctx.fillStyle = color;
+    const head = Math.min(len * 0.4, Math.max(lw * 3.5, len * 0.12));
+    // shaft stops short of the head so the tip is crisp
+    const sx = b.x - Math.cos(ang) * head * 0.8, sy = b.y - Math.sin(ang) * head * 0.8;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(sx, sy); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - Math.cos(ang - 0.5) * head, b.y - Math.sin(ang - 0.5) * head);
+    ctx.lineTo(b.x - Math.cos(ang + 0.5) * head, b.y - Math.sin(ang + 0.5) * head);
+    ctx.closePath(); ctx.fill();
+  }
+
+  /** Placeholder frame shown while an image decodes (or when it fails). */
+  _drawImagePlaceholder(x, y, w, h, broken) {
+    const { ctx } = this;
+    ctx.save();
+    ctx.fillStyle = withAlpha(broken ? '#ff5b6e' : '#5b8cff', 0.10);
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = withAlpha(broken ? '#ff5b6e' : '#5b8cff', 0.6);
+    ctx.lineWidth = this.camera.screenToWorldLen(1);
+    ctx.setLineDash([this.camera.screenToWorldLen(6), this.camera.screenToWorldLen(4)]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
+    // diagonal cross conveys "image" without needing a font
+    ctx.beginPath();
+    ctx.moveTo(x, y); ctx.lineTo(x + w, y + h);
+    ctx.moveTo(x + w, y); ctx.lineTo(x, y + h);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // ---- selection ----
@@ -267,6 +365,20 @@ export class Renderer {
       ctx.strokeStyle = withAlpha('#5b8cff', 0.5);
       ctx.strokeRect(R.minX - 3, R.minY - 3, R.maxX - R.minX + 6, R.maxY - R.minY + 6);
     }
+  }
+
+  /** A small round grab handle above the selection for free rotation. */
+  _drawRotHandle(h) {
+    const { ctx } = this;
+    ctx.strokeStyle = withAlpha('#5b8cff', 0.85);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(h.x, h.y + 22); ctx.lineTo(h.x, h.y);   // stalk down to the bbox top
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, h.r, 0, Math.PI * 2);
+    ctx.fillStyle = withAlpha('#0e0f13', 0.9); ctx.fill();
+    ctx.stroke();
   }
 
   _drawMarquee(m) {

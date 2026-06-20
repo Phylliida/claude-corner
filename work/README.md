@@ -23,7 +23,13 @@ Then open the served URL and draw.
 ## Features
 
 **Drawing tools** — pen (freehand, RDP-simplified), line, arrow, rectangle,
-ellipse, star/polygon (3–12 points, star or regular), text, eraser, select, pan.
+ellipse, star/polygon (3–12 points, star or regular), text, **connector**, eraser,
+select, pan.
+
+**Connectors / diagramming** — with the connector tool (`C`), drag from one object
+to another to link them. The connector stays glued to both, re-routing live as you
+move, rotate, or zoom — and it's deleted automatically when either endpoint is.
+Turns the infinite canvas into a zoomable diagramming surface.
 
 **Infinite canvas**
 - Zoom anchored at the cursor; pan with the hand tool, space-drag, or middle mouse.
@@ -33,9 +39,17 @@ ellipse, star/polygon (3–12 points, star or regular), text, eraser, select, pa
 - Viewport **culling** keeps it fast — 5,000 items render in ~11 ms; when you zoom
   in, only the handful of on-screen items are drawn.
 
-**Editing** — multi-select (click, shift-click, marquee), move, per-item colour /
-width / **opacity**, fill, z-order (front/back/raise/lower), copy/cut/paste,
+**Editing** — multi-select (click, shift-click, marquee), move, **free rotation**
+(drag the handle above the selection, or `.`/`,` for 15° steps; hold `⇧` to snap),
+**group / ungroup** (grouped items select, move, and rotate as one unit), per-item
+colour / width / **opacity**, fill, z-order (front/back/raise/lower), copy/cut/paste,
 duplicate, an **eyedropper** (Alt+click to sample a colour), and full undo/redo.
+
+**Images** — drag-and-drop an image file onto the canvas, paste one from the
+clipboard, or use the 🖼 button. Images are first-class items: zoomable, movable,
+rotatable, fade-able, LOD-taggable, and they round-trip through JSON and SVG.
+
+![rotation + groups](screenshots/rotation.png)
 
 **Infinite-zoom superpowers**
 - **Level of detail (LOD):** tag items to appear only when zoomed in (`near`) or
@@ -59,14 +73,18 @@ and JSON import.
 |-----|--------|-----|--------|
 | `P` pen · `L` line · `A` arrow | tools | `Ctrl/⌘ Z` / `⇧Z` | undo / redo |
 | `R` rect · `O` ellipse · `S` star | tools | `Ctrl/⌘ A` | select all |
-| `T` text · `V` select · `E` eraser · `H` pan | tools | `Ctrl/⌘ C·X·V·D` | copy·cut·paste·dup |
+| `T` text · `C` connector · `V` select | tools | `Ctrl/⌘ C·X·V·D` | copy·cut·paste·dup |
+| `E` eraser · `H` pan | tools | `Ctrl/⌘ G` / `⇧G` | group / ungroup |
 | `+` / `-` | zoom in / out | `Delete` | delete selection |
 | `F` | zoom to fit | `]` / `[` | bring to front / send to back |
 | `0` | reset view | `Ctrl ]` / `Ctrl [` | raise / lower |
 | `G` | toggle grid | `Esc` | clear selection |
+| `.` / `,` | rotate selection ±15° | drag-drop / paste | place an image |
 
 Hold `⇧` while drawing a line/arrow to snap angles, or a rect/ellipse/star to
-keep it square. **Alt+click** anywhere to eyedrop the colour under the cursor.
+keep it square. Hold `⇧` while dragging the rotation handle to snap to 15°.
+**Alt+click** anywhere to eyedrop the colour under the cursor. **Drag-and-drop**
+(or paste) an image file onto the canvas to place it.
 
 ## Architecture
 
@@ -94,14 +112,15 @@ screen pixels. Stroke widths are world-relative, so zooming feels physical.
 
 `app.js` exposes `window.__INFINIZOOM__` so tests (and you, from the console) can
 drive everything headlessly: tools, styling, camera, items, undo/redo, generators,
-LOD, stamp, bookmarks, export, and pixel-level rendering checks. `window.app` is
-the live instance.
+LOD, stamp, bookmarks, images, rotation, grouping, connectors, export, and
+pixel-level rendering checks. `window.app` is the live instance.
 
 ## Testing notes
 
-The suite covers core loading, drawing each tool, the camera (including deep-zoom
-precision and culling), history, persistence, keyboard shortcuts, generators,
-LOD, recursive stamp, bookmarks/fly-to, SVG export, clipboard, and performance.
+The suite (150 tests) covers core loading, drawing each tool, the camera (including
+deep-zoom precision and culling), history, persistence, keyboard shortcuts,
+generators, LOD, recursive stamp, bookmarks/fly-to, SVG export, clipboard,
+performance, images, rotation, grouping, and connectors.
 
 > **NixOS:** Playwright's prebuilt Chromium can't run (missing dynamic linker), so
 > the tests auto-resolve a Nix-store `chromium` via `tests/_helpers.js`. Set
