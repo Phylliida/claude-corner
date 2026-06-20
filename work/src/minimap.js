@@ -56,8 +56,9 @@ export class Minimap {
     const offX = (W - rw * s) / 2, offY = (H - rh * s) / 2;
     const map = (wx, wy) => ({ x: (wx - region.minX) * s + offX, y: (wy - region.minY) * s + offY });
 
-    // items
+    // items (hidden ones are omitted, matching the main canvas)
     for (const it of this.scene.items) {
+      if (it.hidden) continue;
       const b = itemBBox(it);
       const a = map(b.minX, b.minY), c = map(b.maxX, b.maxY);
       ctx.fillStyle = withAlpha(it.color || '#e8e8ef', 0.85);

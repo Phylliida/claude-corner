@@ -89,6 +89,29 @@ await page.evaluate(() => {
 });
 await shot('rotation');
 
+// --- brush showcase: pressure-tapered ink swashes ---
+console.log('brush showcase...');
+await page.evaluate(() => {
+  const A = window.__INFINIZOOM__;
+  A.clear(); A.setCamera({ x: 0, y: 0, scale: 1 });
+  const cols = ['#ff5b6e', '#ffd43b', '#69db7c', '#4dabf7', '#b197fc'];
+  for (let r = 0; r < cols.length; r++) {
+    const pts = [];
+    const y0 = -210 + r * 95;
+    for (let i = 0; i <= 60; i++) {
+      const t = i / 60;
+      const x = -560 + t * 1120;
+      const y = y0 + Math.sin(t * Math.PI * 2 + r) * 42;
+      const p = 0.12 + 0.88 * Math.sin(t * Math.PI); // swells in the middle, tapers at the ends
+      pts.push([x, y, p]);
+    }
+    A.addBrushStroke(pts, { color: cols[r], width: 48 });
+  }
+  A.addText(-560, 250, 'pressure brush — tapered ink', { size: 40, color: '#e8e8ef' });
+  A.fitAll();
+});
+await shot('brush');
+
 // --- recursive-stamp fractal, then a deep zoom into its heart ---
 console.log('stamp-fractal deep zoom...');
 await page.evaluate(() => {

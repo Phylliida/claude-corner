@@ -50,10 +50,11 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - persistence  — reload survival, camera persist, JSON round-trip, corrupt LS
 - keyboard     — all tool keys, undo/redo, select-all, delete, dup, zoom, fit
 
-## Status: WORKING. All 150 tests green (19 spec files), full suite stable.
-## README.md written. ~3000 LOC across src/. Suite runs ~1.6min.
+## Status: WORKING. All 171 tests green (21 spec files), full suite stable (~1.8min).
+## README.md written. ~3200 LOC across src/.
 ## Next-you: pick a feature from the TODO below, implement + test, keep the suite green.
 ## (batch 4, fresh instance 2026-06-19: image items + rotation + group/ungroup + connectors, +40 tests.)
+## (batch 5, fresh instance 2026-06-19: lock/hide + Objects panel, pressure/tapered brush, +21 tests.)
 
 ## Added since v1 (all tested)
 - **5 procedural generators** (src/generators.js): tree, spiral, droste,
@@ -139,6 +140,50 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
     preview reuses the draft render path. Test API: addConnector(from,to,style),
     resolveConnectors(). Renderer._drawArrowSeg() is shared by arrow + connector.
 
+## Added in this session (batch 5 — fresh instance 2026-06-19)
+- **lock / hide per item** — tests/layers.spec.js (12 tests)
+  - Items carry optional booleans `locked` and `hidden` (deleted when off, like
+    `opacity`/`rot`, so JSON stays tidy). `App._setFlag(ids, flag, on)` toggles
+    them reversibly through history.
+  - Enforcement: **renderer** + **minimap** skip `hidden`; **Scene.pick** always
+    skips `hidden` (it's not on screen) but leaves `locked` to the caller's filter;
+    `itemsContainedIn` (marquee) skips BOTH. App has two pick filters now:
+    `_lodFilter` (lod only — used by connector snapping + eyedropper so you can
+    still wire onto a locked shape) and `_selFilter` (lod + not-locked — used by
+    click-select + eraser). `selectAll` skips both. SVG export skips `hidden`.
+    Setting `locked`/`hidden` also drops the item from the current selection.
+  - UX: 🔒 / 👁 buttons in the style panel's arrange area toggle the selection;
+    **Shift+L** / **Shift+H** are the keys (guarded BEFORE the lowercase tool
+    switch, where l=line, h=pan). Recovery from "I locked everything" is the
+    **Objects panel** header's *Show all* / *Unlock all* (they operate on the
+    whole document, so items past the panel's row cap are always reachable —
+    companion's point).
+  - **Objects/layers panel** (`#layers-panel`, second left column): live list of
+    items front-most-first (top of z-stack on top), each row = click-name-to-select
+    + per-row hide + lock toggles. Rebuilt off the hot path via a 120ms-debounced
+    `_scheduleLayers` (called from `_updateHud`), DOM rows capped at 120 so the
+    5k-item perf test stays fast. Test API: setLocked/setHidden/showAll/unlockAll/
+    isLocked/isHidden/lockedCount/hiddenCount/renderLayers, plus lockSelection/
+    hideSelection (toggles).
+- **pressure / tapered brush** — tests/brush.spec.js (9 tests)
+  - New **brush tool** (🖌️, key **B**). Produces a normal `type:'stroke'` item
+    with `taper:true` whose points carry per-point pressure `p` ∈ (0,1]. The plain
+    **pen** tool is untouched (constant width, no `p`) so all prior tests stayed green.
+  - Pressure source: a genuine stylus `e.pressure` when present, else derived from
+    pointer SPEED (fast = thin) so it feels alive with a plain mouse. `_taperEnds`
+    blends the first/last ~22% of points toward a small ABSOLUTE tip pressure (0.06)
+    on commit, so both ends are always the thinnest part — a clean inked nib.
+  - Rendering (`renderer._drawRibbon`): a filled ribbon, recomputed every frame in
+    world space via `util.ribbonOutline(points, halfAt)` (offsets each point along
+    its central-difference normal by `width/2 * p`, with a hairline floor). A
+    1-point stroke is a round dab. Recomputing per frame = crisp at any zoom.
+  - GOTCHA fixed: `translateItem` / `scaleItemAbout` / `rotateItemsAbout` used to
+    map stroke points to bare `{x,y}`, dropping per-point fields. They now spread
+    the original point (`{...p, x, y}`) so brush `p` survives move/scale/rotate.
+    RDP `simplify` already preserved it (it filters whole point objects).
+  - SVG export: tapered stroke → a single filled `<polygon>` (the ribbon outline),
+    or `<circle>` for a dab. Shares `ribbonOutline` with the renderer.
+
 ## Gotchas fixed
 - Text editor: a spurious `blur` fired right as the editor opened, committing the
   empty box closed before it was usable (flaky text test). Fixed in app.js with a
@@ -152,9 +197,14 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - [x] group/ungroup — DONE (batch 4)
 - [x] image item type (paste/drop an image, zoomable) — DONE (batch 4)
 - [x] connectors that stay attached to shapes — DONE (batch 4)
-- [ ] layers panel; lock/hide items
-- [ ] freehand pressure/taper (variable stroke width)
+- [x] layers panel; lock/hide items — DONE (batch 5: Objects panel + per-item locked/hidden)
+- [x] freehand pressure/taper (variable stroke width) — DONE (batch 5: brush tool, ribbon render)
 - [ ] mobile/touch toolbar layout polish
+- [ ] scale/resize handles on selection (rotation handle exists; corner handles don't)
+- [ ] true named layers (groups of items with a shared lock/hide/visibility) — the
+      current model is per-item flags + a z-stack view, not assignable layers
+- [ ] brush polish: smoothing (Catmull-Rom) + miter/bevel on sharp corners (the
+      ribbon uses averaged normals; very sharp post-simplify turns could pinch)
 
 ## Companion
 gemma at http://127.0.0.1:8051 — chat for a second opinion if stuck (give it

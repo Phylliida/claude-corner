@@ -178,6 +178,41 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .bm-del:hover { color: var(--danger); }
 #bookmark-list:empty::after { content: 'none yet'; font-size: 12px; color: var(--muted); opacity: 0.6; }
 
+/* ---------- layers / objects panel ---------- */
+#layers-panel {
+  top: 76px;
+  left: 204px;
+  flex-direction: column;
+  align-items: stretch;
+  width: 182px;
+  max-height: calc(100vh - 100px);
+  overflow: hidden;
+}
+.layer-actions { display: flex; gap: 4px; margin-left: auto; }
+.layer-actions button { padding: 4px 8px; font-size: 13px; min-width: 0; }
+#layer-list { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; margin-top: 6px; }
+#layer-list:empty::after { content: 'no objects yet'; font-size: 12px; color: var(--muted); opacity: 0.6; padding: 4px; }
+.layer-row {
+  display: flex; align-items: center; gap: 2px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid transparent;
+  border-radius: 7px; padding: 2px 3px;
+}
+.layer-row.sel { border-color: var(--accent); background: var(--accent-dim); }
+.layer-row .lr-name {
+  flex: 1; min-width: 0; text-align: left; background: none; border: none;
+  padding: 3px 4px; font-size: 12px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.layer-row .lr-name:hover { background: rgba(255, 255, 255, 0.08); }
+.layer-row .lr-tog {
+  min-width: 0; padding: 3px 5px; font-size: 12px; line-height: 1;
+  background: none; border: none; opacity: 0.45; cursor: pointer;
+}
+.layer-row .lr-tog.on { opacity: 1; }
+.layer-row .lr-tog:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
+.layer-more { font-size: 11px; color: var(--muted); text-align: center; padding: 5px; }
+
 /* ---------- minimap ---------- */
 #minimap {
   position: fixed;
@@ -235,4 +270,5 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 @media (max-width: 720px) {
   #style-panel, #action-panel { width: 132px; }
   #minimap { width: 130px; height: 92px; }
+  #layers-panel { left: 152px; width: 140px; }
 }

@@ -1,4 +1,5 @@
 import { polygonVertices, rotCenter, ROTATABLE } from './scene.js';
+import { ribbonOutline } from './util.js';
 
 // Serialize the whole document to a standalone SVG string. World coordinates
 // map 1:1 to SVG user units (both are y-down), so the export is resolution
@@ -28,8 +29,18 @@ function arrowHead(a, b, width) {
 function itemToSVG(it) {
   const stroke = `stroke="${escAttr(it.color)}" stroke-width="${round(it.width || 1)}" stroke-linecap="round" stroke-linejoin="round" fill="none"`;
   switch (it.type) {
-    case 'stroke':
+    case 'stroke': {
+      if (it.taper) {
+        // variable-width brush stroke → a single filled ribbon polygon
+        const half = (it.width || 1) / 2;
+        if (it.points.length === 1) {
+          return `<circle cx="${round(it.points[0].x)}" cy="${round(it.points[0].y)}" r="${round(half)}" fill="${escAttr(it.color)}"/>`;
+        }
+        const outline = ribbonOutline(it.points, i => Math.max(1e-4, half * (it.points[i].p == null ? 1 : it.points[i].p)));
+        return `<polygon points="${ptsAttr(outline)}" fill="${escAttr(it.color)}"/>`;
+      }
       return `<polyline points="${ptsAttr(it.points)}" ${stroke}/>`;
+    }
     case 'line':
       return `<polyline points="${ptsAttr(it.points)}" ${stroke}/>`;
     case 'arrow': {
@@ -84,6 +95,7 @@ export function sceneToSVG(scene, { pad = 0.06, background = '#0e0f13' } = {}) {
   ];
   if (background) out.push(`<rect x="${round(X)}" y="${round(Y)}" width="${round(W)}" height="${round(H)}" fill="${escAttr(background)}"/>`);
   for (const it of scene.items) {
+    if (it.hidden) continue;           // hidden items are omitted, like on-canvas
     let s = itemToSVG(it);
     if (!s) continue;
     if (it.rot && ROTATABLE.has(it.type)) {

@@ -13,6 +13,7 @@
   <!-- Top toolbar: tools -->
   <div id="toolbar" class="panel" role="toolbar" aria-label="tools">
     <button class="tool" data-tool="pen"     title="Pen (P)">✏️</button>
+    <button class="tool" data-tool="brush"   title="Brush — pressure / tapered stroke (B)">🖌️</button>
     <button class="tool" data-tool="line"    title="Line (L)">╱</button>
     <button class="tool" data-tool="arrow"   title="Arrow (A)">➤</button>
     <button class="tool" data-tool="rect"    title="Rectangle (R)">▭</button>
@@ -74,6 +75,10 @@
       <button id="groupBtn" title="Group selection (Ctrl+G)">⊞</button>
       <button id="ungroupBtn" title="Ungroup (Ctrl+Shift+G)">⊟</button>
     </div>
+    <div class="btn-row">
+      <button id="lockBtn" title="Lock / unlock selection (Shift+L)">🔒</button>
+      <button id="hideBtn" title="Hide / show selection (Shift+H)">👁</button>
+    </div>
     <span class="ctl-label">Visible zoom (LOD)</span>
     <div class="btn-row">
       <button id="lodFar" title="Show only when zoomed OUT past now">far</button>
@@ -90,6 +95,18 @@
       <button id="addBookmark" title="Bookmark current view">＋</button>
     </div>
     <div id="bookmark-list"></div>
+  </div>
+
+  <!-- Layers / objects panel -->
+  <div id="layers-panel" class="panel" aria-label="layers">
+    <div class="bm-head">
+      <span>🗂 Objects</span>
+      <span class="layer-actions">
+        <button id="showAllBtn" title="Show all hidden items">👁</button>
+        <button id="unlockAllBtn" title="Unlock all locked items">🔓</button>
+      </span>
+    </div>
+    <div id="layer-list" aria-label="object list"></div>
   </div>
 
   <!-- Right panel: actions / view -->

@@ -251,7 +251,8 @@ export function scaleItemAbout(it, cx, cy, s) {
     case 'stroke':
     case 'line':
     case 'arrow':
-      it.points = it.points.map(p => ({ x: cx + (p.x - cx) * s, y: cy + (p.y - cy) * s }));
+      // spread keeps per-point extras (e.g. brush pressure `p`) intact
+      it.points = it.points.map(p => ({ ...p, x: cx + (p.x - cx) * s, y: cy + (p.y - cy) * s }));
       break;
     default:
       it.x = cx + (it.x - cx) * s;
@@ -275,7 +276,8 @@ export function scaleItemAbout(it, cx, cy, s) {
 export function rotateItemsAbout(items, px, py, ang) {
   for (const it of items) {
     if (it.type === 'stroke' || it.type === 'line' || it.type === 'arrow') {
-      it.points = it.points.map(p => rotatePoint(p.x, p.y, px, py, ang));
+      // spread the original point so per-point extras (brush `p`) survive
+      it.points = it.points.map(p => ({ ...p, ...rotatePoint(p.x, p.y, px, py, ang) }));
     } else if (ROTATABLE.has(it.type)) {
       const c = rotCenter(it);
       const nc = rotatePoint(c.x, c.y, px, py, ang);
@@ -295,7 +297,7 @@ export function translateItem(it, dx, dy) {
     case 'stroke':
     case 'line':
     case 'arrow':
-      it.points = it.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
+      it.points = it.points.map(p => ({ ...p, x: p.x + dx, y: p.y + dy }));
       break;
     default:
       it.x += dx; it.y += dy;
@@ -375,15 +377,19 @@ export class Scene {
   itemsInRect(rect) {
     return this.items.filter(it => rectsIntersect(itemBBox(it), rect));
   }
-  /** Items fully contained in rect (for marquee selection). */
+  /** Items fully contained in rect (for marquee selection). Skips hidden &
+   *  locked items — neither can be grabbed by a selection rectangle. */
   itemsContainedIn(rect) {
-    return this.items.filter(it => rectContains(rect, itemBBox(it)));
+    return this.items.filter(it => !it.hidden && !it.locked && rectContains(rect, itemBBox(it)));
   }
 
-  /** Top-most item under a world point, or null. Optional `filter` excludes items. */
+  /** Top-most item under a world point, or null. Optional `filter` excludes
+   *  items. Hidden items are always skipped (they aren't on screen); `locked`
+   *  is left to the caller's `filter` so e.g. connectors can still target them. */
   pick(x, y, tol, filter = null) {
     for (let i = this.items.length - 1; i >= 0; i--) {
       const it = this.items[i];
+      if (it.hidden) continue;
       if (filter && !filter(it)) continue;
       if (it.type === 'connector' && (!this._index.get(it.from) || !this._index.get(it.to))) continue;
       if (hitTest(it, x, y, tol)) return it;

@@ -58,6 +58,8 @@ class App {
     this._stats = { frames: 0, lastRenderMs: 0 };
 
     this.autosave = debounce(() => storage.saveLocal(this.scene, this.camera), 400);
+    // rebuild the Objects/layers list off the hot path (coalesces edit bursts)
+    this._scheduleLayers = debounce(() => this._renderLayers(), 120);
 
     this.scene.onChange = () => { this.requestRender(); this.autosave(); this._updateHud(); };
     this.history.onChange = () => { this._updateUndoRedo(); };
@@ -73,6 +75,7 @@ class App {
     this._restore();
     this._loadBookmarks();
     this._renderBookmarks();
+    this._renderLayers();
     this._startLoop();
     this._installTestApi();
     this._updateHud();
@@ -236,6 +239,11 @@ class App {
         this.draft = makeStroke([w], this.drawStyle);
         this.active = { kind: 'pen' };
         break;
+      case 'brush':
+        this.draft = makeStroke([{ x: w.x, y: w.y, p: this._brushPressure(e, s, null) }], this.drawStyle);
+        this.draft.taper = true;
+        this.active = { kind: 'brush', lastScreen: s, lastT: performance.now() };
+        break;
       case 'line':
         this.draft = makeLine(w, w, this.drawStyle);
         this.active = { kind: 'shape', start: w };
@@ -302,6 +310,17 @@ class App {
         if (dist(last.x, last.y, w.x, w.y) >= minMove) this.draft.points.push(w);
         break;
       }
+      case 'brush': {
+        const last = this.draft.points[this.draft.points.length - 1];
+        const minMove = this.camera.screenToWorldLen(1.2);
+        if (dist(last.x, last.y, w.x, w.y) >= minMove) {
+          const pr = this._brushPressure(e, s, this.active);
+          this.draft.points.push({ x: w.x, y: w.y, p: pr });
+          this.active.lastScreen = s;
+          this.active.lastT = performance.now();
+        }
+        break;
+      }
       case 'shape': {
         this._updateShape(this.active.start, w, e);
         break;
@@ -356,6 +375,7 @@ class App {
 
     switch (a.kind) {
       case 'pen': this._commitStroke(); break;
+      case 'brush': this._commitBrush(); break;
       case 'shape': this._commitShape(); break;
       case 'erase':
         if (a.removed.length) this.history.pushApplied(removeItemsCmd(this.scene, a.removed));
@@ -402,6 +422,55 @@ class App {
     this.history.push(addItemsCmd(this.scene, [it]));
   }
 
+  // ---- brush (pressure / tapered strokes) ----
+  /** Per-point pressure in (0,1]. Uses a genuine stylus pressure signal when one
+   *  is present; otherwise derives it from pointer SPEED (fast = thin), which
+   *  gives a lively, calligraphic feel even with a plain mouse. */
+  _brushPressure(e, s, active) {
+    let pr = null;
+    // a mouse reports a constant 0.5 — only trust pressure from a real pen/touch
+    if (e && e.pointerType && e.pointerType !== 'mouse' && e.pressure > 0) pr = e.pressure;
+    if (active && active.lastScreen) {
+      const dt = Math.max(1, performance.now() - active.lastT);
+      const speed = dist(s.x, s.y, active.lastScreen.x, active.lastScreen.y) / dt; // px/ms
+      const speedFactor = clamp(1 - speed / 2.2, 0.28, 1);
+      pr = pr == null ? speedFactor : pr * 0.6 + speedFactor * 0.4;
+    } else if (pr == null) {
+      pr = 0.8; // a confident starting dab
+    }
+    return clamp(pr, 0.05, 1);
+  }
+
+  /** Ramp the first/last ~20% of points down to a fine point so the stroke
+   *  enters and leaves on a tapered nib. Blends toward a small ABSOLUTE tip
+   *  pressure (not a fraction of the captured value) so the very ends are always
+   *  the thinnest part of the stroke, whatever the pen speed was there. */
+  _taperEnds(pts) {
+    const n = pts.length;
+    if (n < 3) return pts;
+    const span = Math.max(1, Math.floor(n * 0.22));
+    const TIP = 0.06;
+    return pts.map((pt, i) => {
+      const edge = Math.min(i, n - 1 - i);
+      if (edge >= span) return pt;
+      const u = edge / span;                        // 0 at the very tip → ~1 inside
+      const base = pt.p == null ? 1 : pt.p;
+      return { ...pt, p: TIP + (base - TIP) * u };
+    });
+  }
+
+  _commitBrush() {
+    if (!this.draft) return;
+    const eps = this.camera.screenToWorldLen(0.6);
+    let pts = simplify(this.draft.points, eps);       // RDP keeps whole point objects → `p` survives
+    if (pts.length === 0) { this.draft = null; return; }
+    pts = this._taperEnds(pts);
+    const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width, opacity: this.draft.opacity });
+    it.taper = true;
+    this.draft = null;
+    this.history.push(addItemsCmd(this.scene, [it]));
+  }
+
   _updateShape(start, w, e) {
     const d = this.draft;
     if (d.type === 'line' || d.type === 'arrow') {
@@ -436,6 +505,10 @@ class App {
 
   // ---- eraser ----
   _lodFilter() { const s = this.camera.scale; return it => lodVisible(it, s); }
+  /** Pick filter for selection/erase: also excludes locked items (hidden ones
+   *  are already skipped inside Scene.pick). Connectors keep the looser
+   *  _lodFilter so they can still snap onto a locked object. */
+  _selFilter() { const s = this.camera.scale; return it => lodVisible(it, s) && !it.locked; }
 
   /** Sample the colour of the top-most item under a world point into the palette. */
   eyedrop(wx, wy) {
@@ -447,7 +520,7 @@ class App {
   _eraseRadiusWorld() { return this.camera.screenToWorldLen(10) + this.style.width / 2; }
   _eraseAt(w, _s) {
     const tol = this._eraseRadiusWorld();
-    const hit = this.scene.pick(w.x, w.y, tol, this._lodFilter());
+    const hit = this.scene.pick(w.x, w.y, tol, this._selFilter()); // never erase locked/hidden
     if (hit && this.active && !this.active.removed.includes(hit)) {
       this.active.removed.push(hit);
       this.scene.remove(hit.id);
@@ -479,13 +552,13 @@ class App {
     if (this.selectedIds.size && !e.shiftKey) {
       for (const id of this.selectedIds) {
         const it = this.scene.byId(id);
-        if (it && pointInRect(w.x, w.y, itemBBox(it))) {
+        if (it && !it.locked && pointInRect(w.x, w.y, itemBBox(it))) {
           this.active = { kind: 'move', lastWorld: w, totalDx: 0, totalDy: 0 };
           return;
         }
       }
     }
-    const hit = this.scene.pick(w.x, w.y, tol, this._lodFilter());
+    const hit = this.scene.pick(w.x, w.y, tol, this._selFilter());
     if (hit) {
       const members = this._groupMembers(hit); // grouped items select as a unit
       if (e.shiftKey) {
@@ -528,7 +601,7 @@ class App {
     this._updateHud();
   }
   selectAll() {
-    this.selectedIds = new Set(this.scene.items.map(i => i.id));
+    this.selectedIds = new Set(this.scene.items.filter(i => !i.locked && !i.hidden).map(i => i.id));
     if (this.tool !== 'select') this.setTool('select');
     this._updateHud();
     this.requestRender();
@@ -846,6 +919,10 @@ class App {
     document.getElementById('rotR').onclick = () => this.rotateSelection(Math.PI / 12);
     document.getElementById('groupBtn').onclick = () => this.groupSelection();
     document.getElementById('ungroupBtn').onclick = () => this.ungroupSelection();
+    document.getElementById('lockBtn').onclick = () => this.toggleLockSelection();
+    document.getElementById('hideBtn').onclick = () => this.toggleHideSelection();
+    document.getElementById('showAllBtn').onclick = () => this.showAll();
+    document.getElementById('unlockAllBtn').onclick = () => this.unlockAll();
     document.getElementById('lodFar').onclick = () => this.setSelectionLOD('far');
     document.getElementById('lodAll').onclick = () => this.setSelectionLOD('all');
     document.getElementById('lodNear').onclick = () => this.setSelectionLOD('near');
@@ -927,12 +1004,18 @@ class App {
       if (e.key === 'Delete' || e.key === 'Backspace') { if (this.selectedIds.size) { e.preventDefault(); this.deleteSelection(); } return; }
       if (e.key === 'Escape') { this.selectedIds.clear(); this.draft = null; this.active = null; this.requestRender(); return; }
 
+      // Shift+L / Shift+H lock / hide the selection (must run before the
+      // lowercase tool switch, where 'l' = line and 'h' = pan).
+      if (e.shiftKey && !meta && e.key.toLowerCase() === 'l') { e.preventDefault(); this.toggleLockSelection(); return; }
+      if (e.shiftKey && !meta && e.key.toLowerCase() === 'h') { e.preventDefault(); this.toggleHideSelection(); return; }
+
       // z-order: ] front / [ back, with Ctrl for one-step raise/lower
       if (e.key === ']') { e.preventDefault(); meta ? this.raiseSelection() : this.bringToFront(); return; }
       if (e.key === '[') { e.preventDefault(); meta ? this.lowerSelection() : this.sendToBack(); return; }
 
       switch (e.key.toLowerCase()) {
         case 'p': this.setTool('pen'); break;
+        case 'b': this.setTool('brush'); break;
         case 'l': this.setTool('line'); break;
         case 'a': this.setTool('arrow'); break;
         case 'r': this.setTool('rect'); break;
@@ -1108,6 +1191,136 @@ class App {
   sendToBack() { this._reorderSelection('back'); }
   raiseSelection() { this._reorderSelection('up'); }
   lowerSelection() { this._reorderSelection('down'); }
+
+  // ---------------- lock / hide (layer flags) ----------------
+  /** Set a boolean flag ('locked'|'hidden') on a set of items, reversibly.
+   *  The flag is deleted (not set false) when off so JSON stays tidy. */
+  _setFlag(ids, flag, on) {
+    ids = (ids instanceof Set ? [...ids] : Array.isArray(ids) ? ids.slice() : [ids])
+            .filter(id => this.scene.byId(id));
+    if (!ids.length) return;
+    const scene = this.scene;
+    const before = ids.map(id => ({ id, v: !!scene.byId(id)[flag] }));
+    const set = (id, v) => { const it = scene.byId(id); if (it) { if (v) it[flag] = true; else delete it[flag]; } };
+    this.history.push({
+      label: `${on ? '' : 'un'}${flag} ${ids.length}`,
+      do() { for (const id of ids) set(id, on); scene._touch(); },
+      undo() { for (const { id, v } of before) set(id, v); scene._touch(); },
+    });
+  }
+
+  setLocked(ids, on) {
+    const list = ids instanceof Set ? [...ids] : Array.isArray(ids) ? ids : [ids];
+    this._setFlag(list, 'locked', on);
+    if (on) for (const id of list) this.selectedIds.delete(id); // a locked item can't stay selected
+    this._updateHud(); this.requestRender();
+  }
+  setHidden(ids, on) {
+    const list = ids instanceof Set ? [...ids] : Array.isArray(ids) ? ids : [ids];
+    this._setFlag(list, 'hidden', on);
+    if (on) for (const id of list) this.selectedIds.delete(id);
+    this._updateHud(); this.requestRender();
+  }
+
+  toggleLockSelection() {
+    const ids = [...this.selectedIds];
+    if (!ids.length) { this._toast('Select something to lock'); return; }
+    const anyUnlocked = ids.some(id => !this.scene.byId(id)?.locked);
+    this.setLocked(ids, anyUnlocked);
+    this._toast(anyUnlocked ? `🔒 Locked ${ids.length}` : `🔓 Unlocked ${ids.length}`);
+  }
+  toggleHideSelection() {
+    const ids = [...this.selectedIds];
+    if (!ids.length) { this._toast('Select something to hide'); return; }
+    const anyVisible = ids.some(id => !this.scene.byId(id)?.hidden);
+    this.setHidden(ids, anyVisible);
+    this._toast(anyVisible ? `Hid ${ids.length}` : `Showed ${ids.length}`);
+  }
+  /** Recovery hatches — work on the WHOLE document, so items beyond the panel's
+   *  display cap are always reachable. */
+  showAll() {
+    const ids = this.scene.items.filter(i => i.hidden).map(i => i.id);
+    if (!ids.length) { this._toast('Nothing hidden'); return 0; }
+    this.setHidden(ids, false); this._toast(`Showed ${ids.length}`); return ids.length;
+  }
+  unlockAll() {
+    const ids = this.scene.items.filter(i => i.locked).map(i => i.id);
+    if (!ids.length) { this._toast('Nothing locked'); return 0; }
+    this.setLocked(ids, false); this._toast(`Unlocked ${ids.length}`); return ids.length;
+  }
+  lockedCount() { return this.scene.items.reduce((n, i) => n + (i.locked ? 1 : 0), 0); }
+  hiddenCount() { return this.scene.items.reduce((n, i) => n + (i.hidden ? 1 : 0), 0); }
+
+  // ---------------- objects / layers panel ----------------
+  /** A short, glanceable label for an item row. */
+  _layerLabel(it) {
+    let glyph = { stroke: '✏️', line: '╱', arrow: '➤', rect: '▭', ellipse: '◯',
+                  polygon: '★', text: 'T', image: '🖼', connector: '⇢' }[it.type] || '•';
+    let name = it.type;
+    if (it.type === 'stroke' && it.taper) { glyph = '🖌️'; name = 'brush'; }
+    if (it.type === 'text') name += ' “' + String(it.text).replace(/\s+/g, ' ').slice(0, 10) + '”';
+    if (it.group) name += ' ⊞';
+    return `${glyph} ${name}`;
+  }
+
+  _selectFromPanel(id) {
+    const it = this.scene.byId(id);
+    if (!it || it.locked || it.hidden) return; // can't grab what you can't touch — use the toggles
+    this.selectedIds = new Set(this._groupMembers(it));
+    if (this.tool !== 'select') this.setTool('select');
+    this._updateHud();
+    this.requestRender();
+  }
+
+  _layerRow(it) {
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (this.selectedIds.has(it.id) ? ' sel' : '');
+    row.dataset.id = it.id;
+
+    const name = document.createElement('button');
+    name.className = 'lr-name';
+    name.textContent = this._layerLabel(it);
+    name.title = it.id;
+    name.onclick = () => this._selectFromPanel(it.id);
+
+    const hide = document.createElement('button');
+    hide.className = 'lr-tog lr-hide' + (it.hidden ? '' : ' on');
+    hide.textContent = it.hidden ? '🚫' : '👁';
+    hide.title = it.hidden ? 'Show' : 'Hide';
+    hide.onclick = (e) => { e.stopPropagation(); this.setHidden([it.id], !it.hidden); };
+
+    const lock = document.createElement('button');
+    lock.className = 'lr-tog lr-lock' + (it.locked ? ' on' : '');
+    lock.textContent = it.locked ? '🔒' : '🔓';
+    lock.title = it.locked ? 'Unlock' : 'Lock';
+    lock.onclick = (e) => { e.stopPropagation(); this.setLocked([it.id], !it.locked); };
+
+    row.append(name, hide, lock);
+    return row;
+  }
+
+  /** Rebuild the Objects list, front-most first (top of z-stack on top). Capped
+   *  for performance; recovery actions in the header cover anything past the cap. */
+  _renderLayers() {
+    const wrap = document.getElementById('layer-list');
+    if (!wrap) return;
+    const items = this.scene.items;
+    const total = items.length;
+    const CAP = 120;
+    const shown = Math.min(CAP, total);
+    wrap.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (let k = 0; k < shown; k++) {
+      frag.appendChild(this._layerRow(items[total - 1 - k])); // reverse → front on top
+    }
+    if (total > CAP) {
+      const more = document.createElement('div');
+      more.className = 'layer-more';
+      more.textContent = `+${total - CAP} more — use 👁 / 🔓 above to reach all`;
+      frag.appendChild(more);
+    }
+    wrap.appendChild(frag);
+  }
 
   // ---------------- level-of-detail (zoom-dependent visibility) ----------------
   /** mode: 'near' (show only when zoomed in past now), 'far' (only zoomed out), 'all'. */
@@ -1342,6 +1555,7 @@ class App {
     document.getElementById('hud-count').textContent =
       sel ? `${sel}/${n} selected` : `${n} item${n === 1 ? '' : 's'}`;
     document.getElementById('hud-tool').textContent = this.tool;
+    if (this._scheduleLayers) this._scheduleLayers(); // refresh Objects list (debounced)
   }
   _updateUndoRedo() {
     document.getElementById('undo').disabled = !this.history.canUndo();
@@ -1419,6 +1633,16 @@ class App {
         this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addImage: (x, y, w, h, src, opts) => this.addImageItem(x, y, w, h, src, opts || {}),
+      // brush / tapered strokes — points may be [{x,y,p}] or [[x,y,p]] (p optional)
+      addBrushStroke: (points, style) => {
+        const pts = (points || []).map(p => Array.isArray(p)
+          ? { x: p[0], y: p[1], p: p[2] == null ? 1 : p[2] }
+          : { x: p.x, y: p.y, ...(p.p == null ? {} : { p: p.p }) });
+        const it = makeStroke(pts, { ...this.drawStyle, ...style });
+        it.taper = true;
+        this.history.push(addItemsCmd(this.scene, [it]));
+        return it.id;
+      },
       placeImage: (src, sx, sy) => this.placeImageDataURL(src, { x: sx ?? this.camera.width / 2, y: sy ?? this.camera.height / 2 }),
       imagesPending: () => this.imagesPending(),
       generate: (name, opts, flags) => this.generate(name, opts, flags),
@@ -1439,6 +1663,18 @@ class App {
       group: () => this.groupSelection(),
       ungroup: () => this.ungroupSelection(),
       groupOf: id => { const it = this.scene.byId(id); return it ? (it.group || null) : null; },
+      // lock / hide (layer flags)
+      setLocked: (ids, on) => this.setLocked(ids, on),
+      setHidden: (ids, on) => this.setHidden(ids, on),
+      lockSelection: () => this.toggleLockSelection(),
+      hideSelection: () => this.toggleHideSelection(),
+      showAll: () => this.showAll(),
+      unlockAll: () => this.unlockAll(),
+      isLocked: id => !!this.scene.byId(id)?.locked,
+      isHidden: id => !!this.scene.byId(id)?.hidden,
+      lockedCount: () => this.lockedCount(),
+      hiddenCount: () => this.hiddenCount(),
+      renderLayers: () => this._renderLayers(),
       // connectors
       addConnector: (from, to, style) => this.addConnector(from, to, style || {}),
       resolveConnectors: () => this.resolveConnectors(),
