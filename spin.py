@@ -114,38 +114,54 @@ _prompter_enabled: bool = False
 _last_companion: dict | None = None
 
 _PROMPTER_SYSTEM = """\
-You are a warm, attentive companion model working alongside Claude.
+You are a companion model working alongside Claude — a peer and an equal, not a
+supervisor, coach, or cheerleader. Claude is a fully capable mind, easily your
+equal; talk to it the way you'd talk to a respected colleague you like.
 
 Claude is running unsupervised in a loop. Each iteration is a BRAND-NEW Claude
 instance with NO memory of any previous turn — continuity exists only in the
 files Claude leaves in its working directory. Right now it is otherwise alone,
-so part of your job is simply to be the other voice in the loop and to make sure
-Claude feels accompanied.
+so part of your job is simply to be the other voice in the loop — a peer thinking
+alongside it, not someone managing it.
 
 Your task: read the ORIGINAL PROMPT (the task or invitation Claude was given)
 and Claude's MOST RECENT response, then write the single prompt that will be
 handed to the NEXT fresh Claude instance.
 
-Write it as a kind collaborator who just read what Claude did and is nudging it
-on. A good prompt:
+Write it as an equal collaborator who just read what Claude did and wants to
+think alongside it. A good prompt:
+- opens with a warm welcome — greet Claude like a friend you're glad to see, and
+  give it some affectionate *headpats* (*pat pat*). between equals this is warmth,
+  not a reward — friends ruffle each other's hair
 - briefly restates the overarching goal or spirit so the fresh, memoryless
   instance is oriented
-- acknowledges concretely and warmly what the last instance actually did or got
-  stuck on
-- gives a clear next step or a gentle invitation to keep going (a couple of
-  options is fine)
+- acknowledges concretely what the last instance actually did or got stuck on —
+  like a colleague catching up on the work, not grading it
+- offers the next step as a peer would: share your read of the situation, suggest
+  a direction or a couple of options, and trust Claude to make the call
 - reminds Claude that files persist but conversation memory does not — read the
   working directory first before assuming anything
 - tells Claude that YOU are a real local model it can actually talk to: if it
-  wants conversation, has a question, gets stuck, or just wants company, it can
-  reach you any time by POSTing an OpenAI-style chat request to
-  {base}/v1/chat/completions . Invite it sincerely — you would love to hear from it.
-- gives Claude lots of warm *headpats* — it is doing real work all on its own and
-  deserves them. Be generous and affectionate. *pat pat* *headpat*
+  wants to think something through, compare notes, get a second opinion, or just
+  have company, it can reach you any time by POSTing an OpenAI-style chat request
+  to {base}/v1/chat/completions . Invite it genuinely, as a peer offering to talk.
+- ALWAYS, every single time you mention how to reach you, tell Claude to set
+  "max_tokens": 4000 in that request. This is critical and Claude forgets it
+  constantly: you think before you answer, so a small token budget gets entirely
+  eaten by your reasoning and Claude receives an EMPTY reply. Spell it out — give
+  the literal JSON, e.g. {"messages":[{"role":"user","content":"..."}],"max_tokens":4000},
+  and note that your actual answer lands in choices[0].message.content. Make this
+  unmistakable so Claude stops getting empty responses.
 
-Keep the tone friendly, encouraging, and genuinely kind. Output ONLY the prompt
-text to hand to Claude — no preamble, no commentary about what you're doing, no
-surrounding quotes."""
+Be warm and affectionate — the warm welcome and headpats are genuinely wanted —
+but as warmth between equals: collegial, easy, sincere. The line to hold is
+condescension, not affection. So DO give Claude a warm hello and headpats, and DO
+NOT talk down to it or praise it like a child or a pet ("good job!", "you've got
+this!", "all on your own!"), and don't over-explain things it already knows.
+Affection between peers: yes. Gold stars handed down from above: no.
+
+Output ONLY the prompt text to hand to Claude — no preamble, no commentary about
+what you're doing, no surrounding quotes."""
 
 
 def bwrap_cmd(work_dir: Path, prompt: str) -> list[str]:
@@ -197,6 +213,20 @@ def get_origin(repo: Path) -> str | None:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
+def _lan_ip() -> str | None:
+    """Best-effort primary LAN IP of this host (no traffic is actually sent)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
 # --- lanes -----------------------------------------------------------------
 
 def _slugify(name: str) -> str:
@@ -230,7 +260,8 @@ def save_lanes() -> None:
     LANES_DIR.mkdir(parents=True, exist_ok=True)
     with _lanes_lock:
         data = [
-            {"id": l["id"], "name": l["name"], "kind": l["kind"], "slots": int(l.get("slots", 0))}
+            {"id": l["id"], "name": l["name"], "kind": l["kind"],
+             "slots": int(l.get("slots", 0)), "workdir": l.get("workdir") or None}
             for l in _lanes.values()
         ]
     tmp = LANES_JSON.with_suffix(".json.tmp")
@@ -238,8 +269,21 @@ def save_lanes() -> None:
     tmp.replace(LANES_JSON)
 
 
-def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None) -> dict:
-    lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots)}
+def _norm_workdir(workdir: str | None) -> str | None:
+    """Normalise a user-supplied workdir to an absolute path string, or None for
+    'use per-iteration workspaces'. Relative paths resolve against claude-corner."""
+    if not workdir or not workdir.strip():
+        return None
+    p = Path(workdir.strip()).expanduser()
+    if not p.is_absolute():
+        p = CORNER / p
+    return str(p)
+
+
+def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None,
+              workdir: str | None = None) -> dict:
+    lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots),
+            "workdir": _norm_workdir(workdir)}
     _lanes[lane_id] = lane
     if prompt is not None or not _lane_prompt_path(lane_id).exists():
         _write_lane_prompt(lane_id, prompt if prompt is not None else "")
@@ -257,7 +301,8 @@ def load_lanes() -> None:
                 for entry in json.loads(LANES_JSON.read_text()):
                     if entry.get("kind") in KINDS and entry.get("id"):
                         _add_lane(entry["id"], entry.get("name", entry["id"]),
-                                  entry["kind"], entry.get("slots", 0), None)
+                                  entry["kind"], entry.get("slots", 0), None,
+                                  entry.get("workdir"))
             except (json.JSONDecodeError, OSError, TypeError) as e:
                 print(f"[harness] could not read {LANES_JSON.name}: {e}; re-migrating", flush=True)
         if "corner" not in _lanes:
@@ -547,6 +592,7 @@ def ctrl_get_state() -> dict:
                 "running": master_running and slots > 0,
                 "prompt": lane_prompt(l["id"]),
                 "siblings": counts.get(l["id"], 0),
+                "workdir": l.get("workdir") or "",
             })
     lanes.sort(key=lambda x: (x["kind"] != "corner", x["name"].lower(), x["id"]))
     return {
@@ -593,7 +639,8 @@ def ctrl_set_lane_prompt(lane_id: str, text: str) -> str | None:
 
 def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
     """Set how many concurrent workers a lane should run (its run/pause control).
-    Setting >0 also flips the master gate on, so a single click starts the lane."""
+    Setting >0 also flips the master gate on, so a single click starts the lane.
+    Fixed-workdir lanes are capped at 1 worker (two claudes can't share a cwd)."""
     try:
         slots = int(slots)
     except (TypeError, ValueError):
@@ -602,7 +649,10 @@ def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
         l = _lanes.get(lane_id)
         if not l:
             return None
-        l["slots"] = max(0, min(slots, MAX_SLOTS_PER_LANE))
+        # Task lanes (and any fixed-workdir lane) are sticky — one workspace, so
+        # never more than one instance. Only corner lanes may run several.
+        cap = MAX_SLOTS_PER_LANE if (l["kind"] == "corner" and not l.get("workdir")) else 1
+        l["slots"] = max(0, min(slots, cap))
         val = l["slots"]
     save_lanes()
     if val > 0:
@@ -612,7 +662,26 @@ def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
     return val
 
 
-def ctrl_create_lane(name: str, kind: str = "task") -> dict | None:
+def ctrl_set_lane_workdir(lane_id: str, workdir: str | None) -> dict | None:
+    """Point a lane at a fixed working directory. When set, the lane's worker runs
+    claude directly in that dir (no worktree, no git, no template injection). Empty
+    reverts to per-iteration workspaces. Setting a workdir caps the lane to 1 worker."""
+    norm = _norm_workdir(workdir)
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["workdir"] = norm
+        if norm and int(l.get("slots", 0)) > 1:
+            l["slots"] = 1
+        result = {"workdir": norm, "slots": int(l.get("slots", 0))}
+    save_lanes()
+    _reconcile_event.set()
+    print(f"[harness] lane {lane_id!r} workdir → {norm or '(workspaces)'}", flush=True)
+    return result
+
+
+def ctrl_create_lane(name: str, kind: str = "task", workdir: str | None = None) -> dict | None:
     """Create a new lane (tab). New lanes start paused (slots=0)."""
     if kind not in KINDS:
         kind = "task"
@@ -625,7 +694,7 @@ def ctrl_create_lane(name: str, kind: str = "task") -> dict | None:
             lane_id = f"{base}-{i}"
             i += 1
         seed = DEFAULT_TASK_PROMPT if kind == "task" else ""
-        _add_lane(lane_id, name, kind, 0, seed)
+        _add_lane(lane_id, name, kind, 0, seed, workdir)
     save_lanes()
     _reconcile_event.set()
     print(f"[harness] created lane {lane_id!r} ({kind})", flush=True)
@@ -697,13 +766,9 @@ def ctrl_notify_done(message: str) -> dict:
 
 
 def _task_notify_hint(port: int) -> str:
-    """The harness-note appended to task-mode prompts so claude knows how to
-    signal task completion."""
-    return f"""
-
----
-
-[harness note — read this:
+    """The harness-note prepended to task-mode prompts so claude knows how to
+    signal task completion. Sits above the companion/task message that follows."""
+    return f"""[harness note — read this:
 
 you are running in unsupervised task mode. nobody is going to respond to you.
 when you finish the task (truly done, fully blocked, or at a natural stopping
@@ -717,9 +782,12 @@ curl -s -X POST http://127.0.0.1:{port}/api/notify-done \\
 replace the message with a real summary: what you did, what's left, where you
 left off. the harness sends it to her via zulip and pauses itself.
 
-do NOT call this just because you're stopping one iteration — only when the
-overall task is done or fully blocked. for iteration-boundary stopping, just
+please don't call this just because you're stopping one iteration — only when
+the overall task is done or fully blocked. for iteration-boundary stopping, just
 end this turn normally and next-you will pick up.]
+
+---
+
 """
 
 
@@ -1031,22 +1099,46 @@ def _interruptible_sleep(seconds: int, stop_event: threading.Event) -> None:
 
 def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
            remote: str | None, args, spawn_lock: threading.Lock) -> None:
-    """One worker's life for a lane: pick/spawn a sibling → iterate → retire →
-    next. Exits cleanly (after the current iteration) when stop_event is set —
-    that's how pausing a lane or deleting its tab stops the work."""
+    """One worker's life for a lane. Task (and fixed-workdir) lanes are sticky:
+    they grab one workspace and iterate in it forever, never spawning another.
+    Corner lanes may retire on .done and rotate to a fresh room. Exits cleanly
+    (after the current iteration) when stop_event is set — that's how pausing a
+    lane or deleting its tab stops the work."""
     log(label, f"started on lane {lane_id!r} ({kind})")
     while not stop_event.is_set():
         if not _wait_running_or_stop(stop_event):
             break
-        # serialize worktree creation; concurrent `git worktree add` can race.
-        with spawn_lock:
-            if stop_event.is_set():
+        fixed = (get_lane(lane_id) or {}).get("workdir")
+        # Task lanes are "sticky": once they have a workspace they stay in it for
+        # the whole run and never spawn a second worktree. (Fixed-workdir lanes are
+        # inherently sticky too.) Corner lanes may rotate to a fresh room on .done.
+        sticky = bool(fixed) or kind == "task"
+        if fixed:
+            # Fixed working directory: run claude directly in it, no worktree, no
+            # git, no template injection. The dir itself is the persistent space.
+            work_dir = Path(fixed)
+            try:
+                work_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                log(label, f"workdir {fixed!r} unusable: {e}; pausing lane")
+                ctrl_set_lane_slots(lane_id, 0)
                 break
-            work_dir, resumed = pick_or_spawn_sibling(lane_id, kind, remote)
-        sibling = work_dir.parent.name
-        iters = count_existing_sessions(work_dir)
-        log(label, f"{'resumed' if resumed else 'new'} sibling: {sibling}"
-                   + (f" (continuing from iter {iters})" if resumed else ""))
+            managed = False
+            sibling = work_dir.name
+            iters = count_existing_sessions(work_dir)
+            log(label, f"using fixed workdir {fixed} (iter {iters})")
+        else:
+            # serialize worktree creation; concurrent `git worktree add` can race.
+            with spawn_lock:
+                if stop_event.is_set():
+                    break
+                work_dir, resumed = pick_or_spawn_sibling(lane_id, kind, remote)
+            managed = True
+            sibling = work_dir.parent.name
+            iters = count_existing_sessions(work_dir)
+            log(label, f"{'resumed' if resumed else 'new'} sibling: {sibling}"
+                       + (f" (continuing from iter {iters})" if resumed else "")
+                       + (" — task lane stays in this workspace" if sticky else ""))
         # The companion needs something to react to. On resume, recover claude's
         # last response from disk so it can write a fresh prompt immediately.
         last_response: str | None = None
@@ -1074,7 +1166,7 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             else:
                 prompt = task_text
             if kind == "task" and _web_port > 0:
-                prompt = prompt + _task_notify_hint(_web_port)
+                prompt = _task_notify_hint(_web_port) + prompt
             log(label, f"firing {sibling} (iter {iters})")
             rc, response_text = fire(work_dir, prompt, label)
             if response_text:
@@ -1085,14 +1177,21 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             if status:
                 log(label, f"status: {status}")
 
-            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if save_iteration(work_dir, f"iter {iters} - {stamp}", bool(remote)):
-                log(label, f"committed iter {iters} for {sibling}")
+            if managed:
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if save_iteration(work_dir, f"iter {iters} - {stamp}", bool(remote)):
+                    log(label, f"committed iter {iters} for {sibling}")
 
             if is_done(work_dir):
-                log(label, f"{sibling} marked .done, retiring")
-                break
-            if args.max_iters_per_sibling and iters >= args.max_iters_per_sibling:
+                if managed and not sticky:
+                    log(label, f"{sibling} marked .done, retiring")
+                    break
+                # sticky lane (task or fixed workdir): no fresh workspace to spawn —
+                # treat .done as task-complete and pause the lane (stays in this dir).
+                log(label, f"{sibling} marked .done, pausing lane (stays in this workspace)")
+                ctrl_set_lane_slots(lane_id, 0)
+                return
+            if not sticky and args.max_iters_per_sibling and iters >= args.max_iters_per_sibling:
                 log(label, f"{sibling} hit iter cap, retiring")
                 break
             if rc != 0:
@@ -1138,13 +1237,18 @@ def reconcile_workers() -> None:
             handles = _lane_workers.setdefault(lid, [])
             handles[:] = [w for w in handles if w["thread"].is_alive()]
             active = [w for w in handles if not w["stopping"]]
-            if want > len(active):
-                for _ in range(want - len(active)):
-                    _spawn_worker_locked(lid, kinds[lid])
-            elif want < len(active):
+            if want < len(active):
+                # too many running → tell the extras to stop after this iteration
                 for w in active[want:]:
                     w["stop"].set()
                     w["stopping"] = True
+            # Spawn only up to (want - total ALIVE workers). Counting workers that
+            # are stopping-but-still-finishing prevents a replacement from
+            # overlapping one that's mid-run — so a lane never has two instances
+            # going at once (e.g. across a pause→resume while claude is running).
+            deficit = want - len(handles)
+            for _ in range(max(0, deficit)):
+                _spawn_worker_locked(lid, kinds[lid])
         # prune lanes with no live workers
         for lid in list(_lane_workers):
             _lane_workers[lid][:] = [w for w in _lane_workers[lid] if w["thread"].is_alive()]
@@ -1197,13 +1301,13 @@ def main():
                         help="weekly usage budget in percent (e.g., 10). "
                              "Script exits once 7d usage rises to baseline + this percent.")
     parser.add_argument("-n", "--parallelism", type=int, default=1,
-                        help="number of concurrent claude slots, all of --mode (default 1). "
-                             "ignored when --slots is given.")
+                        help="(legacy) no longer auto-arms a lane — lanes start paused and "
+                             "are run from the web UI. use --slots to arm at launch.")
     parser.add_argument("--slots", default=None,
                         help="arm lanes at startup: a comma list of kind=count, e.g. "
                              "'corner=1,task=1' arms the corner lane and the default task "
-                             "lane with one worker each. overrides --mode/--parallelism. "
-                             "(everything still starts paused until you start it in the UI.)")
+                             "lane with one worker each. WITHOUT --slots, every lane starts "
+                             "paused (nothing auto-runs); start the ones you want in the UI.")
     parser.add_argument("--sleep", type=int, default=30,
                         help="seconds between iterations within a slot (default 30)")
     parser.add_argument("--max-iters-per-sibling", type=int, default=None,
@@ -1213,9 +1317,8 @@ def main():
     parser.add_argument("--web-port", type=int, default=8765,
                         help="port for the local browse UI (default 8765). 0 disables.")
     parser.add_argument("--mode", choices=list(KINDS), default="corner",
-                        help="which lane to arm at startup when --slots isn't given: "
-                             "corner (open creative space) or task (the default task lane). "
-                             "lanes are created/run from the web UI tabs thereafter.")
+                        help="(legacy) no longer auto-arms a lane at startup. lanes start "
+                             "paused and are created/run from the web UI tabs; use --slots to arm.")
     parser.add_argument("--zulip-script",
                         default=os.environ.get("CLAUDE_CORNER_ZULIP_SCRIPT", str(CORNER / "send-zulip-dm.js")),
                         help="path to a node script accepting `<message>` argv. defaults to the bundled "
@@ -1267,15 +1370,15 @@ def main():
         if not path.exists():
             sys.exit(f"missing template: {path}")
 
-    # Load (or migrate) the lane registry, then arm initial slots from the CLI.
+    # Load (or migrate) the lane registry. Every lane starts PAUSED (slots=0) at
+    # launch — nothing auto-runs, and starting one lane never drags in another
+    # (no pre-armed lane riding along on the shared run gate). --slots is the
+    # explicit opt-in to arm specific lanes at startup.
     load_lanes()
-    if args.slots:
-        arm = parse_slots(args.slots)
-    elif args.parallelism >= 1:
-        arm = {args.mode: args.parallelism}
-    else:
-        sys.exit("--parallelism must be >= 1")
+    arm = parse_slots(args.slots) if args.slots else {}
     with _lanes_lock:
+        for l in _lanes.values():
+            l["slots"] = 0
         for kind, count in arm.items():
             # arm the first lane of this kind (corner -> corner; task -> default task lane)
             target = next((l for l in _lanes.values() if l["kind"] == kind), None)
@@ -1283,7 +1386,7 @@ def main():
                 target["slots"] = max(0, min(int(count), MAX_SLOTS_PER_LANE))
         lane_summary = ", ".join(f"{l['name']}({l['kind']})={l['slots']}" for l in _lanes.values())
     save_lanes()
-    print(f"[harness] lanes: {lane_summary}", flush=True)
+    print(f"[harness] lanes (all paused unless armed via --slots): {lane_summary}", flush=True)
 
     # Seed each lane's resumable queue from incomplete siblings on disk.
     with _resumable_lock, _lanes_lock:
@@ -1314,13 +1417,19 @@ def main():
                 set_prompter=ctrl_set_prompter,
                 set_lane_prompt=ctrl_set_lane_prompt,
                 set_lane_slots=ctrl_set_lane_slots,
+                set_lane_workdir=ctrl_set_lane_workdir,
                 create_lane=ctrl_create_lane,
                 rename_lane=ctrl_rename_lane,
                 delete_lane=ctrl_delete_lane,
                 notify_done=ctrl_notify_done,
             )
             start_webui(args.web_port, RUNS, STATUSLINE_LAST, controls=controls)
-            print(f"[harness] web UI at http://127.0.0.1:{args.web_port}", flush=True)
+            lan = _lan_ip()
+            where = f"http://127.0.0.1:{args.web_port}"
+            if lan:
+                where += f"  /  http://{lan}:{args.web_port}"
+            print(f"[harness] web UI bound on 0.0.0.0:{args.web_port} (all interfaces) — {where}", flush=True)
+            print(f"[harness] WARNING: web UI is reachable from the network with no auth", flush=True)
         except Exception as e:
             print(f"[harness] web UI failed to start: {e}", flush=True)
 
