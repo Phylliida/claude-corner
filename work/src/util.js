@@ -74,6 +74,39 @@ export function ribbonOutline(points, halfAt) {
   return left.concat(right);
 }
 
+/**
+ * Resample a polyline through a uniform Catmull-Rom spline so it reads as a
+ * smooth curve rather than straight chords between (often RDP-thinned) control
+ * points. The curve passes through every input point; `segs` interpolated
+ * points are emitted per span. Per-point pressure `p` (used by the brush) is
+ * carried along, linearly across each span. Endpoints use duplicated phantom
+ * neighbours so the curve doesn't overshoot at the tips.
+ * Returns a copy for < 3 points (nothing to smooth).
+ */
+export function catmullRom(points, segs = 12) {
+  const n = points.length;
+  if (n < 3 || segs < 2) return points.slice();
+  const at = i => points[Math.max(0, Math.min(n - 1, i))];
+  const pr = pt => (pt.p == null ? 1 : pt.p);
+  const out = [];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+    for (let s = 0; s < segs; s++) {
+      const t = s / segs, t2 = t * t, t3 = t2 * t;
+      const x = 0.5 * (2 * p1.x + (-p0.x + p2.x) * t +
+        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+      const y = 0.5 * (2 * p1.y + (-p0.y + p2.y) * t +
+        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+      out.push({ x, y, p: pr(p1) + (pr(p2) - pr(p1)) * t });
+    }
+  }
+  const end = at(n - 1);
+  out.push({ x: end.x, y: end.y, p: pr(end) });
+  return out;
+}
+
 export function rectsIntersect(a, b) {
   return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
 }
