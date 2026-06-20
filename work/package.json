@@ -1,0 +1,10 @@
+{
+  "name": "infinitedraw",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Infinite-zoom drawing app with a stop-motion flipbook and Playwright-driven tests",
+  "scripts": {
+    "test": "node test/run.cjs",
+    "serve": "python3 -m http.server 8080"
+  }
+}
