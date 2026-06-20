@@ -60,6 +60,7 @@
       <input type="range" id="sides" min="3" max="12" step="1" value="5" />
     </label>
     <label class="toggle"><input type="checkbox" id="starToggle" checked /> Star (off = polygon)</label>
+    <label class="toggle"><input type="checkbox" id="brushSmooth" checked /> Smooth brush (Catmull-Rom)</label>
     <div class="swatches" id="swatches" aria-label="palette"></div>
     <span class="sep-h"></span>
     <span class="ctl-label">Arrange selection</span>
@@ -72,6 +73,10 @@
     <div class="btn-row">
       <button id="rotL" title="Rotate −15° (,)">↺</button>
       <button id="rotR" title="Rotate +15° (.)">↻</button>
+      <button id="scaleDown" title="Shrink selection 10% (&lt;)">⤡</button>
+      <button id="scaleUp" title="Grow selection 10% (&gt;)">⤢</button>
+    </div>
+    <div class="btn-row">
       <button id="groupBtn" title="Group selection (Ctrl+G)">⊞</button>
       <button id="ungroupBtn" title="Ungroup (Ctrl+Shift+G)">⊟</button>
     </div>

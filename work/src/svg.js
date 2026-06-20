@@ -1,5 +1,5 @@
 import { polygonVertices, rotCenter, ROTATABLE } from './scene.js';
-import { ribbonOutline } from './util.js';
+import { ribbonOutline, catmullRom } from './util.js';
 
 // Serialize the whole document to a standalone SVG string. World coordinates
 // map 1:1 to SVG user units (both are y-down), so the export is resolution
@@ -36,7 +36,9 @@ function itemToSVG(it) {
         if (it.points.length === 1) {
           return `<circle cx="${round(it.points[0].x)}" cy="${round(it.points[0].y)}" r="${round(half)}" fill="${escAttr(it.color)}"/>`;
         }
-        const outline = ribbonOutline(it.points, i => Math.max(1e-4, half * (it.points[i].p == null ? 1 : it.points[i].p)));
+        // mirror the on-canvas Catmull-Rom smoothing so the export matches
+        const pts = (it.smooth && it.points.length >= 3) ? catmullRom(it.points, 16) : it.points;
+        const outline = ribbonOutline(pts, i => Math.max(1e-4, half * (pts[i].p == null ? 1 : pts[i].p)));
         return `<polygon points="${ptsAttr(outline)}" fill="${escAttr(it.color)}"/>`;
       }
       return `<polyline points="${ptsAttr(it.points)}" ${stroke}/>`;

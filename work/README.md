@@ -30,7 +30,10 @@ line, arrow, rectangle, ellipse, star/polygon (3–12 points, star or regular), 
 stroke: it reads a stylus's real pressure when there is one, and otherwise infers
 it from pointer speed (fast = thin), so it feels alive even with a mouse. Each
 stroke enters and leaves on a fine inked point, and it's drawn as a filled ribbon
-that stays crisp at any zoom and exports to SVG as a single vector polygon.
+that stays crisp at any zoom and exports to SVG as a single vector polygon. A
+**Catmull-Rom smoothing** pass (toggle in the panel) rebuilds the path as a clean
+curve through its points at draw time, so freehand lines read smooth without
+bloating the saved file — the stored stroke keeps only its sparse control points.
 
 **Connectors / diagramming** — with the connector tool (`C`), drag from one object
 to another to link them. The connector stays glued to both, re-routing live as you
@@ -47,9 +50,12 @@ Turns the infinite canvas into a zoomable diagramming surface.
 
 **Editing** — multi-select (click, shift-click, marquee), move, **free rotation**
 (drag the handle above the selection, or `.`/`,` for 15° steps; hold `⇧` to snap),
-**group / ungroup** (grouped items select, move, and rotate as one unit), per-item
-colour / width / **opacity**, fill, z-order (front/back/raise/lower), copy/cut/paste,
-duplicate, an **eyedropper** (Alt+click to sample a colour), and full undo/redo.
+**resize** (drag a corner handle to scale uniformly about the opposite corner, or
+use the ⤢/⤡ buttons and `>`/`<` keys for ±10% steps), **group / ungroup** (grouped
+items select, move, rotate, and scale as one unit), **arrow-key nudge** (1px, or
+×10 with `⇧`), per-item colour / width / **opacity**, fill, z-order
+(front/back/raise/lower), copy/cut/paste, duplicate, an **eyedropper** (Alt+click
+to sample a colour), and full undo/redo.
 
 **Layers — lock & hide** — an **Objects panel** lists every item front-most-first
 (the z-stack as a layer list); click a row to select it, or use its 👁 / 🔒 toggles
@@ -94,6 +100,8 @@ and JSON import.
 | `0` | reset view | `Ctrl ]` / `Ctrl [` | raise / lower |
 | `G` | toggle grid | `Delete` · `Esc` | delete · clear selection |
 | `.` / `,` | rotate selection ±15° | drag-drop / paste | place an image |
+| `>` / `<` | scale selection ±10% | drag corner handle | resize selection |
+| `←↑↓→` | nudge selection 1px (`⇧` ×10) | `Space`-drag · middle-drag | pan |
 
 Hold `⇧` while drawing a line/arrow to snap angles, or a rect/ellipse/star to
 keep it square. Hold `⇧` while dragging the rotation handle to snap to 15°.

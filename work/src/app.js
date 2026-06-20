@@ -5,7 +5,7 @@ import { Scene, makeStroke, makeLine, makeRect, makeEllipse, makeText, makeArrow
 import { Renderer } from './renderer.js';
 import { Minimap } from './minimap.js';
 import { History, addItemsCmd, removeItemsCmd, moveItemsCmd, reorderCmd } from './history.js';
-import { simplify, debounce, clamp, dist, formatZoom, formatCoord, pointInRect } from './util.js';
+import { simplify, debounce, clamp, dist, formatZoom, formatCoord, pointInRect, catmullRom } from './util.js';
 import { GENERATORS } from './generators.js';
 import { sceneToSVG } from './svg.js';
 import * as storage from './storage.js';
@@ -42,6 +42,7 @@ class App {
     this.style = { color: '#e8e8ef', width: 3, fill: null, fillOn: false, fillColor: '#5b8cff',
                    textSize: 24, sides: 5, star: true, opacity: 1 };
     this.snap = false;
+    this.brushSmooth = true;     // Catmull-Rom smoothing for new brush strokes
 
     // interaction state
     this.draft = null;
@@ -357,6 +358,24 @@ class App {
         }
         break;
       }
+      case 'scale': {
+        const a = this.active;
+        const wr = this.toWorld(s.x, s.y); // raw (unsnapped) world point
+        // project the pointer onto the corner→pivot diagonal to get a uniform factor
+        const proj = (wr.x - a.pivot.x) * a.dirx + (wr.y - a.pivot.y) * a.diry;
+        let target = proj / a.baseLen;
+        if (e && e.shiftKey) target = Math.round(target / 0.25) * 0.25; // ⇧ snaps to ¼ steps
+        const minS = 0.02;
+        if (!(target > minS)) target = minS; // never flip/collapse the selection
+        const factor = target / a.applied;
+        if (factor > 0 && isFinite(factor) && Math.abs(factor - 1) > 1e-12) {
+          const items = a.ids.map(id => this.scene.byId(id)).filter(Boolean);
+          for (const it of items) scaleItemAbout(it, a.pivot.x, a.pivot.y, factor);
+          a.applied = target;
+          this.scene._touch();
+        }
+        break;
+      }
       case 'marquee':
         this.marquee = { ...this.marquee, x1: s.x, y1: s.y };
         break;
@@ -401,6 +420,17 @@ class App {
             label: `rotate ${ids.length}`,
             do() { rotateItemsAbout(grab(), pivot.x, pivot.y, ang); scene._touch(); },
             undo() { rotateItemsAbout(grab(), pivot.x, pivot.y, -ang); scene._touch(); },
+          });
+        }
+        break;
+      case 'scale':
+        if (Math.abs(a.applied - 1) > 1e-9) {
+          const ids = a.ids, pivot = a.pivot, sc = a.applied, scene = this.scene;
+          const grab = () => ids.map(id => scene.byId(id)).filter(Boolean);
+          this.history.pushApplied({
+            label: `scale ${ids.length}`,
+            do() { for (const it of grab()) scaleItemAbout(it, pivot.x, pivot.y, sc); scene._touch(); },
+            undo() { for (const it of grab()) scaleItemAbout(it, pivot.x, pivot.y, 1 / sc); scene._touch(); },
           });
         }
         break;
@@ -467,6 +497,7 @@ class App {
     pts = this._taperEnds(pts);
     const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width, opacity: this.draft.opacity });
     it.taper = true;
+    if (this.brushSmooth) it.smooth = true;
     this.draft = null;
     this.history.push(addItemsCmd(this.scene, [it]));
   }
@@ -546,6 +577,24 @@ class App {
         return;
       }
     }
+    // Grabbing a corner handle starts a uniform resize about the opposite corner
+    // (the diagonally-opposite corner stays pinned, like a standard vector editor).
+    const handles = this._scaleHandlesScreen();
+    if (handles) {
+      for (const h of handles) {
+        if (dist(s.x, s.y, h.x, h.y) <= 9) {
+          const pivx = h.ox, pivy = h.oy;
+          const dx = h.wx - pivx, dy = h.wy - pivy;
+          const baseLen = Math.hypot(dx, dy);
+          if (baseLen > 1e-12) {
+            this.active = { kind: 'scale', pivot: { x: pivx, y: pivy },
+                            dirx: dx / baseLen, diry: dy / baseLen, baseLen,
+                            applied: 1, ids: [...this.selectedIds] };
+            return;
+          }
+        }
+      }
+    }
     const tol = this.camera.screenToWorldLen(6);
     // If clicking inside the bbox of an already-selected item, drag the whole
     // selection — even over an unfilled interior. This matches vector editors.
@@ -607,6 +656,16 @@ class App {
     this.requestRender();
   }
 
+  /** Move the selection by a world-space delta as one undoable step (arrow keys). */
+  nudgeSelection(dx, dy) {
+    if (!this.selectedIds.size || (!dx && !dy)) return;
+    const ids = [...this.selectedIds].filter(id => { const it = this.scene.byId(id); return it && !it.locked; });
+    if (!ids.length) return;
+    this.history.push(moveItemsCmd(this.scene, ids, dx, dy, translateItem));
+    this._updateHud();
+    this.requestRender();
+  }
+
   // ---- rotation ----
   _selectionItems() { return [...this.selectedIds].map(id => this.scene.byId(id)).filter(Boolean); }
 
@@ -646,6 +705,56 @@ class App {
     const R = this._selectionAABBScreen();
     if (!R) return null;
     return { x: (R.minX + R.maxX) / 2, y: R.minY - 22, r: 6 };
+  }
+
+  /** World-space AABB of the visible selection (union of item bboxes), or null. */
+  _selectionWorldAABB() {
+    const items = this._selectionItems().filter(it => lodVisible(it, this.camera.scale));
+    if (!items.length) return null;
+    let b = { ...itemBBox(items[0]) };
+    for (const it of items) {
+      const ib = itemBBox(it);
+      b.minX = Math.min(b.minX, ib.minX); b.minY = Math.min(b.minY, ib.minY);
+      b.maxX = Math.max(b.maxX, ib.maxX); b.maxY = Math.max(b.maxY, ib.maxY);
+    }
+    return b;
+  }
+
+  /** The four corner resize handles (screen px), each tagged with its own world
+   *  corner (wx,wy) and the diagonally-opposite corner (ox,oy) used as the scale
+   *  pivot. Null unless the select tool has a non-degenerate selection. */
+  _scaleHandlesScreen() {
+    if (this.tool !== 'select' || !this.selectedIds.size) return null;
+    const b = this._selectionWorldAABB();
+    if (!b) return null;
+    if (b.maxX - b.minX < 1e-12 && b.maxY - b.minY < 1e-12) return null; // a point can't be resized
+    const corners = [
+      { wx: b.minX, wy: b.minY, ox: b.maxX, oy: b.maxY }, // nw, pivot se
+      { wx: b.maxX, wy: b.minY, ox: b.minX, oy: b.maxY }, // ne, pivot sw
+      { wx: b.maxX, wy: b.maxY, ox: b.minX, oy: b.minY }, // se, pivot nw
+      { wx: b.minX, wy: b.maxY, ox: b.maxX, oy: b.minY }, // sw, pivot ne
+    ];
+    return corners.map(c => {
+      const sc = this.camera.worldToScreen(c.wx, c.wy);
+      return { x: sc.x, y: sc.y, wx: c.wx, wy: c.wy, ox: c.ox, oy: c.oy };
+    });
+  }
+
+  /** Uniformly scale the selection by `factor` about a pivot (default: selection
+   *  centre). Reversible. Used by the test API and the ⤢/⤡ buttons. */
+  scaleSelection(factor, pivot = null) {
+    if (!this.selectedIds.size || !(factor > 0) || Math.abs(factor - 1) < 1e-12) return;
+    const b = this._selectionWorldAABB();
+    const p = pivot || (b ? { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 } : null);
+    if (!p) return;
+    const ids = [...this.selectedIds], scene = this.scene;
+    const grab = () => ids.map(id => scene.byId(id)).filter(Boolean);
+    this.history.push({
+      label: `scale ${ids.length}`,
+      do() { for (const it of grab()) scaleItemAbout(it, p.x, p.y, factor); scene._touch(); },
+      undo() { for (const it of grab()) scaleItemAbout(it, p.x, p.y, 1 / factor); scene._touch(); },
+    });
+    this.requestRender();
   }
 
   /** Rotate the selection by `ang` radians about a pivot (default: selection centre). */
@@ -907,6 +1016,7 @@ class App {
       this.requestRender();
     };
     document.getElementById('snapToggle').onchange = e => { this.snap = e.target.checked; };
+    document.getElementById('brushSmooth').onchange = e => { this.brushSmooth = e.target.checked; };
 
     document.querySelectorAll('.gen-row button').forEach(b =>
       b.addEventListener('click', () => this.generate(b.dataset.gen, {}, { clear: false, fit: true })));
@@ -917,6 +1027,8 @@ class App {
     document.getElementById('lower').onclick = () => this.lowerSelection();
     document.getElementById('rotL').onclick = () => this.rotateSelection(-Math.PI / 12);
     document.getElementById('rotR').onclick = () => this.rotateSelection(Math.PI / 12);
+    document.getElementById('scaleDown').onclick = () => this.scaleSelection(1 / 1.1);
+    document.getElementById('scaleUp').onclick = () => this.scaleSelection(1.1);
     document.getElementById('groupBtn').onclick = () => this.groupSelection();
     document.getElementById('ungroupBtn').onclick = () => this.ungroupSelection();
     document.getElementById('lockBtn').onclick = () => this.toggleLockSelection();
@@ -1009,6 +1121,20 @@ class App {
       if (e.shiftKey && !meta && e.key.toLowerCase() === 'l') { e.preventDefault(); this.toggleLockSelection(); return; }
       if (e.shiftKey && !meta && e.key.toLowerCase() === 'h') { e.preventDefault(); this.toggleHideSelection(); return; }
 
+      // Arrow keys nudge the selection — 1px on screen, ×10 with Shift. Using
+      // screen px keeps the felt step constant at any zoom.
+      if (e.key.startsWith('Arrow') && this.selectedIds.size && !meta) {
+        e.preventDefault();
+        const step = this.camera.screenToWorldLen(e.shiftKey ? 10 : 1);
+        let dx = 0, dy = 0;
+        if (e.key === 'ArrowLeft') dx = -step;
+        else if (e.key === 'ArrowRight') dx = step;
+        else if (e.key === 'ArrowUp') dy = -step;
+        else if (e.key === 'ArrowDown') dy = step;
+        this.nudgeSelection(dx, dy);
+        return;
+      }
+
       // z-order: ] front / [ back, with Ctrl for one-step raise/lower
       if (e.key === ']') { e.preventDefault(); meta ? this.raiseSelection() : this.bringToFront(); return; }
       if (e.key === '[') { e.preventDefault(); meta ? this.lowerSelection() : this.sendToBack(); return; }
@@ -1033,6 +1159,8 @@ class App {
         case 'g': { const t = document.getElementById('gridToggle'); t.checked = !t.checked; t.onchange({ target: t }); break; }
         case ',': if (this.selectedIds.size) { e.preventDefault(); this.rotateSelection(-Math.PI / 12); } break;
         case '.': if (this.selectedIds.size) { e.preventDefault(); this.rotateSelection(Math.PI / 12); } break;
+        case '<': if (this.selectedIds.size) { e.preventDefault(); this.scaleSelection(1 / 1.1); } break;
+        case '>': if (this.selectedIds.size) { e.preventDefault(); this.scaleSelection(1.1); } break;
       }
     });
     window.addEventListener('keyup', e => {
@@ -1528,10 +1656,13 @@ class App {
   render() {
     const t0 = performance.now();
     this.resolveConnectors(); // keep connector endpoints glued to their items
+    const gk = this.active && this.active.kind;
     this.renderer.render(this.scene, {
       draft: this.draft, selectedIds: this.selectedIds,
       marquee: this.marquee, eraserCursor: this.eraserCursor,
-      rotHandle: this.active && this.active.kind === 'rotate' ? null : this._rotHandleScreen(),
+      rotHandle: gk === 'rotate' ? null : this._rotHandleScreen(),
+      // hide the corner handles mid-transform so they don't clutter the gesture
+      scaleHandles: (gk === 'scale' || gk === 'rotate' || gk === 'marquee') ? null : this._scaleHandlesScreen(),
     });
     this.minimap.render();
     this._stats.lastRenderMs = performance.now() - t0;
@@ -1634,15 +1765,17 @@ class App {
       },
       addImage: (x, y, w, h, src, opts) => this.addImageItem(x, y, w, h, src, opts || {}),
       // brush / tapered strokes — points may be [{x,y,p}] or [[x,y,p]] (p optional)
-      addBrushStroke: (points, style) => {
+      addBrushStroke: (points, style = {}) => {
         const pts = (points || []).map(p => Array.isArray(p)
           ? { x: p[0], y: p[1], p: p[2] == null ? 1 : p[2] }
           : { x: p.x, y: p.y, ...(p.p == null ? {} : { p: p.p }) });
         const it = makeStroke(pts, { ...this.drawStyle, ...style });
         it.taper = true;
+        if (style.smooth !== false) it.smooth = true; // brush strokes smooth by default
         this.history.push(addItemsCmd(this.scene, [it]));
         return it.id;
       },
+      smoothPoints: (points, segs) => catmullRom(points, segs == null ? 12 : segs),
       placeImage: (src, sx, sy) => this.placeImageDataURL(src, { x: sx ?? this.camera.width / 2, y: sy ?? this.camera.height / 2 }),
       imagesPending: () => this.imagesPending(),
       generate: (name, opts, flags) => this.generate(name, opts, flags),
@@ -1659,6 +1792,9 @@ class App {
       // rotation
       rotateSelection: (ang, pivot) => this.rotateSelection(ang, pivot),
       rotHandle: () => this._rotHandleScreen(),
+      scaleSelection: (factor, pivot) => this.scaleSelection(factor, pivot),
+      scaleHandles: () => this._scaleHandlesScreen(),
+      nudgeSelection: (dx, dy) => this.nudgeSelection(dx, dy),
       // grouping
       group: () => this.groupSelection(),
       ungroup: () => this.ungroupSelection(),

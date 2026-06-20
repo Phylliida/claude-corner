@@ -1,5 +1,5 @@
 import { itemBBox, lodVisible, polygonVertices, rotCenter, ROTATABLE } from './scene.js';
-import { withAlpha, clamp, ribbonOutline } from './util.js';
+import { withAlpha, clamp, ribbonOutline, catmullRom } from './util.js';
 
 /**
  * Owns the <canvas>, handles device-pixel-ratio, and paints everything:
@@ -115,6 +115,7 @@ export class Renderer {
     // Selection chrome & marquee in screen space.
     this._screenSpace();
     if (selected.size) this._drawSelection(scene, selected);
+    if (state.scaleHandles) this._drawScaleHandles(state.scaleHandles);
     if (state.rotHandle) this._drawRotHandle(state.rotHandle);
     if (state.marquee) this._drawMarquee(state.marquee);
     if (state.eraserCursor) this._drawEraserCursor(state.eraserCursor);
@@ -330,7 +331,7 @@ export class Renderer {
    *  it visible when zoomed far out). A 1-point stroke renders as a round dab. */
   _drawRibbon(it, lw) {
     const { ctx, camera } = this;
-    const p = it.points;
+    let p = it.points;
     const base = lw / 2;
     const minHalf = camera.screenToWorldLen(0.35);
     ctx.fillStyle = it.color;
@@ -339,6 +340,15 @@ export class Renderer {
       ctx.arc(p[0].x, p[0].y, Math.max(minHalf, base), 0, Math.PI * 2);
       ctx.fill();
       return;
+    }
+    // Catmull-Rom smoothing: resample at a density tied to on-screen size so the
+    // curve stays smooth when zoomed in, cheap when small. World-space → crisp.
+    if (it.smooth && p.length >= 3) {
+      let len = 0;
+      for (let i = 1; i < p.length; i++) len += Math.hypot(p[i].x - p[i - 1].x, p[i].y - p[i - 1].y);
+      const avgPx = camera.worldToScreenLen(len / (p.length - 1));
+      const segs = clamp(Math.round(avgPx / 7), 4, 48);
+      p = catmullRom(p, segs);
     }
     const outline = ribbonOutline(p, i => Math.max(minHalf, base * (p[i].p == null ? 1 : p[i].p)));
     if (!outline || !outline.length) return;
@@ -391,6 +401,21 @@ export class Renderer {
     if (any && ids.size > 1) {
       ctx.strokeStyle = withAlpha('#5b8cff', 0.5);
       ctx.strokeRect(R.minX - 3, R.minY - 3, R.maxX - R.minX + 6, R.maxY - R.minY + 6);
+    }
+  }
+
+  /** Small square grab handles at the selection corners for uniform resize. */
+  _drawScaleHandles(handles) {
+    const { ctx } = this;
+    const sz = 4; // half-side in px
+    ctx.lineWidth = 1.5;
+    for (const h of handles) {
+      ctx.fillStyle = withAlpha('#0e0f13', 0.9);
+      ctx.strokeStyle = withAlpha('#5b8cff', 0.9);
+      ctx.beginPath();
+      ctx.rect(h.x - sz, h.y - sz, sz * 2, sz * 2);
+      ctx.fill();
+      ctx.stroke();
     }
   }
 

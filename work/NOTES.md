@@ -50,11 +50,13 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - persistence  — reload survival, camera persist, JSON round-trip, corrupt LS
 - keyboard     — all tool keys, undo/redo, select-all, delete, dup, zoom, fit
 
-## Status: WORKING. All 171 tests green (21 spec files), full suite stable (~1.8min).
-## README.md written. ~3200 LOC across src/.
+## Status: WORKING. All 195 tests green (24 spec files), full suite stable (~2min).
+## README.md written. ~3300 LOC across src/.
 ## Next-you: pick a feature from the TODO below, implement + test, keep the suite green.
 ## (batch 4, fresh instance 2026-06-19: image items + rotation + group/ungroup + connectors, +40 tests.)
 ## (batch 5, fresh instance 2026-06-19: lock/hide + Objects panel, pressure/tapered brush, +21 tests.)
+## (batch 6, fresh instance 2026-06-19: corner scale/resize handles + Catmull-Rom brush
+##  smoothing + arrow-key nudge, +24 tests.)
 
 ## Added since v1 (all tested)
 - **5 procedural generators** (src/generators.js): tree, spiral, droste,
@@ -184,6 +186,54 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
   - SVG export: tapered stroke → a single filled `<polygon>` (the ribbon outline),
     or `<circle>` for a dab. Shares `ribbonOutline` with the renderer.
 
+## Added in this session (batch 6 — fresh instance 2026-06-19)
+- **corner scale / resize handles** — tests/scale.spec.js (10 tests)
+  - Four small square handles at the selection's screen-space AABB corners
+    (`renderer._drawScaleHandles`, `app._scaleHandlesScreen()`). Grabbing one
+    starts a `kind:'scale'` gesture that UNIFORMLY (aspect-preserving) scales the
+    selection about the diagonally-opposite corner, which stays pinned.
+  - WHY uniform-only: the app's `scaleItemAbout(it,cx,cy,s)` is a single-factor
+    scale that already works for strokes (preserves per-point `p`), rotated boxes
+    (uniform scale commutes with `rot`), images, text, LOD thresholds, etc.
+    Non-uniform (independent x/y) scaling shears rotated boxes and can't be
+    expressed by `scaleItemAbout` — companion agreed uniform is the right call.
+  - Factor = pointer projected onto the corner→pivot diagonal / original diagonal
+    length, clamped to ≥0.02 so the selection never flips/collapses. Applied
+    incrementally each move (`applied` tracks the cumulative factor); committed as
+    one reversible history step on pointer-up (scale by `applied` / `1/applied`,
+    same pattern as rotate). ⇧ snaps the factor to ¼ steps.
+  - Also: `scaleSelection(factor, pivot?)` (defaults to selection-centre pivot) —
+    used by the ⤢/⤡ buttons (arrange row) and `>` / `<` keys (±10%), and the test
+    API. Handles are suppressed mid-scale/rotate/marquee so they don't clutter.
+  - GOTCHA avoided: Alt+drag for centre-scaling collides with the existing
+    Alt+click eyedropper (which early-returns in `_onDown` before `_beginSelect`),
+    so centre-scaling lives only on the buttons/keys/API, not on a modifier-drag.
+  - Handle grab radius 9px; checked AFTER the rotation handle and BEFORE the
+    move/marquee logic in `_beginSelect`. Safe with all prior tests (none start a
+    second-gesture drag within 9px of a selection corner).
+- **Catmull-Rom brush smoothing** — tests/smoothing.spec.js (7 tests)
+  - `util.catmullRom(points, segs)` resamples a polyline through a uniform
+    Catmull-Rom spline (passes through every control point, duplicated phantom
+    endpoints so tips don't overshoot), carrying per-point pressure `p` linearly.
+    Output length = (n-1)*segs+1; returns the list unchanged for <3 points.
+  - RENDER-ONLY: brush strokes get `smooth:true`; the stored control points stay
+    compact (RDP-thinned), and the smooth curve is rebuilt every frame in world
+    space. `renderer._drawRibbon` picks `segs` from the on-screen span length
+    (clamp(avgPx/7, 4, 48)) so it stays smooth zoomed in, cheap when small. SVG
+    export mirrors it (fixed segs=16). Both reuse `ribbonOutline`.
+  - Toggle: `#brushSmooth` checkbox (default on) → `app.brushSmooth` → sets
+    `it.smooth` on commit. `addBrushStroke(pts,{smooth:false})` opts out. Because
+    smoothing never touches stored points, every prior brush test stayed green
+    (they assert on control points / pressures, which are unchanged).
+  - Test API: `smoothPoints(points, segs)` exposes `catmullRom` for unit testing.
+- **arrow-key nudge** — tests/nudge.spec.js (7 tests)
+  - `←↑↓→` move the selection by 1 screen px (`⇧` = ×10), via `app.nudgeSelection
+    (dx,dy)` → one undoable `moveItemsCmd` per press. Step is `screenToWorldLen(px)`
+    so the felt distance is constant at any zoom (at scale 4, 1px = 0.25 world).
+  - Handler sits before the z-order keys in `_bindKeys`, guarded by `!meta` and a
+    live selection; skips `locked` items; no-op (no history entry) with no
+    selection. Test API: `nudgeSelection(dx,dy)`.
+
 ## Gotchas fixed
 - Text editor: a spurious `blur` fired right as the editor opened, committing the
   empty box closed before it was usable (flaky text test). Fixed in app.js with a
@@ -200,11 +250,14 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - [x] layers panel; lock/hide items — DONE (batch 5: Objects panel + per-item locked/hidden)
 - [x] freehand pressure/taper (variable stroke width) — DONE (batch 5: brush tool, ribbon render)
 - [ ] mobile/touch toolbar layout polish
-- [ ] scale/resize handles on selection (rotation handle exists; corner handles don't)
+- [x] scale/resize handles on selection — DONE (batch 6: uniform corner handles,
+      scale about opposite corner; ⤢/⤡ buttons + `>`/`<` keys + scaleSelection API).
+      Still TODO: non-uniform (side) handles — hard for rotated/stroke items.
 - [ ] true named layers (groups of items with a shared lock/hide/visibility) — the
       current model is per-item flags + a z-stack view, not assignable layers
-- [ ] brush polish: smoothing (Catmull-Rom) + miter/bevel on sharp corners (the
-      ribbon uses averaged normals; very sharp post-simplify turns could pinch)
+- [x] brush smoothing (Catmull-Rom) — DONE (batch 6: render-time spline resample,
+      `smooth` flag + #brushSmooth toggle). Still TODO: miter/bevel on sharp corners
+      (smoothing helps, but the ribbon still uses averaged normals).
 
 ## Companion
 gemma at http://127.0.0.1:8051 — chat for a second opinion if stuck (give it

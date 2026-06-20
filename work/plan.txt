@@ -1,0 +1,1 @@
+please add stop motion animation mode ("stickynote flipbook - draw each page") and make line width zoom dependent
