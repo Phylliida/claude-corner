@@ -1,0 +1,103 @@
+// Visual showcase: generates each procedural scene and a deep-zoom sequence,
+// saving screenshots to screenshots/. Run with the server up (npm run serve)
+// or it will use whatever IZ_URL/IZ_PORT point to.
+import { chromium } from 'playwright';
+import { mkdirSync } from 'node:fs';
+import { BASE_URL, launchOptions, waitReady, captureErrors } from './_helpers.js';
+
+mkdirSync('screenshots', { recursive: true });
+
+const browser = await chromium.launch(launchOptions);
+const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+const errors = captureErrors(page);
+await page.goto(BASE_URL);
+await waitReady(page);
+await page.evaluate(() => localStorage.clear());
+
+const shot = async (name) => {
+  await page.evaluate(() => window.__INFINIZOOM__.render());
+  await page.waitForTimeout(120);
+  await page.screenshot({ path: `screenshots/${name}.png` });
+  console.log('  saved', name);
+};
+
+// --- gallery of every generator ---
+const gens = await page.evaluate(() => window.__INFINIZOOM__.generators());
+console.log('generators:', gens.join(', '));
+for (const g of gens) {
+  await page.evaluate((g) => window.__INFINIZOOM__.generate(g, {}, { clear: true, fit: true }), g);
+  await shot(`gen-${g}`);
+}
+
+// --- deep zoom showcase on the spiral ---
+console.log('deep-zoom sequence...');
+await page.evaluate(() => window.__INFINIZOOM__.generate('spiral', { count: 110, shrink: 0.9 }, { clear: true, fit: true }));
+await shot('zoom-00-overview');
+
+// progressively zoom toward the spiral's drifting eye
+for (let step = 1; step <= 6; step++) {
+  await page.evaluate(() => {
+    const A = window.__INFINIZOOM__;
+    // aim at the densest cluster: pick the bbox of the smallest (last) items
+    const items = window.app.scene.items;
+    const tail = items.slice(-6);
+    let cx = 0, cy = 0, n = 0;
+    for (const it of tail) { for (const p of it.points || []) { cx += p.x; cy += p.y; n++; } }
+    if (n) { cx /= n; cy /= n; }
+    const cam = A.getCamera();
+    A.setCamera({ x: cx, y: cy, scale: cam.scale * 7 });
+  });
+  await shot(`zoom-${String(step).padStart(2, '0')}`);
+  const cam = await page.evaluate(() => window.__INFINIZOOM__.getCamera());
+  console.log(`    step ${step}: scale=${cam.scale.toExponential(2)}`);
+}
+
+// --- shapes showcase ---
+console.log('shapes showcase...');
+await page.evaluate(() => {
+  const A = window.__INFINIZOOM__;
+  A.clear(); A.setCamera({ x: 0, y: 0, scale: 1 });
+  A.addArrow({ x: -520, y: -220 }, { x: -160, y: -300 }, { color: '#ffa94d', width: 7 });
+  A.addArrow({ x: 160, y: -300 }, { x: 520, y: -160 }, { color: '#ff5b6e', width: 12 });
+  A.addPolygon(-540, 40, 190, 190, { star: true, sides: 5, color: '#ffd43b', fill: '#ffd43b' });
+  A.addPolygon(-300, 40, 190, 190, { star: true, sides: 9, color: '#f783ac', fill: null });
+  A.addPolygon(-40, 40, 190, 190, { star: false, sides: 6, color: '#69db7c', fill: '#38d9a9' });
+  A.addPolygon(220, 40, 190, 190, { star: false, sides: 3, color: '#4dabf7', fill: null });
+  A.addText(-520, 260, 'arrows · stars · polygons', { size: 40, color: '#e8e8ef' });
+  A.fitAll();
+});
+await shot('shapes');
+
+// --- recursive-stamp fractal, then a deep zoom into its heart ---
+console.log('stamp-fractal deep zoom...');
+await page.evaluate(() => {
+  const A = window.__INFINIZOOM__;
+  A.clear(); A.setCamera({ x: 0, y: 0, scale: 1 });
+  // a ring of colored polygons as the motif
+  const cols = ['#ff5b6e', '#ffa94d', '#ffd43b', '#69db7c', '#4dabf7', '#b197fc'];
+  const ids = [];
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    ids.push(A.addPolygon(Math.cos(a) * 260 - 70, Math.sin(a) * 260 - 70, 140, 140,
+      { star: i % 2 === 0, sides: 5, color: cols[i], fill: cols[i] }));
+  }
+  A.select(ids);
+  A.stamp({ factor: 0.5, depth: 9 }); // nested copies toward the centre
+  A.select([]);
+  A.fitAll();
+});
+await shot('fractal-00');
+for (let step = 1; step <= 5; step++) {
+  await page.evaluate(() => {
+    const A = window.__INFINIZOOM__;
+    const cam = A.getCamera();
+    A.setCamera({ x: 0, y: 0, scale: cam.scale * 8 });
+  });
+  await shot(`fractal-${String(step).padStart(2, '0')}`);
+  const cam = await page.evaluate(() => window.__INFINIZOOM__.getCamera());
+  console.log(`    fractal step ${step}: scale=${cam.scale.toExponential(2)}`);
+}
+
+console.log('errors:', errors.length ? errors : 'none');
+await browser.close();
+process.exit(errors.length ? 1 : 0);

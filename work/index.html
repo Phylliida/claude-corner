@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>∞ Infinizoom — infinite zoom drawing</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e0f13'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='%235b8cff'%3E%E2%88%9E%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="canvas" aria-label="drawing canvas"></canvas>
+
+  <!-- Top toolbar: tools -->
+  <div id="toolbar" class="panel" role="toolbar" aria-label="tools">
+    <button class="tool" data-tool="pen"     title="Pen (P)">✏️</button>
+    <button class="tool" data-tool="line"    title="Line (L)">╱</button>
+    <button class="tool" data-tool="arrow"   title="Arrow (A)">➤</button>
+    <button class="tool" data-tool="rect"    title="Rectangle (R)">▭</button>
+    <button class="tool" data-tool="ellipse" title="Ellipse (O)">◯</button>
+    <button class="tool" data-tool="star"    title="Star / polygon (S)">★</button>
+    <button class="tool" data-tool="text"    title="Text (T)">T</button>
+    <button class="tool" data-tool="select"  title="Select (V)">⬚</button>
+    <button class="tool" data-tool="eraser"  title="Eraser (E)">🩹</button>
+    <button class="tool" data-tool="pan"     title="Pan (H / hold Space)">✋</button>
+    <span class="sep"></span>
+    <button id="undo" title="Undo (Ctrl+Z)">↶</button>
+    <button id="redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+    <span class="sep"></span>
+    <button id="zoomOut" title="Zoom out (-)">−</button>
+    <button id="zoomIn"  title="Zoom in (+)">+</button>
+    <button id="zoomFit" title="Zoom to fit (F)">⤢</button>
+    <button id="zoomReset" title="Reset view (0)">⌂</button>
+  </div>
+
+  <!-- Left panel: style -->
+  <div id="style-panel" class="panel" aria-label="style">
+    <label class="ctl">
+      <span>Color</span>
+      <input type="color" id="color" value="#e8e8ef" />
+    </label>
+    <label class="ctl">
+      <span>Fill</span>
+      <span class="fill-row">
+        <input type="checkbox" id="fillOn" />
+        <input type="color" id="fillColor" value="#5b8cff" />
+      </span>
+    </label>
+    <label class="ctl">
+      <span>Width <b id="widthVal">3</b></span>
+      <input type="range" id="width" min="0.5" max="64" step="0.5" value="3" />
+    </label>
+    <label class="ctl">
+      <span>Opacity <b id="opacityVal">100%</b></span>
+      <input type="range" id="opacity" min="0.1" max="1" step="0.05" value="1" />
+    </label>
+    <label class="ctl">
+      <span>Star points <b id="sidesVal">5</b></span>
+      <input type="range" id="sides" min="3" max="12" step="1" value="5" />
+    </label>
+    <label class="toggle"><input type="checkbox" id="starToggle" checked /> Star (off = polygon)</label>
+    <div class="swatches" id="swatches" aria-label="palette"></div>
+    <span class="sep-h"></span>
+    <span class="ctl-label">Arrange selection</span>
+    <div class="btn-row">
+      <button id="toBack" title="Send to back ([)">⤓</button>
+      <button id="lower" title="Lower (Ctrl+[)">↓</button>
+      <button id="raise" title="Raise (Ctrl+])">↑</button>
+      <button id="toFront" title="Bring to front (])">⤒</button>
+    </div>
+    <span class="ctl-label">Visible zoom (LOD)</span>
+    <div class="btn-row">
+      <button id="lodFar" title="Show only when zoomed OUT past now">far</button>
+      <button id="lodAll" title="Always visible">all</button>
+      <button id="lodNear" title="Show only when zoomed IN past now">near</button>
+    </div>
+    <button id="stampBtn" title="Drop nested shrinking copies of the selection — make a fractal!">♺ Recursive stamp</button>
+  </div>
+
+  <!-- Bookmarks panel -->
+  <div id="bookmark-panel" class="panel" aria-label="bookmarks">
+    <div class="bm-head">
+      <span>🔖 Bookmarks</span>
+      <button id="addBookmark" title="Bookmark current view">＋</button>
+    </div>
+    <div id="bookmark-list"></div>
+  </div>
+
+  <!-- Right panel: actions / view -->
+  <div id="action-panel" class="panel" aria-label="actions">
+    <button id="clearBtn" title="Clear everything">🗑 Clear</button>
+    <button id="exportPng" title="Export view as PNG">🖼 PNG</button>
+    <button id="exportSvg" title="Export drawing as SVG (vector)">✒ SVG</button>
+    <button id="exportJson" title="Export drawing as JSON">💾 JSON</button>
+    <button id="importJson" title="Import JSON">📂 Open</button>
+    <input type="file" id="importFile" accept="application/json" hidden />
+    <span class="sep-h"></span>
+    <div class="grid-row">
+      <label class="toggle"><input type="checkbox" id="gridToggle" checked /> Grid</label>
+      <select id="gridStyle" title="Grid style">
+        <option value="lines">lines</option>
+        <option value="dots">dots</option>
+      </select>
+    </div>
+    <label class="toggle"><input type="checkbox" id="minimapToggle" checked /> Minimap</label>
+    <label class="toggle"><input type="checkbox" id="snapToggle" /> Snap</label>
+    <span class="sep-h"></span>
+    <span class="gen-label">✨ Generate</span>
+    <div class="gen-row">
+      <button data-gen="tree" title="Fractal tree">🌳</button>
+      <button data-gen="spiral" title="Spiral squares (deep zoom!)">🌀</button>
+      <button data-gen="droste" title="Droste rings (deep zoom!)">🎯</button>
+      <button data-gen="sierpinski" title="Sierpinski triangle">🔺</button>
+      <button data-gen="flowers" title="Flower field">🌸</button>
+    </div>
+  </div>
+
+  <!-- Bottom-left HUD -->
+  <div id="hud" class="panel">
+    <span id="hud-zoom">100%</span>
+    <span id="hud-coord">0, 0</span>
+    <span id="hud-count">0 items</span>
+    <span id="hud-tool">pen</span>
+  </div>
+
+  <!-- Minimap -->
+  <canvas id="minimap" title="minimap — click to jump"></canvas>
+
+  <!-- Toast / status messages -->
+  <div id="toast" aria-live="polite"></div>
+
+  <!-- Text editing overlay -->
+  <textarea id="text-editor" spellcheck="false"></textarea>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
