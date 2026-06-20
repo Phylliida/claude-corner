@@ -97,14 +97,22 @@ export class Renderer {
     const cull = { minX: view.minX - margin, minY: view.minY - margin,
                    maxX: view.maxX + margin, maxY: view.maxY + margin };
     const selected = state.selectedIds instanceof Set ? state.selectedIds : new Set();
+    const fv = state.frame || null;                         // flipbook page view, or null
     let drawn = 0;
     for (const it of scene.items) {
       if (it.hidden) continue;                              // layer visibility (eye toggle)
       if (!lodVisible(it, camera.scale)) continue;          // zoom-dependent visibility
       if (it.type === 'connector' && (!scene.byId(it.from) || !scene.byId(it.to))) continue; // dangling
+      // flipbook: skip off-page items, ghost neighbouring pages (onion skin)
+      let alphaMul = 1, tint = null;
+      if (fv) {
+        const fs = this._frameStyle(it, fv);
+        if (!fs) continue;
+        alphaMul = fs.alpha; tint = fs.tint;
+      }
       const b = itemBBox(it);
       if (b.maxX < cull.minX || b.minX > cull.maxX || b.maxY < cull.minY || b.minY > cull.maxY) continue;
-      this._drawItem(it);
+      this._drawItem(it, false, alphaMul, tint);
       drawn++;
     }
     this.lastDrawn = drawn;
@@ -119,6 +127,25 @@ export class Renderer {
     if (state.rotHandle) this._drawRotHandle(state.rotHandle);
     if (state.marquee) this._drawMarquee(state.marquee);
     if (state.eraserCursor) this._drawEraserCursor(state.eraserCursor);
+  }
+
+  /**
+   * Flipbook page styling for an item, given the view {current, onion, tint}.
+   * Returns null to hide the item, else { alpha, tint } where alpha multiplies
+   * its opacity and tint (a flat colour) marks an onion-skin ghost. The current
+   * page draws at full strength in its own colours; adjacent pages within the
+   * onion reach fade with distance and tint warm (past) / cool (future), the
+   * traditional-animation convention.
+   */
+  _frameStyle(it, fv) {
+    const df = (it.frame || 0) - fv.current;
+    if (df === 0) return { alpha: 1, tint: null };
+    const onion = fv.onion || 0;
+    if (onion <= 0 || Math.abs(df) > onion) return null;
+    const fade = 1 - (Math.abs(df) - 1) / (onion + 0.6); // nearer ghosts stronger
+    const alpha = 0.34 * Math.max(0.12, fade);
+    const tint = fv.tint ? (df < 0 ? '#ff6b6b' : '#5b8cff') : null;
+    return { alpha, tint };
   }
 
   // ---- grid ----
@@ -199,13 +226,25 @@ export class Renderer {
   }
 
   // ---- items ----
-  _drawItem(it, isDraft = false) {
+  /**
+   * Paint one item. `alphaMul` scales its opacity (used for onion-skin ghosts);
+   * `tint` overrides its colour with a flat ghost colour (and suppresses fills),
+   * also for onion skinning. Both default to the no-op identity so normal draws
+   * are byte-identical to before.
+   */
+  _drawItem(it, isDraft = false, alphaMul = 1, tint = null) {
     const { ctx, camera } = this;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.globalAlpha = it.opacity == null ? 1 : it.opacity;
+    ctx.globalAlpha = (it.opacity == null ? 1 : it.opacity) * alphaMul;
+    const col = tint || it.color;          // onion ghosts draw in a flat tint
+    const fillCol = tint ? null : it.fill; // tint ⇒ stroke-only ghost (no fill)
+    // Stroke width: world units that scale with zoom (default), or — when the
+    // item opts into widthMode:'screen' — a constant on-screen pixel width.
     const minWorldWidth = camera.screenToWorldLen(0.75); // keep hairlines visible
-    const lw = Math.max(it.width || 1, minWorldWidth);
+    const lw = it.widthMode === 'screen'
+      ? camera.screenToWorldLen(Math.max(it.width || 1, 0.75))
+      : Math.max(it.width || 1, minWorldWidth);
 
     // Rotated box items draw in a locally-rotated world frame; point items bake
     // their rotation into the geometry so they need no transform here.
@@ -222,8 +261,8 @@ export class Renderer {
       case 'stroke': {
         const p = it.points;
         if (!p.length) break;
-        if (it.taper) { this._drawRibbon(it, lw); break; }   // pressure/tapered brush
-        ctx.strokeStyle = it.color;
+        if (it.taper) { this._drawRibbon(it, lw, col); break; }   // pressure/tapered brush
+        ctx.strokeStyle = col;
         ctx.lineWidth = lw;
         ctx.beginPath();
         ctx.moveTo(p[0].x, p[0].y);
@@ -234,19 +273,19 @@ export class Renderer {
       }
       case 'line': {
         const [a, b] = it.points;
-        ctx.strokeStyle = it.color;
+        ctx.strokeStyle = col;
         ctx.lineWidth = lw;
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
         break;
       }
       case 'arrow': {
         const [a, b] = it.points;
-        this._drawArrowSeg(a, b, it.color, lw, true);
+        this._drawArrowSeg(a, b, col, lw, true);
         break;
       }
       case 'connector': {
         const a = { x: it.ax, y: it.ay }, b = { x: it.bx, y: it.by };
-        this._drawArrowSeg(a, b, it.color, lw, it.arrow !== false);
+        this._drawArrowSeg(a, b, col, lw, it.arrow !== false);
         break;
       }
       case 'polygon': {
@@ -256,13 +295,13 @@ export class Renderer {
         ctx.moveTo(verts[0].x, verts[0].y);
         for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
         ctx.closePath();
-        if (it.fill) { ctx.fillStyle = it.fill; ctx.fill(); }
-        ctx.strokeStyle = it.color; ctx.lineWidth = lw; ctx.stroke();
+        if (fillCol) { ctx.fillStyle = fillCol; ctx.fill(); }
+        ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
         break;
       }
       case 'rect': {
-        if (it.fill) { ctx.fillStyle = it.fill; ctx.fillRect(it.x, it.y, it.w, it.h); }
-        ctx.strokeStyle = it.color; ctx.lineWidth = lw;
+        if (fillCol) { ctx.fillStyle = fillCol; ctx.fillRect(it.x, it.y, it.w, it.h); }
+        ctx.strokeStyle = col; ctx.lineWidth = lw;
         ctx.strokeRect(it.x, it.y, it.w, it.h);
         break;
       }
@@ -271,8 +310,8 @@ export class Renderer {
         const rx = Math.abs(it.w / 2), ry = Math.abs(it.h / 2);
         ctx.beginPath();
         ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-        if (it.fill) { ctx.fillStyle = it.fill; ctx.fill(); }
-        ctx.strokeStyle = it.color; ctx.lineWidth = lw; ctx.stroke();
+        if (fillCol) { ctx.fillStyle = fillCol; ctx.fill(); }
+        ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
         break;
       }
       case 'image': {
@@ -290,7 +329,7 @@ export class Renderer {
         break;
       }
       case 'text': {
-        ctx.fillStyle = it.color;
+        ctx.fillStyle = col;
         ctx.textBaseline = 'top';
         ctx.font = `${it.size}px ui-sans-serif, system-ui, sans-serif`;
         const lines = String(it.text).split('\n');
@@ -329,12 +368,12 @@ export class Renderer {
    *  each point is the base half-width times that point's pressure `p`. Recomputed
    *  every frame in world space, so it stays crisp at any zoom (a tiny floor keeps
    *  it visible when zoomed far out). A 1-point stroke renders as a round dab. */
-  _drawRibbon(it, lw) {
+  _drawRibbon(it, lw, col = it.color) {
     const { ctx, camera } = this;
     let p = it.points;
     const base = lw / 2;
     const minHalf = camera.screenToWorldLen(0.35);
-    ctx.fillStyle = it.color;
+    ctx.fillStyle = col;
     if (p.length === 1) {
       ctx.beginPath();
       ctx.arc(p[0].x, p[0].y, Math.max(minHalf, base), 0, Math.PI * 2);

@@ -52,6 +52,13 @@
       <input type="range" id="width" min="0.5" max="64" step="0.5" value="3" />
     </label>
     <label class="ctl">
+      <span>Width vs zoom</span>
+      <select id="widthMode" title="How stroke width responds to zoom">
+        <option value="world">Scale (world)</option>
+        <option value="screen">Fixed (screen px)</option>
+      </select>
+    </label>
+    <label class="ctl">
       <span>Opacity <b id="opacityVal">100%</b></span>
       <input type="range" id="opacity" min="0.1" max="1" step="0.05" value="1" />
     </label>
@@ -142,6 +149,26 @@
       <button data-gen="droste" title="Droste rings (deep zoom!)">🎯</button>
       <button data-gen="sierpinski" title="Sierpinski triangle">🔺</button>
       <button data-gen="flowers" title="Flower field">🌸</button>
+    </div>
+  </div>
+
+  <!-- Bottom-center: stop-motion flipbook -->
+  <div id="anim-panel" class="panel" aria-label="flipbook animation">
+    <button id="flipToggle" title="Stop-motion flipbook — draw each page (frame)">🎬 Flipbook</button>
+    <div id="flip-controls" class="flip-controls hidden">
+      <button id="flipPrev" title="Previous page (←)">◀</button>
+      <span id="flipIndicator" class="flip-indicator">1 / 1</span>
+      <button id="flipNext" title="Next page (→)">▶</button>
+      <input type="range" id="flipScrub" class="flip-scrub" min="0" max="0" step="1" value="0" title="Scrub through pages" />
+      <span class="sep"></span>
+      <button id="flipAdd" title="Insert a blank page after this one">＋</button>
+      <button id="flipDup" title="Duplicate this page (then tweak it — stop-motion!)">⧉</button>
+      <button id="flipDel" title="Delete this page">🗑</button>
+      <button id="flipPlay" title="Play / pause">▶</button>
+      <label class="flip-mini" title="Frames per second">fps <input type="number" id="flipFps" min="1" max="60" value="6" /></label>
+      <label class="flip-mini" title="Onion-skin: how many neighbouring pages to ghost">onion <input type="range" id="flipOnion" min="0" max="3" step="1" value="1" /></label>
+      <label class="flip-mini" title="Tint onion skins (past = warm, next = cool)"><input type="checkbox" id="flipTint" checked /> tint</label>
+      <label class="flip-mini" title="Loop playback"><input type="checkbox" id="flipLoop" checked /> loop</label>
     </div>
   </div>
 
