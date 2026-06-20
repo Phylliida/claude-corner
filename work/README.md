@@ -22,9 +22,15 @@ Then open the served URL and draw.
 
 ## Features
 
-**Drawing tools** — pen (freehand, RDP-simplified), line, arrow, rectangle,
-ellipse, star/polygon (3–12 points, star or regular), text, **connector**, eraser,
-select, pan.
+**Drawing tools** — pen (freehand, RDP-simplified), **brush** (pressure / tapered),
+line, arrow, rectangle, ellipse, star/polygon (3–12 points, star or regular), text,
+**connector**, eraser, select, pan.
+
+**Pressure brush** — the brush tool (`B`) lays down a variable-width, tapered
+stroke: it reads a stylus's real pressure when there is one, and otherwise infers
+it from pointer speed (fast = thin), so it feels alive even with a mouse. Each
+stroke enters and leaves on a fine inked point, and it's drawn as a filled ribbon
+that stays crisp at any zoom and exports to SVG as a single vector polygon.
 
 **Connectors / diagramming** — with the connector tool (`C`), drag from one object
 to another to link them. The connector stays glued to both, re-routing live as you
@@ -44,6 +50,14 @@ Turns the infinite canvas into a zoomable diagramming surface.
 **group / ungroup** (grouped items select, move, and rotate as one unit), per-item
 colour / width / **opacity**, fill, z-order (front/back/raise/lower), copy/cut/paste,
 duplicate, an **eyedropper** (Alt+click to sample a colour), and full undo/redo.
+
+**Layers — lock & hide** — an **Objects panel** lists every item front-most-first
+(the z-stack as a layer list); click a row to select it, or use its 👁 / 🔒 toggles
+to hide or lock it. Hidden items vanish from the canvas, minimap, SVG export, and
+hit-testing; locked items stay visible but can't be selected, moved, or erased
+(though connectors can still snap onto them). Toggle the selection with the 🔒 / 👁
+buttons or `Shift+L` / `Shift+H`, and recover everything at once with the panel's
+*Show all* / *Unlock all*. All of it is undoable and round-trips through JSON.
 
 **Images** — drag-and-drop an image file onto the canvas, paste one from the
 clipboard, or use the 🖼 button. Images are first-class items: zoomable, movable,
@@ -71,14 +85,14 @@ and JSON import.
 
 | Key | Action | Key | Action |
 |-----|--------|-----|--------|
-| `P` pen · `L` line · `A` arrow | tools | `Ctrl/⌘ Z` / `⇧Z` | undo / redo |
+| `P` pen · `B` brush · `L` line · `A` arrow | tools | `Ctrl/⌘ Z` / `⇧Z` | undo / redo |
 | `R` rect · `O` ellipse · `S` star | tools | `Ctrl/⌘ A` | select all |
 | `T` text · `C` connector · `V` select | tools | `Ctrl/⌘ C·X·V·D` | copy·cut·paste·dup |
 | `E` eraser · `H` pan | tools | `Ctrl/⌘ G` / `⇧G` | group / ungroup |
-| `+` / `-` | zoom in / out | `Delete` | delete selection |
+| `+` / `-` | zoom in / out | `⇧L` / `⇧H` | lock / hide selection |
 | `F` | zoom to fit | `]` / `[` | bring to front / send to back |
 | `0` | reset view | `Ctrl ]` / `Ctrl [` | raise / lower |
-| `G` | toggle grid | `Esc` | clear selection |
+| `G` | toggle grid | `Delete` · `Esc` | delete · clear selection |
 | `.` / `,` | rotate selection ±15° | drag-drop / paste | place an image |
 
 Hold `⇧` while drawing a line/arrow to snap angles, or a rect/ellipse/star to
@@ -112,15 +126,17 @@ screen pixels. Stroke widths are world-relative, so zooming feels physical.
 
 `app.js` exposes `window.__INFINIZOOM__` so tests (and you, from the console) can
 drive everything headlessly: tools, styling, camera, items, undo/redo, generators,
-LOD, stamp, bookmarks, images, rotation, grouping, connectors, export, and
-pixel-level rendering checks. `window.app` is the live instance.
+LOD, stamp, bookmarks, images, rotation, grouping, connectors, lock/hide, the
+pressure brush, export, and pixel-level rendering checks. `window.app` is the live
+instance.
 
 ## Testing notes
 
-The suite (150 tests) covers core loading, drawing each tool, the camera (including
+The suite (171 tests) covers core loading, drawing each tool, the camera (including
 deep-zoom precision and culling), history, persistence, keyboard shortcuts,
 generators, LOD, recursive stamp, bookmarks/fly-to, SVG export, clipboard,
-performance, images, rotation, grouping, and connectors.
+performance, images, rotation, grouping, connectors, lock/hide layers, and the
+pressure brush.
 
 > **NixOS:** Playwright's prebuilt Chromium can't run (missing dynamic linker), so
 > the tests auto-resolve a Nix-store `chromium` via `tests/_helpers.js`. Set

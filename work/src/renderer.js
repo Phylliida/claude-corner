@@ -1,5 +1,5 @@
 import { itemBBox, lodVisible, polygonVertices, rotCenter, ROTATABLE } from './scene.js';
-import { withAlpha, clamp } from './util.js';
+import { withAlpha, clamp, ribbonOutline } from './util.js';
 
 /**
  * Owns the <canvas>, handles device-pixel-ratio, and paints everything:
@@ -99,6 +99,7 @@ export class Renderer {
     const selected = state.selectedIds instanceof Set ? state.selectedIds : new Set();
     let drawn = 0;
     for (const it of scene.items) {
+      if (it.hidden) continue;                              // layer visibility (eye toggle)
       if (!lodVisible(it, camera.scale)) continue;          // zoom-dependent visibility
       if (it.type === 'connector' && (!scene.byId(it.from) || !scene.byId(it.to))) continue; // dangling
       const b = itemBBox(it);
@@ -220,6 +221,7 @@ export class Renderer {
       case 'stroke': {
         const p = it.points;
         if (!p.length) break;
+        if (it.taper) { this._drawRibbon(it, lw); break; }   // pressure/tapered brush
         ctx.strokeStyle = it.color;
         ctx.lineWidth = lw;
         ctx.beginPath();
@@ -322,6 +324,31 @@ export class Renderer {
     ctx.closePath(); ctx.fill();
   }
 
+  /** Paint a variable-width "brush" stroke: a filled ribbon whose half-width at
+   *  each point is the base half-width times that point's pressure `p`. Recomputed
+   *  every frame in world space, so it stays crisp at any zoom (a tiny floor keeps
+   *  it visible when zoomed far out). A 1-point stroke renders as a round dab. */
+  _drawRibbon(it, lw) {
+    const { ctx, camera } = this;
+    const p = it.points;
+    const base = lw / 2;
+    const minHalf = camera.screenToWorldLen(0.35);
+    ctx.fillStyle = it.color;
+    if (p.length === 1) {
+      ctx.beginPath();
+      ctx.arc(p[0].x, p[0].y, Math.max(minHalf, base), 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    const outline = ribbonOutline(p, i => Math.max(minHalf, base * (p[i].p == null ? 1 : p[i].p)));
+    if (!outline || !outline.length) return;
+    ctx.beginPath();
+    ctx.moveTo(outline[0].x, outline[0].y);
+    for (let i = 1; i < outline.length; i++) ctx.lineTo(outline[i].x, outline[i].y);
+    ctx.closePath();
+    ctx.fill();
+  }
+
   /** Placeholder frame shown while an image decodes (or when it fails). */
   _drawImagePlaceholder(x, y, w, h, broken) {
     const { ctx } = this;
@@ -347,7 +374,7 @@ export class Renderer {
     let any = false, R = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
     for (const id of ids) {
       const it = scene.byId(id);
-      if (!it) continue;
+      if (!it || it.hidden) continue;
       if (!lodVisible(it, camera.scale)) continue; // don't frame invisible items
       any = true;
       const b = itemBBox(it);

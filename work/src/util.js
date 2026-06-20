@@ -47,6 +47,33 @@ export function bboxOfPoints(points) {
   return { minX, minY, maxX, maxY };
 }
 
+/**
+ * Closed outline (world points) of a variable-width "ribbon" swept along
+ * `points`, where `halfAt(i)` returns the half-width at point i. The outline
+ * runs up one side and back the other, ready to fill as a single polygon.
+ * Normals use a central difference so the band stays smooth along curves.
+ * Returns [] for an empty list and null for a single point (caller draws a dot).
+ */
+export function ribbonOutline(points, halfAt) {
+  const n = points.length;
+  if (n === 0) return [];
+  if (n === 1) return null;
+  const left = [], right = [];
+  for (let i = 0; i < n; i++) {
+    const prev = points[Math.max(0, i - 1)];
+    const next = points[Math.min(n - 1, i + 1)];
+    // normal = perpendicular to the local tangent (prev→next)
+    let nx = -(next.y - prev.y), ny = next.x - prev.x;
+    const len = Math.hypot(nx, ny) || 1;
+    nx /= len; ny /= len;
+    const h = halfAt(i);
+    left.push({ x: points[i].x + nx * h, y: points[i].y + ny * h });
+    right.push({ x: points[i].x - nx * h, y: points[i].y - ny * h });
+  }
+  right.reverse();
+  return left.concat(right);
+}
+
 export function rectsIntersect(a, b) {
   return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
 }
