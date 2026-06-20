@@ -1,0 +1,18 @@
+{
+  "name": "infinizoom",
+  "version": "1.0.0",
+  "description": "An infinite-zoom vector drawing app with Playwright browser-automation tests.",
+  "type": "module",
+  "scripts": {
+    "serve": "node server.js 8080",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "demo": "node tests/demo.js"
+  },
+  "keywords": ["canvas", "drawing", "infinite-zoom", "playwright"],
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "playwright": "^1.61.0"
+  }
+}
