@@ -77,6 +77,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-radius: 3px; padding: 0.25rem 0.5rem; width: 5em;
       font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;
     }
+    .controlbar input[type=text] {
+      background: var(--bg3); color: var(--fg); border: 1px solid var(--fg-dim);
+      border-radius: 3px; padding: 0.25rem 0.5rem;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;
+    }
+    .controlbar input[type=text]:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
     .tabbar {
       display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center;
       margin-bottom: 0.8rem; border-bottom: 1px solid var(--bg3); padding-bottom: 0.4rem;
@@ -321,6 +327,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button id="lane-delete" class="btn btn-danger" onclick="deleteLane()">delete</button>
     </div>
     <div class="controlbar">
+      <label for="lane-workdir">workdir</label>
+      <input id="lane-workdir" type="text" placeholder="(empty = per-iteration workspaces)" style="flex:1; min-width:14em;" />
+      <button class="btn" onclick="applyLaneWorkdir()">set</button>
+      <button class="btn" onclick="clearLaneWorkdir()">clear</button>
+      <span id="lane-workdir-hint" class="budget-numbers"></span>
+    </div>
+    <div class="controlbar">
       <label for="prompt-editor">prompt</label>
       <span id="prompt-dirty-badge" class="budget-numbers prompt-dirty"></span>
       <span style="flex:1"></span>
@@ -497,6 +510,22 @@ function applyLaneSlots() {
   setLaneSlots(lane.id, v);
 }
 
+async function setLaneWorkdir(workdir) {
+  const lane = currentLane();
+  if (!lane) return;
+  try { await laneFetch('/api/control/lane/workdir', { lane: lane.id, workdir: workdir }); heartbeat(); }
+  catch (e) { /* alerted */ }
+}
+
+function applyLaneWorkdir() {
+  setLaneWorkdir(document.getElementById('lane-workdir').value.trim());
+}
+
+function clearLaneWorkdir() {
+  document.getElementById('lane-workdir').value = '';
+  setLaneWorkdir('');
+}
+
 function toggleLaneRun() {
   const lane = currentLane();
   if (!lane) return;
@@ -542,12 +571,23 @@ function syncLanePanel(s) {
   }
   runBtn.onclick = toggleLaneRun;
   const slotsInput = document.getElementById('lane-slots');
-  slotsInput.max = s.max_slots_per_lane || 4;
+  slotsInput.max = (lane.kind === 'corner' && !lane.workdir) ? (s.max_slots_per_lane || 4) : 1;
   if (document.activeElement !== slotsInput) slotsInput.value = lane.slots;
   const state = lane.running ? 'running'
     : (lane.slots > 0 ? 'armed (master paused — click run)' : 'paused');
-  document.getElementById('lane-info').textContent = `${lane.kind} · ${lane.siblings} sibling(s) · ${state}`;
+  const where = lane.workdir ? 'fixed workdir' : `${lane.siblings} sibling(s)`;
+  document.getElementById('lane-info').textContent = `${lane.kind} · ${where} · ${state}`;
   document.getElementById('lane-delete').style.display = (lane.id === 'corner') ? 'none' : '';
+
+  // workdir input + hint
+  const wdInput = document.getElementById('lane-workdir');
+  if (document.activeElement !== wdInput) wdInput.value = lane.workdir || '';
+  const wdHint = document.getElementById('lane-workdir-hint');
+  if (wdHint) {
+    wdHint.textContent = lane.workdir
+      ? 'runs claude directly here — no worktree, no git, no template (max 1 worker)'
+      : 'per-iteration git worktrees under runs/ (default)';
+  }
 
   // prompt editor synced to the selected lane (don't clobber unsaved edits)
   const promptVal = lane.prompt || '';
@@ -735,7 +775,7 @@ function createSiblingEl(s) {
   el.dataset.sibling = s.name;
   el.innerHTML = `
     <div class="sibling-header">
-      <div><span class="arrow">▶</span><span class="sibling-name">${s.name}</span></div>
+      <div><span class="arrow">▶</span><span class="sibling-name">${escapeHtml(s.label || s.name)}</span></div>
       <div class="sibling-meta">${siblingMetaText(s)}</div>
     </div>
     <div class="sibling-body">
@@ -1217,7 +1257,7 @@ def _find_sessions(work_dir: Path) -> list[dict]:
             "mtime": st.st_mtime,
             "size": st.st_size,
         })
-    sessions.sort(key=lambda s: s["mtime"])
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions
 
 
@@ -1265,35 +1305,40 @@ def _simplify_event(evt: dict) -> dict | None:
     return {"role": role, "blocks": blocks, "timestamp": evt.get("timestamp")}
 
 
-FILE_EXCLUDE_DIRS = {".git", ".claude"}
+FILE_EXCLUDE_DIRS = {".git", ".claude", "node_modules", "__pycache__",
+                     ".venv", "venv", ".next", "runs"}
 FILE_EXCLUDE_NAMES = {".statusline.last", ".statusline.input",
                       ".statusline.last.tmp", ".statusline.input.tmp"}
+MAX_LISTED_FILES = 2000
 
 
 def _list_files(work_dir: Path) -> list[dict]:
+    """List files under work_dir for the UI. Prunes heavy dirs (node_modules,
+    .git, runs, …) during the walk and caps the count, so pointing a lane at a
+    large directory doesn't make /api/siblings huge or slow."""
     if not work_dir.exists():
         return []
-    out = []
-    for p in work_dir.rglob("*"):
-        try:
-            rel_parts = p.relative_to(work_dir).parts
-        except ValueError:
-            continue
-        if any(part in FILE_EXCLUDE_DIRS for part in rel_parts):
-            continue
-        if p.name in FILE_EXCLUDE_NAMES:
-            continue
-        if not p.is_file():
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        out.append({
-            "path": "/".join(rel_parts),
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-        })
+    out: list[dict] = []
+    base = str(work_dir)
+    for root, dirnames, filenames in os.walk(work_dir):
+        # prune excluded dirs in place so os.walk doesn't descend into them
+        dirnames[:] = [d for d in dirnames if d not in FILE_EXCLUDE_DIRS]
+        for name in filenames:
+            if name in FILE_EXCLUDE_NAMES:
+                continue
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, base)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            out.append({"path": rel.replace(os.sep, "/"),
+                        "size": st.st_size, "mtime": st.st_mtime})
+            if len(out) >= MAX_LISTED_FILES:
+                out.sort(key=lambda x: x["path"])
+                out.append({"path": f"… (truncated at {MAX_LISTED_FILES} files)",
+                            "size": 0, "mtime": 0})
+                return out
     out.sort(key=lambda x: x["path"])
     return out
 
@@ -1320,6 +1365,31 @@ def _parse_session(jsonl_path: Path) -> list[dict]:
 def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
     app = Flask(__name__)
 
+    def _lane_workdirs() -> dict:
+        """lane_id -> lane dict, for lanes that run in a fixed workdir."""
+        out = {}
+        if controls is not None and hasattr(controls, "get_state"):
+            try:
+                for l in controls.get_state().get("lanes", []):
+                    if l.get("workdir"):
+                        out[l["id"]] = l
+            except Exception:
+                pass
+        return out
+
+    def _resolve_work_dir(sibling: str):
+        """Map a sibling id to its work dir. Real worktrees are 'claude-<id>'
+        under runs/; fixed-workdir lanes are addressed as 'lane:<id>'."""
+        if "/" in sibling or ".." in sibling:
+            return None
+        if sibling.startswith("claude-"):
+            return runs_dir / sibling / "work"
+        if sibling.startswith("lane:"):
+            lane = _lane_workdirs().get(sibling[len("lane:"):])
+            if lane and lane.get("workdir"):
+                return Path(lane["workdir"])
+        return None
+
     @app.route("/")
     def index():
         return render_template_string(INDEX_HTML)
@@ -1336,8 +1406,6 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
                 except OSError:
                     continue
                 work = d / "work"
-                sessions = _find_sessions(work)
-                files = _list_files(work)
                 lane = "corner"
                 mf = d / ".mode"
                 if mf.exists():
@@ -1349,19 +1417,39 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
                         pass
                 result.append({
                     "name": d.name,
+                    "label": d.name,
                     "mtime": mtime,
                     "lane": lane,
-                    "sessions": sessions,
-                    "files": files,
+                    "sessions": _find_sessions(work),
+                    "files": _list_files(work),
                 })
+        # Fixed-workdir lanes have no runs/ worktree — surface them directly so
+        # their sessions and files still show in the UI under their tab.
+        for lane_id, lane in _lane_workdirs().items():
+            work = Path(lane["workdir"])
+            sessions = _find_sessions(work)
+            try:
+                mtime = max([s["mtime"] for s in sessions], default=work.stat().st_mtime)
+            except OSError:
+                mtime = 0
+            result.append({
+                "name": f"lane:{lane_id}",
+                "label": f"{lane['name']} · {lane['workdir']}",
+                "mtime": mtime,
+                "lane": lane_id,
+                "sessions": sessions,
+                "files": _list_files(work),
+            })
         result.sort(key=lambda s: s["mtime"], reverse=True)
         return jsonify(result)
 
     @app.route("/api/session/<sibling>/<session_id>")
     def api_session(sibling, session_id):
-        if not sibling.startswith("claude-") or "/" in session_id or ".." in session_id:
+        if "/" in session_id or ".." in session_id:
             return jsonify({"error": "bad path"}), 400
-        work_dir = runs_dir / sibling / "work"
+        work_dir = _resolve_work_dir(sibling)
+        if work_dir is None:
+            return jsonify({"error": "bad path"}), 400
         proj_dir = PROJECTS / _sanitize(work_dir)
         jsonl = proj_dir / f"{session_id}.jsonl"
         if not jsonl.exists():
@@ -1370,9 +1458,9 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
 
     @app.route("/file/<sibling>/<path:filepath>")
     def file_serve(sibling, filepath):
-        if not sibling.startswith("claude-") or "/" in sibling or ".." in sibling:
+        work = _resolve_work_dir(sibling)
+        if work is None:
             return abort(400)
-        work = runs_dir / sibling / "work"
         try:
             full = (work / filepath).resolve()
             work_resolved = work.resolve()
@@ -1464,6 +1552,20 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
             return jsonify({"error": f"unknown lane {lane!r} or bad slots"}), 400
         return jsonify({"slots": res})
 
+    @app.route("/api/control/lane/workdir", methods=["POST"])
+    def api_set_lane_workdir():
+        if controls is None or not hasattr(controls, "set_lane_workdir"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        workdir = data.get("workdir", "")
+        if not isinstance(lane, str) or not isinstance(workdir, str):
+            return jsonify({"error": "lane and workdir must be strings"}), 400
+        res = controls.set_lane_workdir(lane, workdir)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify(res)
+
     @app.route("/api/control/lanes", methods=["POST"])
     def api_create_lane():
         if controls is None or not hasattr(controls, "create_lane"):
@@ -1538,7 +1640,7 @@ def start_webui(port: int, runs_dir: Path, statusline_last: Path, controls=None)
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     def _serve():
-        app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
