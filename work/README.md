@@ -15,12 +15,22 @@ npm run serve   # python3 -m http.server 8080  ->  http://localhost:8080
 **Canvas**
 - Infinite pan & zoom. Scroll to zoom toward the cursor; drag (or middle-mouse /
   hold <kbd>Space</kbd>) to pan. The zoom range is effectively unbounded.
-- Tools: pen, straight line, rectangle, ellipse, stroke-eraser, eyedropper, pan.
+- Tools: pen, straight line, rectangle, ellipse, stroke-eraser, eyedropper,
+  **select**, pan.
 - Color picker + quick palette, **background colour**, brush-size slider,
   **brush opacity**, optional **pen smoothing** (quadratic curves).
 - **Velocity taper** (toggle <kbd>T</kbd>): the pen varies its width with drawing
   speed — fast strokes go thin, slow strokes go thick, for an organic ink /
   calligraphy feel. The "Taper amt" slider sets how dramatic the thinning is.
+- **Selection tool** (<kbd>V</kbd>): marquee-select strokes, then move, scale, or
+  delete them. Drag a marquee to select — **left→right** is a *window* (solid
+  blue; only fully-enclosed strokes), **right→left** is a *crossing* (dashed
+  green; any touched stroke), the AutoCAD convention. Drag inside the selection
+  to move it, grab one of the 8 handles to scale (taper widths scale too),
+  arrow keys to nudge (<kbd>Shift</kbd> for ×10), <kbd>Delete</kbd> to remove,
+  <kbd>Ctrl/⌘+J</kbd> to duplicate. <kbd>Shift</kbd>+drag/click adds to the
+  selection, <kbd>Ctrl/⌘+A</kbd> selects all, <kbd>Esc</kbd> clears. All
+  transforms are undoable.
 - Adaptive dot grid with an origin crosshair (toggle with <kbd>G</kbd>).
 - **Minimap / locator** (top-right): an overview of the whole drawing with a live
   viewport rectangle showing where you are. Click or drag it to jump the camera.
@@ -57,10 +67,12 @@ npm run serve   # python3 -m http.server 8080  ->  http://localhost:8080
 
 | key | action | key | action |
 |----|----|----|----|
-| `P` `L` `R` `O` `E` `I` | pen / line / rect / ellipse / eraser / eyedropper | `H` / `Space` | pan |
+| `P` `L` `R` `O` `E` `I` | pen / line / rect / ellipse / eraser / eyedropper | `V` / `H` / `Space` | select / pan |
 | `[` `]` | brush size | `C` / `X` | focus color / swap recent |
 | `0` | reset view | `F` | fit to drawing |
 | `G` / `M` / `T` | toggle grid / minimap / taper | `Ctrl/⌘+Z` / `+Shift` | undo / redo |
+| `Ctrl/⌘+A` | select all | `Delete` / `Esc` | delete selection / clear |
+| `Ctrl/⌘+J` | duplicate selection | `←↑→↓` (`+Shift`) | nudge selection 1px (10px) |
 | `N` | new frame | `D` | duplicate frame |
 | `,` `.` | prev / next frame | `Enter` | play / pause |
 | `Ctrl/⌘+C` / `+V` | copy / paste frame strokes | `Ctrl/⌘+S` | save |

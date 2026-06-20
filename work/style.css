@@ -36,6 +36,7 @@ html, body {
 }
 #board.panning { cursor: grab; }
 #board.panning.active { cursor: grabbing; }
+#board.selecting { cursor: default; }
 
 .panel {
   position: fixed;
