@@ -79,6 +79,24 @@ rotatable, fade-able, LOD-taggable, and they round-trip through JSON and SVG.
 - **Bookmarks:** save camera views and *fly* between them with eased, log-space
   zoom — even across billion-fold scale jumps.
 
+**Stop-motion flipbook** — flip the 🎬 toggle (bottom-center) and the canvas turns
+into a sticky-note flipbook: each page is an animation frame. Draw a page, add or
+**duplicate** the page (copy then nudge — the classic stop-motion move), and repeat;
+**onion skins** ghost the neighbouring pages so you can register the next drawing,
+tinted warm for the previous page and cool for the next (the traditional-animation
+convention). Scrub the slider or press ←/→ to flip through, hit ▶ to play it back
+at an adjustable fps (looping optional), and only the live page is editable so you
+never disturb the others. Every page op is undoable, and the whole flip-book
+round-trips through JSON (each item just carries a `frame` index). Flipbook is off
+by default, so the app is a plain infinite canvas until you want it.
+
+**Zoom-dependent line width** — the *Width vs zoom* selector chooses how a stroke's
+thickness responds to zoom: **Scale (world)** — the default — keeps width in world
+units so lines thicken as you zoom in (drawing feels physical), while **Fixed
+(screen px)** pins the on-screen thickness so a line reads the same weight at every
+magnification (great for annotations on a deep-zoom scene). It applies to the
+selection and to new strokes, and round-trips through JSON.
+
 **Procedural art generators** — fractal tree, spiral squares, Droste rings,
 Sierpinski triangle, flower field (the ✨ buttons).
 
@@ -102,6 +120,7 @@ and JSON import.
 | `.` / `,` | rotate selection ±15° | drag-drop / paste | place an image |
 | `>` / `<` | scale selection ±10% | drag corner handle | resize selection |
 | `←↑↓→` | nudge selection 1px (`⇧` ×10) | `Space`-drag · middle-drag | pan |
+| `←` / `→` | flip pages (flipbook on, no selection) | 🎬 scrub · ▶ | navigate · play frames |
 
 Hold `⇧` while drawing a line/arrow to snap angles, or a rect/ellipse/star to
 keep it square. Hold `⇧` while dragging the rotation handle to snap to 15°.
@@ -128,23 +147,25 @@ tests/           Playwright specs + standalone demo/smoke scripts
 ```
 
 Geometry lives in unbounded `f64` **world coordinates**; the camera maps them to
-screen pixels. Stroke widths are world-relative, so zooming feels physical.
+screen pixels. Stroke widths are world-relative by default, so zooming feels
+physical — or set a stroke's `widthMode` to `'screen'` to pin its on-screen weight.
 
 ### The test API
 
 `app.js` exposes `window.__INFINIZOOM__` so tests (and you, from the console) can
 drive everything headlessly: tools, styling, camera, items, undo/redo, generators,
 LOD, stamp, bookmarks, images, rotation, grouping, connectors, lock/hide, the
-pressure brush, export, and pixel-level rendering checks. `window.app` is the live
-instance.
+pressure brush, **zoom-dependent line width**, the **stop-motion flipbook** (frames,
+onion skins, playback), export, and pixel-level rendering checks. `window.app` is
+the live instance.
 
 ## Testing notes
 
-The suite (171 tests) covers core loading, drawing each tool, the camera (including
+The suite (213 tests) covers core loading, drawing each tool, the camera (including
 deep-zoom precision and culling), history, persistence, keyboard shortcuts,
 generators, LOD, recursive stamp, bookmarks/fly-to, SVG export, clipboard,
-performance, images, rotation, grouping, connectors, lock/hide layers, and the
-pressure brush.
+performance, images, rotation, grouping, connectors, lock/hide layers, the
+pressure brush, zoom-dependent line width, and the stop-motion flipbook.
 
 > **NixOS:** Playwright's prebuilt Chromium can't run (missing dynamic linker), so
 > the tests auto-resolve a Nix-store `chromium` via `tests/_helpers.js`. Set

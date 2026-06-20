@@ -40,9 +40,16 @@ class App {
 
     this.tool = 'pen';
     this.style = { color: '#e8e8ef', width: 3, fill: null, fillOn: false, fillColor: '#5b8cff',
-                   textSize: 24, sides: 5, star: true, opacity: 1 };
+                   textSize: 24, sides: 5, star: true, opacity: 1, widthMode: 'world' };
     this.snap = false;
     this.brushSmooth = true;     // Catmull-Rom smoothing for new brush strokes
+
+    // Stop-motion flipbook ("sticky-note flipbook — draw each page"). OFF by
+    // default, so the app is a normal infinite canvas until you turn it on.
+    // Each item carries an optional `frame` (0-based page; absent = page 0).
+    this.anim = { on: false, current: 0, count: 1, onion: 1, fps: 6,
+                  tint: true, loop: true, playing: false };
+    this._playTimer = null;
 
     // interaction state
     this.draft = null;
@@ -74,9 +81,11 @@ class App {
     this._buildSwatches();
 
     this._restore();
+    this._restoreAnim();
     this._loadBookmarks();
     this._renderBookmarks();
     this._renderLayers();
+    this._updateAnimUI();
     this._startLoop();
     this._installTestApi();
     this._updateHud();
@@ -141,11 +150,16 @@ class App {
       document.getElementById('opacity').value = partial.opacity;
       document.getElementById('opacityVal').textContent = Math.round(partial.opacity * 100) + '%';
     }
+    if (partial.widthMode !== undefined) {
+      const sel = document.getElementById('widthMode');
+      if (sel) sel.value = partial.widthMode;
+    }
     // apply to current selection
     const fillable = new Set(['rect', 'ellipse', 'polygon']);
+    const strokeable = new Set(['stroke', 'line', 'arrow', 'rect', 'ellipse', 'polygon', 'connector']);
     if (this.selectedIds.size && (partial.color || partial.width || partial.fill !== undefined ||
                                   partial.sides !== undefined || partial.star !== undefined ||
-                                  partial.opacity !== undefined)) {
+                                  partial.opacity !== undefined || partial.widthMode !== undefined)) {
       for (const id of this.selectedIds) {
         const it = this.scene.byId(id);
         if (!it) continue;
@@ -157,6 +171,9 @@ class App {
         if (partial.opacity !== undefined) {
           if (partial.opacity >= 1) delete it.opacity; else it.opacity = partial.opacity;
         }
+        if (partial.widthMode !== undefined && strokeable.has(it.type)) {
+          if (partial.widthMode === 'screen') it.widthMode = 'screen'; else delete it.widthMode;
+        }
       }
       this.scene._touch();
     }
@@ -167,7 +184,8 @@ class App {
   get drawStyle() {
     return { color: this.style.color, width: this.style.width,
              fill: this.style.fillOn ? this.style.fillColor : null, size: this.style.textSize,
-             sides: this.style.sides, star: this.style.star, opacity: this.style.opacity };
+             sides: this.style.sides, star: this.style.star, opacity: this.style.opacity,
+             widthMode: this.style.widthMode };
   }
 
   // ---------------- pointer input ----------------
@@ -210,6 +228,7 @@ class App {
   }
 
   _onDown(e) {
+    if (this.anim.playing) this.stop();   // interacting stops flipbook playback
     try { this.canvas.setPointerCapture?.(e.pointerId); } catch { /* synthetic events */ }
     const s = this.evtScreen(e);
     this.pointers.set(e.pointerId, s);
@@ -447,8 +466,9 @@ class App {
     const eps = this.camera.screenToWorldLen(0.6);
     let pts = simplify(this.draft.points, eps);
     if (pts.length === 0) { this.draft = null; return; }
-    const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width });
+    const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width, widthMode: this.draft.widthMode });
     this.draft = null;
+    this._assignFrame([it]);
     this.history.push(addItemsCmd(this.scene, [it]));
   }
 
@@ -495,10 +515,12 @@ class App {
     let pts = simplify(this.draft.points, eps);       // RDP keeps whole point objects → `p` survives
     if (pts.length === 0) { this.draft = null; return; }
     pts = this._taperEnds(pts);
-    const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width, opacity: this.draft.opacity });
+    const it = makeStroke(pts, { color: this.draft.color, width: this.draft.width,
+                                 widthMode: this.draft.widthMode, opacity: this.draft.opacity });
     it.taper = true;
     if (this.brushSmooth) it.smooth = true;
     this.draft = null;
+    this._assignFrame([it]);
     this.history.push(addItemsCmd(this.scene, [it]));
   }
 
@@ -531,15 +553,20 @@ class App {
     } else if (Math.abs(d.w) < this.camera.screenToWorldLen(2) && Math.abs(d.h) < this.camera.screenToWorldLen(2)) {
       return;
     }
+    this._assignFrame([d]);
     this.history.push(addItemsCmd(this.scene, [d]));
   }
 
   // ---- eraser ----
-  _lodFilter() { const s = this.camera.scale; return it => lodVisible(it, s); }
+  _lodFilter() { const s = this.camera.scale; return it => lodVisible(it, s) && this._frameInteractive(it); }
   /** Pick filter for selection/erase: also excludes locked items (hidden ones
    *  are already skipped inside Scene.pick). Connectors keep the looser
    *  _lodFilter so they can still snap onto a locked object. */
-  _selFilter() { const s = this.camera.scale; return it => lodVisible(it, s) && !it.locked; }
+  _selFilter() { const s = this.camera.scale; return it => lodVisible(it, s) && !it.locked && this._frameInteractive(it); }
+
+  /** In flipbook mode only items on the current page can be picked/edited;
+   *  off-page pages are onion-skin ghosts. With flipbook OFF, everything is live. */
+  _frameInteractive(it) { return !this.anim.on || (it.frame || 0) === this.anim.current; }
 
   /** Sample the colour of the top-most item under a world point into the palette. */
   eyedrop(wx, wy) {
@@ -633,7 +660,7 @@ class App {
     const rect = { minX: Math.min(a.x, b.x), minY: Math.min(a.y, b.y), maxX: Math.max(a.x, b.x), maxY: Math.max(a.y, b.y) };
     if (Math.abs(this.marquee.x1 - this.marquee.x0) > 3 || Math.abs(this.marquee.y1 - this.marquee.y0) > 3) {
       const hits = this.scene.itemsContainedIn(rect);
-      for (const it of hits) this.selectedIds.add(it.id);
+      for (const it of hits) if (this._frameInteractive(it)) this.selectedIds.add(it.id);
       this._expandSelectionGroups(); // pull in the rest of any touched group
     }
     this.marquee = null;
@@ -650,7 +677,7 @@ class App {
     this._updateHud();
   }
   selectAll() {
-    this.selectedIds = new Set(this.scene.items.filter(i => !i.locked && !i.hidden).map(i => i.id));
+    this.selectedIds = new Set(this.scene.items.filter(i => !i.locked && !i.hidden && this._frameInteractive(i)).map(i => i.id));
     if (this.tool !== 'select') this.setTool('select');
     this._updateHud();
     this.requestRender();
@@ -877,6 +904,7 @@ class App {
     const it = makeConnector(fromId, toId,
       { color: this.style.color, width: this.style.width, arrow: true, ...style });
     this._resolveConnector(it);
+    this._assignFrame([it]);
     this.history.push(addItemsCmd(this.scene, [it]));
     this._toast('Connected');
     return it.id;
@@ -951,6 +979,7 @@ class App {
     if (text.trim() && this._textPos) {
       const it = makeText(this._textPos.x, this._textPos.y, text,
         { color: this.style.color, size: this.style.textSize });
+      this._assignFrame([it]);
       this.history.push(addItemsCmd(this.scene, [it]));
     }
     this._textPos = null;
@@ -982,6 +1011,7 @@ class App {
 
     document.getElementById('color').oninput = e => this.setStyle({ color: e.target.value });
     document.getElementById('width').oninput = e => this.setStyle({ width: parseFloat(e.target.value) });
+    document.getElementById('widthMode').onchange = e => this.setStyle({ widthMode: e.target.value });
     document.getElementById('sides').oninput = e => this.setStyle({ sides: parseInt(e.target.value, 10) });
     document.getElementById('opacity').oninput = e => this.setStyle({ opacity: parseFloat(e.target.value) });
     document.getElementById('starToggle').onchange = e => this.setStyle({ star: e.target.checked });
@@ -1017,6 +1047,20 @@ class App {
     };
     document.getElementById('snapToggle').onchange = e => { this.snap = e.target.checked; };
     document.getElementById('brushSmooth').onchange = e => { this.brushSmooth = e.target.checked; };
+
+    // flipbook / stop-motion controls
+    document.getElementById('flipToggle').onclick = () => this.toggleFlipbook();
+    document.getElementById('flipPrev').onclick = () => this.prevFrame();
+    document.getElementById('flipNext').onclick = () => this.nextFrame();
+    document.getElementById('flipScrub').oninput = e => this.setFrame(parseInt(e.target.value, 10));
+    document.getElementById('flipAdd').onclick = () => this.addFrame();
+    document.getElementById('flipDup').onclick = () => this.duplicateFrame();
+    document.getElementById('flipDel').onclick = () => this.deleteFrame();
+    document.getElementById('flipPlay').onclick = () => this.togglePlay();
+    document.getElementById('flipFps').onchange = e => this.setFps(parseInt(e.target.value, 10));
+    document.getElementById('flipOnion').oninput = e => this.setOnion(parseInt(e.target.value, 10));
+    document.getElementById('flipTint').onchange = e => this.setTint(e.target.checked);
+    document.getElementById('flipLoop').onchange = e => this.setLoop(e.target.checked);
 
     document.querySelectorAll('.gen-row button').forEach(b =>
       b.addEventListener('click', () => this.generate(b.dataset.gen, {}, { clear: false, fit: true })));
@@ -1121,6 +1165,15 @@ class App {
       if (e.shiftKey && !meta && e.key.toLowerCase() === 'l') { e.preventDefault(); this.toggleLockSelection(); return; }
       if (e.shiftKey && !meta && e.key.toLowerCase() === 'h') { e.preventDefault(); this.toggleHideSelection(); return; }
 
+      // In flipbook mode with nothing selected, ←/→ flip between pages. (When
+      // something is selected, the arrows nudge it — handled just below.)
+      if (this.anim.on && !this.selectedIds.size && !meta &&
+          (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        e.key === 'ArrowLeft' ? this.prevFrame() : this.nextFrame();
+        return;
+      }
+
       // Arrow keys nudge the selection — 1px on screen, ×10 with Shift. Using
       // screen px keeps the felt step constant at any zoom.
       if (e.key.startsWith('Arrow') && this.selectedIds.size && !meta) {
@@ -1201,6 +1254,7 @@ class App {
     // land the paste centred on the current view
     const dx = this.camera.x - cx, dy = this.camera.y - cy;
     for (const c of clones) translateItem(c, dx, dy);
+    this._assignFrame(clones);
     this.history.push(addItemsCmd(this.scene, clones));
     this.selectedIds = new Set(clones.map(c => c.id));
     this._updateHud();
@@ -1223,6 +1277,7 @@ class App {
     }).filter(Boolean);
     this._relinkConnectors(clones, idMap);
     this._remapGroups(clones);
+    this._assignFrame(clones);
     this.history.push(addItemsCmd(this.scene, clones));
     this.selectedIds = new Set(clones.map(c => c.id));
     this._updateHud();
@@ -1289,6 +1344,7 @@ class App {
   addImageItem(x, y, w, h, src, { select = false } = {}) {
     const it = makeImage(x, y, w, h, src, { opacity: this.style.opacity });
     if (src) this.renderer._image(src);   // begin decoding immediately
+    this._assignFrame([it]);
     this.history.push(addItemsCmd(this.scene, [it]));
     if (select) { this.selectedIds = new Set([it.id]); if (this.tool !== 'select') this.setTool('select'); }
     this._updateHud();
@@ -1504,6 +1560,7 @@ class App {
       }
       s *= factor;
     }
+    this._assignFrame(clones);
     this.history.push(addItemsCmd(this.scene, clones));
     this.selectedIds = new Set(clones.map(c => c.id));
     this._updateHud();
@@ -1593,6 +1650,258 @@ class App {
     }
   }
 
+  // ---------------- flipbook / stop-motion animation ----------------
+  /** The page an item lives on (absent `frame` ⇒ page 0). */
+  frameOf(it) { return it ? (it.frame || 0) : 0; }
+
+  /** Highest page index any item currently occupies (0 if none). */
+  _framesMaxUsed() {
+    let m = 0;
+    for (const it of this.scene.items) { const f = it.frame || 0; if (f > m) m = f; }
+    return m;
+  }
+
+  /** Keep page count ≥ pages actually drawn, and current page within range. */
+  _reconcileFrames() {
+    this.anim.count = Math.max(1, this.anim.count | 0, this._framesMaxUsed() + 1);
+    this.anim.current = clamp(this.anim.current | 0, 0, this.anim.count - 1);
+  }
+
+  /** Tag freshly-created items with the active page (no-op when flipbook is off,
+   *  so a normal infinite-canvas drawing never grows a `frame` field). */
+  _assignFrame(items) {
+    if (!this.anim.on) return items;
+    const f = this.anim.current;
+    for (const it of (Array.isArray(items) ? items : [items])) {
+      if (f) it.frame = f; else delete it.frame; // page 0 is implicit
+    }
+    return items;
+  }
+
+  _itemsOnFrame(f) { return this.scene.items.filter(it => (it.frame || 0) === f); }
+  /** How many items live on a page (default: the current one). */
+  frameItemCount(f = this.anim.current) { return this._itemsOnFrame(f).length; }
+
+  _ensureFlipbook() { if (!this.anim.on) this.setFlipbook(true); }
+
+  /** Turn flipbook mode on/off. Turning on snaps the page count to what's drawn. */
+  setFlipbook(on) {
+    on = !!on;
+    if (on === this.anim.on) { this._updateAnimUI(); return; }
+    this.anim.on = on;
+    if (on) this._reconcileFrames(); else this.stop();
+    this.selectedIds.clear();           // a selection may now be off-page
+    this._afterAnimChange();
+    this._toast(on ? '🎬 Flipbook on — each page is a frame' : 'Flipbook off');
+  }
+  toggleFlipbook() { this.setFlipbook(!this.anim.on); }
+
+  /** Jump to page i (clamped). Pure navigation — not an undo step. */
+  setFrame(i) {
+    this._ensureFlipbook();
+    this.anim.current = clamp(i | 0, 0, this.anim.count - 1);
+    this.selectedIds.clear();
+    this._afterAnimChange();
+  }
+  nextFrame() { if (this.anim.count) this.setFrame((this.anim.current + 1) % this.anim.count); }
+  prevFrame() { if (this.anim.count) this.setFrame((this.anim.current - 1 + this.anim.count) % this.anim.count); }
+
+  /** Insert a blank page right after the current one (undoable). */
+  addFrame() {
+    this._ensureFlipbook();
+    const at = this.anim.current, app = this, scene = this.scene;
+    const shifted = scene.items.filter(it => (it.frame || 0) > at).map(it => it.id);
+    const oldCount = this.anim.count, oldCur = this.anim.current;
+    this.history.push({
+      label: 'add frame',
+      do() {
+        for (const id of shifted) { const it = scene.byId(id); if (it) it.frame = (it.frame || 0) + 1; }
+        app.anim.count = oldCount + 1; app.anim.current = at + 1; scene._touch(); app._afterAnimChange();
+      },
+      undo() {
+        for (const id of shifted) { const it = scene.byId(id); if (it) { it.frame = (it.frame || 0) - 1; if (!it.frame) delete it.frame; } }
+        app.anim.count = oldCount; app.anim.current = oldCur; scene._touch(); app._afterAnimChange();
+      },
+    });
+    this._toast(`Added page ${at + 2}`);
+  }
+
+  /** Duplicate the current page's drawing onto a fresh page after it (undoable).
+   *  The heart of stop-motion: copy a page, then nudge things a little. */
+  duplicateFrame() {
+    this._ensureFlipbook();
+    const at = this.anim.current, app = this, scene = this.scene;
+    const shifted = scene.items.filter(it => (it.frame || 0) > at).map(it => it.id);
+    const src = this._itemsOnFrame(at);
+    const idMap = new Map();
+    const clones = src.map(it => {
+      const c = JSON.parse(JSON.stringify(it));
+      c.id = `fd_${(this._fdupSeq = (this._fdupSeq || 0) + 1).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      c.frame = at + 1;
+      idMap.set(it.id, c.id);
+      return c;
+    });
+    this._relinkConnectors(clones, idMap);
+    this._remapGroups(clones);
+    const oldCount = this.anim.count, oldCur = this.anim.current;
+    this.history.push({
+      label: 'duplicate frame',
+      do() {
+        for (const id of shifted) { const it = scene.byId(id); if (it) it.frame = (it.frame || 0) + 1; }
+        scene.addMany(clones);
+        app.anim.count = oldCount + 1; app.anim.current = at + 1; app._afterAnimChange();
+      },
+      undo() {
+        scene.removeMany(clones.map(c => c.id));
+        for (const id of shifted) { const it = scene.byId(id); if (it) { it.frame = (it.frame || 0) - 1; if (!it.frame) delete it.frame; } }
+        app.anim.count = oldCount; app.anim.current = oldCur; app._afterAnimChange();
+      },
+    });
+    this._toast(`Duplicated page → ${at + 2}`);
+  }
+
+  /** Delete the current page (its items and the slot), pulling later pages down.
+   *  The final remaining page can't be removed — it's just emptied. (undoable) */
+  deleteFrame() {
+    this._ensureFlipbook();
+    const scene = this.scene, app = this;
+    if (this.anim.count <= 1) {
+      const items = this._itemsOnFrame(0);
+      if (items.length) this.history.push(removeItemsCmd(scene, items));
+      this.anim.current = 0; this._afterAnimChange();
+      return;
+    }
+    const at = this.anim.current;
+    const doomed = this._itemsOnFrame(at);
+    const snapshot = doomed.map(it => ({ item: it, index: scene.items.indexOf(it) })).sort((a, b) => a.index - b.index);
+    const shifted = scene.items.filter(it => (it.frame || 0) > at).map(it => it.id);
+    const oldCount = this.anim.count, oldCur = this.anim.current;
+    const newCur = Math.min(at, oldCount - 2);
+    this.history.push({
+      label: 'delete frame',
+      do() {
+        scene.removeMany(doomed.map(i => i.id));
+        for (const id of shifted) { const it = scene.byId(id); if (it) { it.frame = (it.frame || 0) - 1; if (!it.frame) delete it.frame; } }
+        app.anim.count = oldCount - 1; app.anim.current = newCur; app._afterAnimChange();
+      },
+      undo() {
+        for (const id of shifted) { const it = scene.byId(id); if (it) it.frame = (it.frame || 0) + 1; }
+        for (const { item, index } of snapshot) { const a = Math.min(index, scene.items.length); scene.items.splice(a, 0, item); scene._index.set(item.id, item); }
+        app.anim.count = oldCount; app.anim.current = oldCur; scene._touch(); app._afterAnimChange();
+      },
+    });
+    this._toast(`Deleted page ${at + 1}`);
+  }
+
+  /** Reassign the selection onto another page (cross-frame edit, undoable). */
+  moveSelectionToFrame(target) {
+    if (!this.anim.on || !this.selectedIds.size) return;
+    target = clamp(target | 0, 0, this.anim.count - 1);
+    const ids = [...this.selectedIds].filter(id => this.scene.byId(id));
+    if (!ids.length) return;
+    const scene = this.scene;
+    const before = ids.map(id => ({ id, frame: scene.byId(id).frame || 0 }));
+    const setF = (id, f) => { const it = scene.byId(id); if (it) { if (f) it.frame = f; else delete it.frame; } };
+    this.history.push({
+      label: 'move to frame',
+      do() { for (const id of ids) setF(id, target); scene._touch(); },
+      undo() { for (const { id, frame } of before) setF(id, frame); scene._touch(); },
+    });
+    this.selectedIds.clear();           // they've left the current page
+    this._afterAnimChange();
+    this._toast(`Moved ${ids.length} to page ${target + 1}`);
+  }
+
+  // ---- playback ----
+  play() {
+    this._ensureFlipbook();
+    if (this.anim.count <= 1) { this._toast('Add pages to animate first'); return; }
+    if (this.anim.playing) return;
+    this.anim.playing = true;
+    this.selectedIds.clear();
+    this._updateAnimUI(); this.requestRender();
+    this._step();
+  }
+  _step() {
+    if (!this.anim.playing) return;
+    const dt = 1000 / clamp(this.anim.fps, 1, 60);
+    this._playTimer = setTimeout(() => {
+      this._playTimer = null;
+      if (!this.anim.playing) return;
+      let next = this.anim.current + 1;
+      if (next >= this.anim.count) { if (this.anim.loop) next = 0; else { this.stop(); return; } }
+      this.anim.current = next;
+      this._updateAnimUI(); this.requestRender();
+      this._step();
+    }, dt);
+  }
+  stop() {
+    if (this._playTimer) { clearTimeout(this._playTimer); this._playTimer = null; }
+    if (this.anim.playing) { this.anim.playing = false; this._afterAnimChange(); }
+  }
+  togglePlay() { this.anim.playing ? this.stop() : this.play(); }
+
+  setOnion(n) { this.anim.onion = clamp(n | 0, 0, 5); this._afterAnimChange(); }
+  setFps(n) { this.anim.fps = clamp(n | 0, 1, 60); this._saveAnim(); this._updateAnimUI(); }
+  setTint(on) { this.anim.tint = !!on; this._afterAnimChange(); }
+  setLoop(on) { this.anim.loop = !!on; this._saveAnim(); this._updateAnimUI(); }
+
+  /** Persist + refresh UI + repaint after any flipbook state change. */
+  _afterAnimChange() {
+    this._reconcileFrames();
+    this._saveAnim();
+    this._updateAnimUI();
+    this._updateHud();
+    this.requestRender();
+  }
+
+  _saveAnim() {
+    const a = this.anim;
+    try {
+      localStorage.setItem('infinizoom.anim', JSON.stringify({
+        on: a.on, current: a.current, count: a.count,
+        onion: a.onion, fps: a.fps, tint: a.tint, loop: a.loop,
+      }));
+    } catch { /* ignore */ }
+  }
+  _restoreAnim() {
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem('infinizoom.anim') || 'null'); } catch { s = null; }
+    if (s && typeof s === 'object') {
+      this.anim.on = !!s.on;
+      this.anim.onion = clamp(s.onion == null ? 1 : s.onion, 0, 5);
+      this.anim.fps = clamp(s.fps == null ? 6 : s.fps, 1, 60);
+      this.anim.tint = s.tint !== false;
+      this.anim.loop = s.loop !== false;
+      this.anim.count = Math.max(1, s.count | 0);
+      this.anim.current = clamp(s.current | 0, 0, this.anim.count - 1);
+    }
+    this.anim.playing = false;
+    this._reconcileFrames();
+  }
+
+  /** Refresh the flipbook panel to match anim state. */
+  _updateAnimUI() {
+    const on = this.anim.on;
+    const tgl = document.getElementById('flipToggle');
+    if (tgl) tgl.classList.toggle('active', on);
+    const ctrls = document.getElementById('flip-controls');
+    if (ctrls) ctrls.classList.toggle('hidden', !on);
+    document.body.classList.toggle('flip-on', on); // lifts the toast clear of the panel
+    if (!on) return;
+    const n = this.frameItemCount();
+    const ind = document.getElementById('flipIndicator');
+    if (ind) ind.textContent = `${this.anim.current + 1} / ${this.anim.count} · ${n} item${n === 1 ? '' : 's'}`;
+    const scrub = document.getElementById('flipScrub');
+    if (scrub && document.activeElement !== scrub) { scrub.max = String(this.anim.count - 1); scrub.value = String(this.anim.current); }
+    const play = document.getElementById('flipPlay');
+    if (play) { play.textContent = this.anim.playing ? '⏸' : '▶'; play.classList.toggle('active', this.anim.playing); }
+    const fps = document.getElementById('flipFps'); if (fps && document.activeElement !== fps) fps.value = String(this.anim.fps);
+    const onion = document.getElementById('flipOnion'); if (onion && document.activeElement !== onion) onion.value = String(this.anim.onion);
+    const tint = document.getElementById('flipTint'); if (tint) tint.checked = this.anim.tint;
+    const loop = document.getElementById('flipLoop'); if (loop) loop.checked = this.anim.loop;
+  }
+
   // ---------------- generators ----------------
   /** Build a procedural scene. Returns the number of items created. */
   generate(name, opts = {}, { clear = false, fit = true } = {}) {
@@ -1603,6 +1912,7 @@ class App {
       this._genSeq = (this._genSeq || 0) + 1;
       return { ...s, id: `g_${this._genSeq.toString(36)}_${Math.random().toString(36).slice(2, 6)}` };
     });
+    this._assignFrame(items);
     if (clear && this.scene.count()) {
       const old = this.scene.items.slice();
       const scene = this.scene;
@@ -1638,6 +1948,9 @@ class App {
     this.renderer.warmImages(this.scene);
     this.history.clear();
     this.selectedIds.clear();
+    this.stop();
+    this._reconcileFrames();          // page count tracks the loaded drawing
+    this._updateAnimUI();
     this._updateHud();
     this.requestRender();
   }
@@ -1663,6 +1976,10 @@ class App {
       rotHandle: gk === 'rotate' ? null : this._rotHandleScreen(),
       // hide the corner handles mid-transform so they don't clutter the gesture
       scaleHandles: (gk === 'scale' || gk === 'rotate' || gk === 'marquee') ? null : this._scaleHandlesScreen(),
+      // flipbook: which page is live + onion-skin reach (no onion during playback)
+      frame: this.anim.on ? { current: this.anim.current,
+                              onion: this.anim.playing ? 0 : this.anim.onion,
+                              tint: this.anim.tint } : null,
     });
     this.minimap.render();
     this._stats.lastRenderMs = performance.now() - t0;
@@ -1687,6 +2004,7 @@ class App {
       sel ? `${sel}/${n} selected` : `${n} item${n === 1 ? '' : 's'}`;
     document.getElementById('hud-tool').textContent = this.tool;
     if (this._scheduleLayers) this._scheduleLayers(); // refresh Objects list (debounced)
+    if (this.anim.on) this._updateAnimUI();           // keep the page item-count live
   }
   _updateUndoRedo() {
     document.getElementById('undo').disabled = !this.history.canUndo();
@@ -1738,30 +2056,31 @@ class App {
       loadJSON: d => this.loadDoc(d),
       stats: () => ({ ...this._stats }),
       drawnCount: () => { this.render(); return this.renderer.lastDrawn || 0; },
-      // helpers that build geometry directly (world coords)
+      // helpers that build geometry directly (world coords). They land on the
+      // active flipbook page (when flipbook is on) just like interactive drawing.
       addStroke: (points, style) => {
         const it = makeStroke(points, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addRect: (x, y, w, h, style) => {
         const it = makeRect(x, y, w, h, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addEllipse: (x, y, w, h, style) => {
         const it = makeEllipse(x, y, w, h, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addText: (x, y, text, style) => {
         const it = makeText(x, y, text, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addArrow: (a, b, style) => {
         const it = makeArrow(a, b, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addPolygon: (x, y, w, h, style) => {
         const it = makePolygon(x, y, w, h, { ...this.drawStyle, ...style });
-        this.history.push(addItemsCmd(this.scene, [it])); return it.id;
+        this._assignFrame([it]); this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
       addImage: (x, y, w, h, src, opts) => this.addImageItem(x, y, w, h, src, opts || {}),
       // brush / tapered strokes — points may be [{x,y,p}] or [[x,y,p]] (p optional)
@@ -1772,6 +2091,7 @@ class App {
         const it = makeStroke(pts, { ...this.drawStyle, ...style });
         it.taper = true;
         if (style.smooth !== false) it.smooth = true; // brush strokes smooth by default
+        this._assignFrame([it]);
         this.history.push(addItemsCmd(this.scene, [it]));
         return it.id;
       },
@@ -1814,6 +2134,28 @@ class App {
       // connectors
       addConnector: (from, to, style) => this.addConnector(from, to, style || {}),
       resolveConnectors: () => this.resolveConnectors(),
+      // flipbook / stop-motion animation
+      flipbook: () => ({ ...this.anim }),
+      setFlipbook: on => this.setFlipbook(on),
+      toggleFlipbook: () => this.toggleFlipbook(),
+      currentFrame: () => this.anim.current,
+      frameCount: () => this.anim.count,
+      setFrame: i => this.setFrame(i),
+      nextFrame: () => this.nextFrame(),
+      prevFrame: () => this.prevFrame(),
+      addFrame: () => this.addFrame(),
+      duplicateFrame: () => this.duplicateFrame(),
+      deleteFrame: () => this.deleteFrame(),
+      moveSelectionToFrame: f => this.moveSelectionToFrame(f),
+      frameItemCount: f => this.frameItemCount(f),
+      frameOf: id => this.frameOf(this.scene.byId(id)),
+      play: () => this.play(),
+      stop: () => this.stop(),
+      isPlaying: () => this.anim.playing,
+      setOnion: n => this.setOnion(n),
+      setFps: n => this.setFps(n),
+      setTint: on => this.setTint(on),
+      setLoop: on => this.setLoop(on),
       // recursive stamp
       stamp: opts => this.recursiveStamp(opts),
       // bookmarks + fly-to

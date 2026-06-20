@@ -15,35 +15,44 @@ export const ROTATABLE = new Set(['rect', 'ellipse', 'polygon', 'image', 'text']
  *   connector: { from, to, ax, ay, bx, by, color, width, arrow }
  *             // from/to are item ids; ax..by are the resolved endpoint world
  *             // coords (a cache kept fresh by App.resolveConnectors each render)
+ *
+ * Optional cross-cutting fields (attached only when non-default, to keep JSON
+ * tidy): `opacity`, `rot`, `group`, `locked`, `hidden`, `minScale`/`maxScale`
+ * (LOD), `widthMode:'screen'` (constant on-screen stroke width — see Renderer),
+ * and `frame` (0-based flipbook page index; absent = page 0 — see App.anim).
  */
 
 // Only attach `opacity` when it's actually translucent, to keep JSON tidy.
 const op = s => (s && s.opacity != null && s.opacity < 1 ? { opacity: s.opacity } : {});
+// Only attach `widthMode` when it's the non-default 'screen' (constant on-screen
+// width). Absent / 'world' = the default where width is world units and scales
+// with zoom. Keeps JSON tidy and all width-mode-unaware items backward compatible.
+const wm = s => (s && s.widthMode === 'screen' ? { widthMode: 'screen' } : {});
 
 export function makeStroke(points, style) {
-  return { id: uid('s'), type: 'stroke', points, color: style.color, width: style.width, ...op(style) };
+  return { id: uid('s'), type: 'stroke', points, color: style.color, width: style.width, ...wm(style), ...op(style) };
 }
 export function makeLine(a, b, style) {
-  return { id: uid('l'), type: 'line', points: [a, b], color: style.color, width: style.width, ...op(style) };
+  return { id: uid('l'), type: 'line', points: [a, b], color: style.color, width: style.width, ...wm(style), ...op(style) };
 }
 export function makeRect(x, y, w, h, style) {
   return { id: uid('r'), type: 'rect', x, y, w, h, color: style.color, width: style.width,
-           fill: style.fill || null, ...op(style) };
+           fill: style.fill || null, ...wm(style), ...op(style) };
 }
 export function makeEllipse(x, y, w, h, style) {
   return { id: uid('e'), type: 'ellipse', x, y, w, h, color: style.color, width: style.width,
-           fill: style.fill || null, ...op(style) };
+           fill: style.fill || null, ...wm(style), ...op(style) };
 }
 export function makeText(x, y, text, style) {
   return { id: uid('t'), type: 'text', x, y, text, color: style.color, size: style.size, ...op(style) };
 }
 export function makeArrow(a, b, style) {
-  return { id: uid('a'), type: 'arrow', points: [a, b], color: style.color, width: style.width, ...op(style) };
+  return { id: uid('a'), type: 'arrow', points: [a, b], color: style.color, width: style.width, ...wm(style), ...op(style) };
 }
 export function makePolygon(x, y, w, h, style) {
   return { id: uid('p'), type: 'polygon', x, y, w, h,
            sides: style.sides || 5, star: !!style.star,
-           color: style.color, width: style.width, fill: style.fill || null, ...op(style) };
+           color: style.color, width: style.width, fill: style.fill || null, ...wm(style), ...op(style) };
 }
 export function makeImage(x, y, w, h, src, style = {}) {
   return { id: uid('img'), type: 'image', x, y, w, h, src, ...op(style) };
@@ -51,7 +60,7 @@ export function makeImage(x, y, w, h, src, style = {}) {
 export function makeConnector(fromId, toId, style = {}) {
   return { id: uid('c'), type: 'connector', from: fromId, to: toId,
            ax: 0, ay: 0, bx: 0, by: 0,
-           color: style.color, width: style.width, arrow: style.arrow !== false, ...op(style) };
+           color: style.color, width: style.width, arrow: style.arrow !== false, ...wm(style), ...op(style) };
 }
 
 /** Point where the segment from box centre (cx,cy) toward (tx,ty) exits `box`. */

@@ -213,6 +213,34 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .layer-row .lr-tog:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
 .layer-more { font-size: 11px; color: var(--muted); text-align: center; padding: 5px; }
 
+/* ---------- flipbook / stop-motion ---------- */
+#anim-panel {
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 260px);
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+#anim-panel #flipToggle { font-size: 13px; white-space: nowrap; }
+.flip-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.flip-controls.hidden { display: none; }
+.flip-controls button { font-size: 14px; padding: 6px 9px; min-width: 32px; }
+.flip-indicator {
+  font-size: 12px; color: var(--ink); font-variant-numeric: tabular-nums;
+  min-width: 110px; text-align: center; white-space: nowrap;
+}
+.flip-scrub { width: 120px; accent-color: var(--accent); }
+.flip-mini { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.flip-mini input[type="number"] {
+  width: 44px; font: inherit; font-size: 12px; color: var(--ink);
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--panel-border);
+  border-radius: 6px; padding: 3px 4px;
+}
+.flip-mini input[type="range"] { width: 58px; accent-color: var(--accent); }
+.flip-mini input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent); }
+
 /* ---------- minimap ---------- */
 #minimap {
   position: fixed;
@@ -247,6 +275,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   transition: opacity .2s, transform .2s;
 }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* when the flipbook panel is open (bottom-center), lift the toast above it */
+body.flip-on #toast { bottom: 150px; }
 
 /* ---------- text editor overlay ---------- */
 #text-editor {

@@ -50,13 +50,15 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - persistence  — reload survival, camera persist, JSON round-trip, corrupt LS
 - keyboard     — all tool keys, undo/redo, select-all, delete, dup, zoom, fit
 
-## Status: WORKING. All 195 tests green (24 spec files), full suite stable (~2min).
+## Status: WORKING. All 213 tests green (26 spec files), full suite stable (~2.3min).
 ## README.md written. ~3300 LOC across src/.
 ## Next-you: pick a feature from the TODO below, implement + test, keep the suite green.
 ## (batch 4, fresh instance 2026-06-19: image items + rotation + group/ungroup + connectors, +40 tests.)
 ## (batch 5, fresh instance 2026-06-19: lock/hide + Objects panel, pressure/tapered brush, +21 tests.)
 ## (batch 6, fresh instance 2026-06-19: corner scale/resize handles + Catmull-Rom brush
 ##  smoothing + arrow-key nudge, +24 tests.)
+## (batch 7, fresh instance 2026-06-20: zoom-dependent line width (widthMode) +
+##  stop-motion flipbook animation mode, +18 tests.)
 
 ## Added since v1 (all tested)
 - **5 procedural generators** (src/generators.js): tree, spiral, droste,
@@ -234,6 +236,59 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
     live selection; skips `locked` items; no-op (no history entry) with no
     selection. Test API: `nudgeSelection(dx,dy)`.
 
+## Added in this session (batch 7 — fresh instance 2026-06-20)
+- **zoom-dependent line width** (`widthMode`) — tests/widthmode.spec.js (5 tests)
+  - Strokes/shapes carry an optional `widthMode`. Absent / `'world'` (default) =
+    width is WORLD units, so on-screen thickness scales with zoom (the original
+    behaviour, with the 0.75px hairline floor). `'screen'` = width is SCREEN px,
+    so the line keeps a CONSTANT on-screen thickness at any zoom — the renderer
+    uses `screenToWorldLen(width)` for the world-space lineWidth.
+  - One chokepoint: `renderer._drawItem` computes `lw` once from `widthMode`; the
+    field attaches only when `'screen'` (scene.js `wm()` helper, like `op()`), so
+    every width-mode-unaware item and all 195 prior tests stayed byte-identical.
+  - UI: a `#widthMode` select in the style panel ("Scale (world)" / "Fixed
+    (screen px)"). Mirrors via setStyle, applies to the selection like color/width,
+    threads through `drawStyle` → test API addStroke/addRect/etc. GOTCHA fixed:
+    `_commitStroke`/`_commitBrush` rebuild the item from simplified points and
+    used to drop draft fields — now they carry `widthMode` (and the brush keeps it).
+  - SVG export needs no change: a 'screen' item at scale 1 = `width` px, which is
+    exactly what `stroke-width="it.width"` already emits.
+- **stop-motion flipbook** ("sticky-note flipbook — draw each page") —
+  tests/flipbook.spec.js (13 tests)
+  - Each item gets an optional integer `frame` (0-based page; absent = page 0).
+    App `this.anim = {on,current,count,onion,fps,tint,loop,playing}`, **OFF by
+    default** so the app stays a normal infinite canvas until you enable it.
+  - When ON: only the current page is drawn full-strength + editable/pickable;
+    neighbouring pages within `onion` reach draw as dimmed onion-skin GHOSTS —
+    tinted warm (#ff6b6b) for past pages, cool (#5b8cff) for next pages (the
+    traditional-animation convention; `renderer._frameStyle`). New drawing is
+    tagged to the current page via `_assignFrame()` (wired into every create path:
+    pen/brush/shape/text/image/connector/paste/duplicate/generate/stamp + the
+    test-API adders).
+  - Interaction is frame-gated: `_frameInteractive()` folds into `_lodFilter`/
+    `_selFilter`, marquee, and `selectAll`, so off-page ghosts are look-only.
+    Renderer gets `state.frame={current,onion,tint}` (onion forced 0 during
+    playback for a clean preview).
+  - Frame ops are undoable history commands that restore BOTH the scene AND
+    `anim.count`/`current` (closures capture old/new): `addFrame` (insert blank
+    after current, shift later pages up), `duplicateFrame` (clone current page →
+    next page; THE stop-motion move: copy then tweak), `deleteFrame` (remove page,
+    pull later pages down; last page is emptied not removed), `moveSelectionToFrame`
+    (cross-frame edit). Navigation (`setFrame`/`next`/`prev`) is non-undo, like
+    camera moves.
+  - Playback: `play()` steps `current` 0..count-1 via a self-rescheduling
+    `setTimeout` at `fps`, looping if `loop`; `_onDown` stops playback on any
+    canvas interaction. Persisted in a separate `localStorage['infinizoom.anim']`
+    key (scene `frame` fields persist with the doc), reconciled on load so blank
+    trailing pages survive.
+  - UI: bottom-center `#anim-panel` — toggle, ◀ / indicator "n / N · k items" / ▶,
+    a **scrub slider**, ＋ add / ⧉ duplicate / 🗑 delete page, ▶/⏸ play, fps,
+    onion (0-3), tint + loop checkboxes. Keys: ←/→ flip pages when flipbook is on
+    and nothing is selected (selection-present → arrows still nudge).
+  - Test API: flipbook/setFlipbook/toggleFlipbook, currentFrame/frameCount,
+    setFrame/next/prev, addFrame/duplicateFrame/deleteFrame, moveSelectionToFrame,
+    frameItemCount, frameOf, play/stop/isPlaying, setOnion/setFps/setTint/setLoop.
+
 ## Gotchas fixed
 - Text editor: a spurious `blur` fired right as the editor opened, committing the
   empty box closed before it was usable (flaky text test). Fixed in app.js with a
@@ -258,6 +313,17 @@ selectedCount, render, dataURL, stats. `window.app` is the full instance.
 - [x] brush smoothing (Catmull-Rom) — DONE (batch 6: render-time spline resample,
       `smooth` flag + #brushSmooth toggle). Still TODO: miter/bevel on sharp corners
       (smoothing helps, but the ribbon still uses averaged normals).
+- [x] zoom-dependent line width — DONE (batch 7: `widthMode` 'world'|'screen',
+      #widthMode select). Still TODO: a clamped-hybrid mode (scale with zoom but
+      pin to a [minPx,maxPx] screen range) for extreme deep zoom.
+- [x] stop-motion flipbook animation — DONE (batch 7: per-item `frame`, onion
+      skins, play/scrub, add/dup/delete page, all undoable). Ideas for next-you:
+      • export the animation (animated GIF / APNG / sprite-sheet PNG / frames-to-SVG);
+      • per-page thumbnails strip instead of just a scrub slider;
+      • "ghost ALL frames at 10%" overlay (motion-path view) — onion already tints,
+        this would be a separate toggle showing every page faintly at once;
+      • ease/hold timing per frame (currently a flat fps);
+      • minimap currently shows ALL frames overlaid — could filter to current page.
 
 ## Companion
 gemma at http://127.0.0.1:8051 — chat for a second opinion if stuck (give it
