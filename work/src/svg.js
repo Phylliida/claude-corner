@@ -1,4 +1,4 @@
-import { polygonVertices } from './scene.js';
+import { polygonVertices, rotCenter, ROTATABLE } from './scene.js';
 
 // Serialize the whole document to a standalone SVG string. World coordinates
 // map 1:1 to SVG user units (both are y-down), so the export is resolution
@@ -38,6 +38,13 @@ function itemToSVG(it) {
       return `<polyline points="${ptsAttr([a, h.shaftEnd])}" ${stroke}/>` +
              `<polygon points="${ptsAttr(h.tri)}" fill="${escAttr(it.color)}"/>`;
     }
+    case 'connector': {
+      const a = { x: it.ax, y: it.ay }, b = { x: it.bx, y: it.by };
+      if (it.arrow === false) return `<polyline points="${ptsAttr([a, b])}" ${stroke}/>`;
+      const h = arrowHead(a, b, it.width || 1);
+      return `<polyline points="${ptsAttr([a, h.shaftEnd])}" ${stroke}/>` +
+             `<polygon points="${ptsAttr(h.tri)}" fill="${escAttr(it.color)}"/>`;
+    }
     case 'rect': {
       const x = Math.min(it.x, it.x + it.w), y = Math.min(it.y, it.y + it.h);
       const fill = it.fill ? escAttr(it.fill) : 'none';
@@ -51,6 +58,11 @@ function itemToSVG(it) {
     case 'polygon': {
       const fill = it.fill ? escAttr(it.fill) : 'none';
       return `<polygon points="${ptsAttr(polygonVertices(it))}" fill="${fill}" stroke="${escAttr(it.color)}" stroke-width="${round(it.width || 1)}"/>`;
+    }
+    case 'image': {
+      const x = Math.min(it.x, it.x + it.w), y = Math.min(it.y, it.y + it.h);
+      const op = (it.opacity != null && it.opacity < 1) ? ` opacity="${round(it.opacity)}"` : '';
+      return `<image href="${escAttr(it.src)}" x="${round(x)}" y="${round(y)}" width="${round(Math.abs(it.w))}" height="${round(Math.abs(it.h))}" preserveAspectRatio="none"${op}/>`;
     }
     case 'text': {
       const lines = String(it.text).split('\n');
@@ -71,7 +83,15 @@ export function sceneToSVG(scene, { pad = 0.06, background = '#0e0f13' } = {}) {
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${round(X)} ${round(Y)} ${round(W)} ${round(H)}" width="${round(W)}" height="${round(H)}">`,
   ];
   if (background) out.push(`<rect x="${round(X)}" y="${round(Y)}" width="${round(W)}" height="${round(H)}" fill="${escAttr(background)}"/>`);
-  for (const it of scene.items) { const s = itemToSVG(it); if (s) out.push(s); }
+  for (const it of scene.items) {
+    let s = itemToSVG(it);
+    if (!s) continue;
+    if (it.rot && ROTATABLE.has(it.type)) {
+      const c = rotCenter(it);
+      s = `<g transform="rotate(${round(it.rot * 180 / Math.PI)} ${round(c.x)} ${round(c.y)})">${s}</g>`;
+    }
+    out.push(s);
+  }
   out.push('</svg>');
   return out.join('\n');
 }

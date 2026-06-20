@@ -1,6 +1,7 @@
 import { Camera } from './camera.js';
 import { Scene, makeStroke, makeLine, makeRect, makeEllipse, makeText, makeArrow, makePolygon,
-         translateItem, scaleItemAbout, itemBBox, lodVisible } from './scene.js';
+         makeImage, makeConnector, boxEdgePoint, translateItem, scaleItemAbout, rotateItemsAbout,
+         itemBBox, lodVisible } from './scene.js';
 import { Renderer } from './renderer.js';
 import { Minimap } from './minimap.js';
 import { History, addItemsCmd, removeItemsCmd, moveItemsCmd, reorderCmd } from './history.js';
@@ -60,10 +61,13 @@ class App {
 
     this.scene.onChange = () => { this.requestRender(); this.autosave(); this._updateHud(); };
     this.history.onChange = () => { this._updateUndoRedo(); };
+    // repaint when a deferred image bitmap finishes decoding
+    this.renderer.onAsyncLoad = () => this.requestRender();
 
     this._bindUI();
     this._bindInput();
     this._bindKeys();
+    this._bindImageDrop();
     this._buildSwatches();
 
     this._restore();
@@ -262,6 +266,9 @@ class App {
       case 'select':
         this._beginSelect(s, w, e);
         break;
+      case 'connector':
+        this._beginConnector(s, w);
+        break;
     }
     this.requestRender();
   }
@@ -311,6 +318,26 @@ class App {
         this.scene._touch();
         break;
       }
+      case 'connect': {
+        const wr = this.toWorld(s.x, s.y);
+        if (this.draft) { this.draft.bx = wr.x; this.draft.by = wr.y; }
+        break;
+      }
+      case 'rotate': {
+        const pivot = this.active.pivot;
+        const wr = this.toWorld(s.x, s.y); // raw (unsnapped) world point for the angle
+        const cur = Math.atan2(wr.y - pivot.y, wr.x - pivot.x);
+        let target = cur - this.active.startAngle;
+        if (e && e.shiftKey) { const step = Math.PI / 12; target = Math.round(target / step) * step; }
+        const d = target - this.active.applied;
+        if (d) {
+          const items = this.active.ids.map(id => this.scene.byId(id)).filter(Boolean);
+          rotateItemsAbout(items, pivot.x, pivot.y, d);
+          this.active.applied = target;
+          this.scene._touch();
+        }
+        break;
+      }
       case 'marquee':
         this.marquee = { ...this.marquee, x1: s.x, y1: s.y };
         break;
@@ -346,6 +373,18 @@ class App {
           });
         }
         break;
+      case 'rotate':
+        if (Math.abs(a.applied) > 1e-9) {
+          const ids = a.ids, pivot = a.pivot, ang = a.applied, scene = this.scene;
+          const grab = () => ids.map(id => scene.byId(id)).filter(Boolean);
+          this.history.pushApplied({
+            label: `rotate ${ids.length}`,
+            do() { rotateItemsAbout(grab(), pivot.x, pivot.y, ang); scene._touch(); },
+            undo() { rotateItemsAbout(grab(), pivot.x, pivot.y, -ang); scene._touch(); },
+          });
+        }
+        break;
+      case 'connect': this._endConnector(this.evtScreen(e), a); break;
       case 'marquee': this._commitMarquee(); break;
     }
     this.requestRender();
@@ -412,11 +451,28 @@ class App {
     if (hit && this.active && !this.active.removed.includes(hit)) {
       this.active.removed.push(hit);
       this.scene.remove(hit.id);
+      // erasing an endpoint item takes its connectors with it
+      if (hit.type !== 'connector') {
+        for (const c of this._connectorsReferencing([hit.id])) {
+          if (!this.active.removed.includes(c)) { this.active.removed.push(c); this.scene.remove(c.id); }
+        }
+      }
     }
   }
 
   // ---- selection ----
   _beginSelect(s, w, e) {
+    // Grabbing the rotation handle starts a rotate gesture (highest priority).
+    const handle = this._rotHandleScreen();
+    if (handle && dist(s.x, s.y, handle.x, handle.y) <= handle.r + 6) {
+      const pivot = this._selectionWorldCenter();
+      if (pivot) {
+        this.active = { kind: 'rotate', pivot, applied: 0,
+                        startAngle: Math.atan2(w.y - pivot.y, w.x - pivot.x),
+                        ids: [...this.selectedIds] };
+        return;
+      }
+    }
     const tol = this.camera.screenToWorldLen(6);
     // If clicking inside the bbox of an already-selected item, drag the whole
     // selection — even over an unfilled interior. This matches vector editors.
@@ -431,11 +487,12 @@ class App {
     }
     const hit = this.scene.pick(w.x, w.y, tol, this._lodFilter());
     if (hit) {
+      const members = this._groupMembers(hit); // grouped items select as a unit
       if (e.shiftKey) {
-        if (this.selectedIds.has(hit.id)) this.selectedIds.delete(hit.id);
-        else this.selectedIds.add(hit.id);
+        const allIn = members.every(id => this.selectedIds.has(id));
+        for (const id of members) allIn ? this.selectedIds.delete(id) : this.selectedIds.add(id);
       } else if (!this.selectedIds.has(hit.id)) {
-        this.selectedIds = new Set([hit.id]);
+        this.selectedIds = new Set(members);
       }
       if (this.selectedIds.size) {
         this.active = { kind: 'move', lastWorld: w, totalDx: 0, totalDy: 0 };
@@ -455,6 +512,7 @@ class App {
     if (Math.abs(this.marquee.x1 - this.marquee.x0) > 3 || Math.abs(this.marquee.y1 - this.marquee.y0) > 3) {
       const hits = this.scene.itemsContainedIn(rect);
       for (const it of hits) this.selectedIds.add(it.id);
+      this._expandSelectionGroups(); // pull in the rest of any touched group
     }
     this.marquee = null;
     this._updateHud();
@@ -462,7 +520,10 @@ class App {
   deleteSelection() {
     if (!this.selectedIds.size) return;
     const items = [...this.selectedIds].map(id => this.scene.byId(id)).filter(Boolean);
-    this.history.push(removeItemsCmd(this.scene, items));
+    const ids = new Set(items.map(i => i.id));
+    // also drop connectors that would be left dangling, in the same undo step
+    const orphans = this._connectorsReferencing(ids).filter(c => !ids.has(c.id));
+    this.history.push(removeItemsCmd(this.scene, [...items, ...orphans]));
     this.selectedIds.clear();
     this._updateHud();
   }
@@ -471,6 +532,192 @@ class App {
     if (this.tool !== 'select') this.setTool('select');
     this._updateHud();
     this.requestRender();
+  }
+
+  // ---- rotation ----
+  _selectionItems() { return [...this.selectedIds].map(id => this.scene.byId(id)).filter(Boolean); }
+
+  /** World-space centre of the current selection's combined bbox (rotation pivot). */
+  _selectionWorldCenter() {
+    const items = this._selectionItems();
+    if (!items.length) return null;
+    let b = { ...itemBBox(items[0]) };
+    for (const it of items) {
+      const ib = itemBBox(it);
+      b.minX = Math.min(b.minX, ib.minX); b.minY = Math.min(b.minY, ib.minY);
+      b.maxX = Math.max(b.maxX, ib.maxX); b.maxY = Math.max(b.maxY, ib.maxY);
+    }
+    return { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
+  }
+
+  /** Screen-space AABB enclosing the visible selection, or null. */
+  _selectionAABBScreen() {
+    if (!this.selectedIds.size) return null;
+    let any = false, R = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    for (const id of this.selectedIds) {
+      const it = this.scene.byId(id);
+      if (!it || !lodVisible(it, this.camera.scale)) continue;
+      any = true;
+      const b = itemBBox(it);
+      const tl = this.camera.worldToScreen(b.minX, b.minY);
+      const br = this.camera.worldToScreen(b.maxX, b.maxY);
+      R.minX = Math.min(R.minX, tl.x); R.minY = Math.min(R.minY, tl.y);
+      R.maxX = Math.max(R.maxX, br.x); R.maxY = Math.max(R.maxY, br.y);
+    }
+    return any ? R : null;
+  }
+
+  /** Screen position of the rotation grab handle above the selection, or null. */
+  _rotHandleScreen() {
+    if (this.tool !== 'select' || !this.selectedIds.size) return null;
+    const R = this._selectionAABBScreen();
+    if (!R) return null;
+    return { x: (R.minX + R.maxX) / 2, y: R.minY - 22, r: 6 };
+  }
+
+  /** Rotate the selection by `ang` radians about a pivot (default: selection centre). */
+  rotateSelection(ang, pivot = null) {
+    if (!this.selectedIds.size || !ang) return;
+    const p = pivot || this._selectionWorldCenter();
+    if (!p) return;
+    const ids = [...this.selectedIds];
+    const scene = this.scene;
+    const grab = () => ids.map(id => scene.byId(id)).filter(Boolean);
+    this.history.push({
+      label: `rotate ${ids.length}`,
+      do() { rotateItemsAbout(grab(), p.x, p.y, ang); scene._touch(); },
+      undo() { rotateItemsAbout(grab(), p.x, p.y, -ang); scene._touch(); },
+    });
+    this.requestRender();
+  }
+
+  // ---- grouping ----
+  /** All item ids sharing a group with `it` (or just [it.id] if it is ungrouped). */
+  _groupMembers(it) {
+    if (!it) return [];
+    if (!it.group) return [it.id];
+    return this.scene.items.filter(o => o.group === it.group).map(o => o.id);
+  }
+  /** Grow the current selection so any touched group is selected whole. */
+  _expandSelectionGroups() {
+    const groups = new Set();
+    for (const id of this.selectedIds) { const it = this.scene.byId(id); if (it && it.group) groups.add(it.group); }
+    if (!groups.size) return;
+    for (const it of this.scene.items) if (it.group && groups.has(it.group)) this.selectedIds.add(it.id);
+  }
+
+  /** Tag all selected items with one fresh group id (reversible). Needs ≥2 items. */
+  groupSelection() {
+    const ids = [...this.selectedIds];
+    if (ids.length < 2) { this._toast('Select 2+ items to group'); return null; }
+    const gid = 'grp_' + Math.random().toString(36).slice(2, 9);
+    const scene = this.scene;
+    const before = ids.map(id => ({ id, group: scene.byId(id)?.group ?? null }));
+    this.history.push({
+      label: `group ${ids.length}`,
+      do() { for (const id of ids) { const it = scene.byId(id); if (it) it.group = gid; } scene._touch(); },
+      undo() { for (const { id, group } of before) { const it = scene.byId(id); if (it) { if (group == null) delete it.group; else it.group = group; } } scene._touch(); },
+    });
+    this._toast(`Grouped ${ids.length} items`);
+    this.requestRender();
+    return gid;
+  }
+
+  /** Remove the group tag from every member of any group in the selection. */
+  ungroupSelection() {
+    const groups = new Set();
+    for (const id of this.selectedIds) { const it = this.scene.byId(id); if (it && it.group) groups.add(it.group); }
+    if (!groups.size) return 0;
+    const before = this.scene.items.filter(it => it.group && groups.has(it.group)).map(it => ({ id: it.id, group: it.group }));
+    const scene = this.scene;
+    this.history.push({
+      label: 'ungroup',
+      do() { for (const { id } of before) { const it = scene.byId(id); if (it) delete it.group; } scene._touch(); },
+      undo() { for (const { id, group } of before) { const it = scene.byId(id); if (it) it.group = group; } scene._touch(); },
+    });
+    this._toast(`Ungrouped ${before.length} items`);
+    this.requestRender();
+    return before.length;
+  }
+
+  /** Re-map group ids on a freshly-cloned item set so clones stay grouped among
+   *  themselves but distinct from the originals. Mutates items in place. */
+  _remapGroups(items) {
+    const map = new Map();
+    for (const c of items) {
+      if (!c.group) continue;
+      if (!map.has(c.group)) map.set(c.group, 'grp_' + Math.random().toString(36).slice(2, 9));
+      c.group = map.get(c.group);
+    }
+  }
+
+  // ---- connectors ----
+  /** After cloning a subgraph, re-point cloned connectors at the cloned items
+   *  (when both ends were copied), so the copy stays internally wired. */
+  _relinkConnectors(items, idMap) {
+    for (const it of items) {
+      if (it.type !== 'connector') continue;
+      if (idMap.has(it.from)) it.from = idMap.get(it.from);
+      if (idMap.has(it.to)) it.to = idMap.get(it.to);
+    }
+  }
+
+  _itemCenter(it) { const b = itemBBox(it); return { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 }; }
+
+  /** Recompute one connector's endpoint cache (ax..by) from the items it links,
+   *  clipping each end to the linked item's bbox edge. Leaves danglers untouched. */
+  _resolveConnector(it) {
+    const A = this.scene.byId(it.from), B = this.scene.byId(it.to);
+    if (!A || !B) return false;
+    const ba = itemBBox(A), bb = itemBBox(B);
+    const ca = { x: (ba.minX + ba.maxX) / 2, y: (ba.minY + ba.maxY) / 2 };
+    const cb = { x: (bb.minX + bb.maxX) / 2, y: (bb.minY + bb.maxY) / 2 };
+    const a = boxEdgePoint(ca.x, ca.y, cb.x, cb.y, ba);
+    const b = boxEdgePoint(cb.x, cb.y, ca.x, ca.y, bb);
+    it.ax = a.x; it.ay = a.y; it.bx = b.x; it.by = b.y;
+    return true;
+  }
+  /** Refresh every connector's endpoint cache so they track their items. Cheap;
+   *  run before any render or bounds query. Does not mutate the document model. */
+  resolveConnectors() {
+    for (const it of this.scene.items) if (it.type === 'connector') this._resolveConnector(it);
+  }
+
+  /** Connectors whose `from`/`to` falls in the given id set. */
+  _connectorsReferencing(ids) {
+    const set = ids instanceof Set ? ids : new Set(ids);
+    return this.scene.items.filter(it => it.type === 'connector' && (set.has(it.from) || set.has(it.to)));
+  }
+
+  /** Create a connector linking two existing items. Returns its id (or null). */
+  addConnector(fromId, toId, style = {}) {
+    if (fromId === toId || !this.scene.byId(fromId) || !this.scene.byId(toId)) return null;
+    const it = makeConnector(fromId, toId,
+      { color: this.style.color, width: this.style.width, arrow: true, ...style });
+    this._resolveConnector(it);
+    this.history.push(addItemsCmd(this.scene, [it]));
+    this._toast('Connected');
+    return it.id;
+  }
+
+  _beginConnector(s, w) {
+    const from = this.scene.pick(w.x, w.y, this.camera.screenToWorldLen(6), this._lodFilter());
+    if (!from || from.type === 'connector') { this.active = null; return; }
+    const c = this._itemCenter(from);
+    const wr = this.toWorld(s.x, s.y);
+    this.draft = { type: 'connector', from: from.id, to: from.id,
+                   ax: c.x, ay: c.y, bx: wr.x, by: wr.y,
+                   color: this.style.color, width: this.style.width, arrow: true };
+    this.active = { kind: 'connect', from: from.id };
+  }
+  _endConnector(s, a) {
+    this.draft = null;
+    if (!a) return;
+    const w = this.toWorld(s.x, s.y);
+    const target = this.scene.pick(w.x, w.y, this.camera.screenToWorldLen(6), this._lodFilter());
+    if (target && target.id !== a.from && target.type !== 'connector') {
+      this.addConnector(a.from, target.id);
+    }
   }
 
   // ---- pinch ----
@@ -531,6 +778,7 @@ class App {
   zoomAtCenter(factor) { this.camera.zoomBy(factor); this._updateHud(); this.requestRender(); }
   resetView() { this.camera.x = 0; this.camera.y = 0; this.camera.scale = 1; this._updateHud(); this.requestRender(); }
   fitAll() {
+    this.resolveConnectors(); // ensure connector bounds are current before fitting
     const b = this.scene.bounds();
     if (!b) { this.resetView(); return; }
     this.camera.fitToRect(b, 0.16);
@@ -560,7 +808,7 @@ class App {
 
     document.getElementById('clearBtn').onclick = () => this.clearAll();
     document.getElementById('exportPng').onclick = () => { this.render(); storage.downloadPNG(this.canvas); this._toast('Exported PNG'); };
-    document.getElementById('exportSvg').onclick = () => { storage.downloadSVG(sceneToSVG(this.scene)); this._toast('Exported SVG'); };
+    document.getElementById('exportSvg').onclick = () => { this.resolveConnectors(); storage.downloadSVG(sceneToSVG(this.scene)); this._toast('Exported SVG'); };
     document.getElementById('exportJson').onclick = () => { storage.downloadJSON(this.scene); this._toast('Exported JSON'); };
     document.getElementById('importJson').onclick = () => document.getElementById('importFile').click();
     document.getElementById('importFile').onchange = async e => {
@@ -568,6 +816,13 @@ class App {
       if (!f) return;
       try { const data = await storage.readFileAsJSON(f); this.loadDoc(data); this._toast('Imported drawing'); }
       catch { this._toast('Import failed — invalid JSON'); }
+      e.target.value = '';
+    };
+
+    document.getElementById('addImageBtn').onclick = () => document.getElementById('imageFile').click();
+    document.getElementById('imageFile').onchange = e => {
+      const f = e.target.files[0];
+      if (f) this.loadImageFile(f, { x: this.camera.width / 2, y: this.camera.height / 2 });
       e.target.value = '';
     };
 
@@ -587,6 +842,10 @@ class App {
     document.getElementById('toFront').onclick = () => this.bringToFront();
     document.getElementById('raise').onclick = () => this.raiseSelection();
     document.getElementById('lower').onclick = () => this.lowerSelection();
+    document.getElementById('rotL').onclick = () => this.rotateSelection(-Math.PI / 12);
+    document.getElementById('rotR').onclick = () => this.rotateSelection(Math.PI / 12);
+    document.getElementById('groupBtn').onclick = () => this.groupSelection();
+    document.getElementById('ungroupBtn').onclick = () => this.ungroupSelection();
     document.getElementById('lodFar').onclick = () => this.setSelectionLOD('far');
     document.getElementById('lodAll').onclick = () => this.setSelectionLOD('all');
     document.getElementById('lodNear').onclick = () => this.setSelectionLOD('near');
@@ -663,6 +922,7 @@ class App {
       if (meta && e.key.toLowerCase() === 'c') { e.preventDefault(); this.copySelection(); return; }
       if (meta && e.key.toLowerCase() === 'x') { e.preventDefault(); this.cutSelection(); return; }
       if (meta && e.key.toLowerCase() === 'v') { e.preventDefault(); this.paste(); return; }
+      if (meta && e.key.toLowerCase() === 'g') { e.preventDefault(); e.shiftKey ? this.ungroupSelection() : this.groupSelection(); return; }
 
       if (e.key === 'Delete' || e.key === 'Backspace') { if (this.selectedIds.size) { e.preventDefault(); this.deleteSelection(); } return; }
       if (e.key === 'Escape') { this.selectedIds.clear(); this.draft = null; this.active = null; this.requestRender(); return; }
@@ -680,6 +940,7 @@ class App {
         case 's': this.setTool('star'); break;
         case 't': this.setTool('text'); break;
         case 'v': this.setTool('select'); break;
+        case 'c': this.setTool('connector'); break;
         case 'e': this.setTool('eraser'); break;
         case 'h': this.setTool('pan'); break;
         case 'f': this.fitAll(); break;
@@ -687,6 +948,8 @@ class App {
         case '+': case '=': this.zoomAtCenter(1.25); break;
         case '-': case '_': this.zoomAtCenter(1 / 1.25); break;
         case 'g': { const t = document.getElementById('gridToggle'); t.checked = !t.checked; t.onchange({ target: t }); break; }
+        case ',': if (this.selectedIds.size) { e.preventDefault(); this.rotateSelection(-Math.PI / 12); } break;
+        case '.': if (this.selectedIds.size) { e.preventDefault(); this.rotateSelection(Math.PI / 12); } break;
       }
     });
     window.addEventListener('keyup', e => {
@@ -700,7 +963,7 @@ class App {
     this.clipboard = [...this.selectedIds]
       .map(id => this.scene.byId(id))
       .filter(Boolean)
-      .map(it => { const c = JSON.parse(JSON.stringify(it)); delete c.id; return c; });
+      .map(it => { const c = JSON.parse(JSON.stringify(it)); c._src = c.id; delete c.id; return c; });
     this._toast(`Copied ${this.clipboard.length}`);
     return this.clipboard.length;
   }
@@ -711,11 +974,16 @@ class App {
   }
   paste() {
     if (!this.clipboard || !this.clipboard.length) return 0;
+    const idMap = new Map();
     const clones = this.clipboard.map(c => {
       const n = JSON.parse(JSON.stringify(c));
+      const src = n._src; delete n._src;
       n.id = `pst_${(this._pasteSeq = (this._pasteSeq || 0) + 1).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      if (src) idMap.set(src, n.id);
       return n;
     });
+    this._relinkConnectors(clones, idMap);
+    this._remapGroups(clones);
     let b = itemBBox(clones[0]); b = { ...b };
     for (const c of clones) { const ib = itemBBox(c); b.minX = Math.min(b.minX, ib.minX); b.minY = Math.min(b.minY, ib.minY); b.maxX = Math.max(b.maxX, ib.maxX); b.maxY = Math.max(b.maxY, ib.maxY); }
     const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
@@ -732,23 +1000,92 @@ class App {
   duplicateSelection() {
     if (!this.selectedIds.size) return;
     const off = this.camera.screenToWorldLen(16);
+    const idMap = new Map();
     const clones = [...this.selectedIds].map(id => {
       const it = this.scene.byId(id);
       if (!it) return null;
       const c = JSON.parse(JSON.stringify(it));
-      c.id = undefined;
-      const made = c;
-      return made;
-    }).filter(Boolean);
-    // assign fresh ids & offset
-    for (const c of clones) {
       c.id = 'dup_' + Math.random().toString(36).slice(2, 9);
+      idMap.set(id, c.id);
       translateItem(c, off, off);
-    }
+      return c;
+    }).filter(Boolean);
+    this._relinkConnectors(clones, idMap);
+    this._remapGroups(clones);
     this.history.push(addItemsCmd(this.scene, clones));
     this.selectedIds = new Set(clones.map(c => c.id));
     this._updateHud();
   }
+
+  // ---------------- images ----------------
+  /** Accept image files dropped onto the canvas, or pasted from the OS clipboard. */
+  _bindImageDrop() {
+    const c = this.canvas;
+    c.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+    c.addEventListener('drop', e => {
+      e.preventDefault();
+      const files = [...(e.dataTransfer?.files || [])].filter(f => /^image\//.test(f.type));
+      if (!files.length) return;
+      const s = this.evtScreen(e);
+      files.forEach((f, i) => this.loadImageFile(f, { x: s.x + i * 14, y: s.y + i * 14 }));
+    });
+    // OS-clipboard image paste (separate from the in-app Ctrl+V clipboard)
+    window.addEventListener('paste', e => {
+      const items = [...(e.clipboardData?.items || [])];
+      const imgItem = items.find(it => /^image\//.test(it.type));
+      if (!imgItem) return;
+      const file = imgItem.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      this.loadImageFile(file, { x: this.camera.width / 2, y: this.camera.height / 2 });
+    });
+  }
+
+  /** World-space size for an image with the given natural pixel dimensions,
+   *  scaled so it lands at a comfortable on-screen size (native px, capped). */
+  _imageWorldSize(natW, natH) {
+    natW = Math.max(1, natW || 1); natH = Math.max(1, natH || 1);
+    const cap = Math.min(this.camera.width, this.camera.height) * 0.7;
+    const longest = Math.max(natW, natH);
+    const screenLongest = Math.min(longest, cap);
+    const k = screenLongest / longest;                 // shrink-to-fit factor
+    const screenW = natW * k, screenH = natH * k;
+    return { w: this.camera.screenToWorldLen(screenW), h: this.camera.screenToWorldLen(screenH) };
+  }
+
+  /** Read an image File, decode its natural size, and drop it centred on a screen point. */
+  loadImageFile(file, screenPoint) {
+    const reader = new FileReader();
+    reader.onload = () => this.placeImageDataURL(reader.result, screenPoint);
+    reader.onerror = () => this._toast('Could not read image');
+    reader.readAsDataURL(file);
+  }
+
+  /** Place an image from a data URL, centred on a screen point, at native-ish size. */
+  placeImageDataURL(src, screenPoint = { x: this.camera.width / 2, y: this.camera.height / 2 }) {
+    const probe = new Image();
+    probe.onload = () => {
+      const { w, h } = this._imageWorldSize(probe.naturalWidth, probe.naturalHeight);
+      const c = this.toWorld(screenPoint.x, screenPoint.y);
+      this.addImageItem(c.x - w / 2, c.y - h / 2, w, h, src, { select: true });
+      this._toast(`Placed ${probe.naturalWidth}×${probe.naturalHeight} image`);
+    };
+    probe.onerror = () => this._toast('Invalid image data');
+    probe.src = src;
+  }
+
+  /** Add an image item (world coords/size) through history. Returns the item id. */
+  addImageItem(x, y, w, h, src, { select = false } = {}) {
+    const it = makeImage(x, y, w, h, src, { opacity: this.style.opacity });
+    if (src) this.renderer._image(src);   // begin decoding immediately
+    this.history.push(addItemsCmd(this.scene, [it]));
+    if (select) { this.selectedIds = new Set([it.id]); if (this.tool !== 'select') this.setTool('select'); }
+    this._updateHud();
+    return it.id;
+  }
+
+  /** Count image items whose bitmap hasn't decoded yet (test/UX hook). */
+  imagesPending() { return this.renderer.pendingImages(this.scene); }
 
   // ---------------- z-order ----------------
   _reorderSelection(mode) {
@@ -957,6 +1294,7 @@ class App {
     const doc = data && data.doc ? data.doc : data;
     this.scene.loadJSON(doc || { items: [] });
     if (data && data.camera) this.camera.restore(data.camera);
+    this.renderer.warmImages(this.scene);
     this.history.clear();
     this.selectedIds.clear();
     this._updateHud();
@@ -968,6 +1306,7 @@ class App {
     if (saved) {
       this.scene.loadJSON(saved.doc || { items: [] });
       this.camera.restore(saved.camera);
+      this.renderer.warmImages(this.scene);
     }
   }
 
@@ -975,9 +1314,11 @@ class App {
   requestRender() { this._dirty = true; }
   render() {
     const t0 = performance.now();
+    this.resolveConnectors(); // keep connector endpoints glued to their items
     this.renderer.render(this.scene, {
       draft: this.draft, selectedIds: this.selectedIds,
       marquee: this.marquee, eraserCursor: this.eraserCursor,
+      rotHandle: this.active && this.active.kind === 'rotate' ? null : this._rotHandleScreen(),
     });
     this.minimap.render();
     this._stats.lastRenderMs = performance.now() - t0;
@@ -1048,7 +1389,7 @@ class App {
       screenToWorld: (x, y) => this.camera.screenToWorld(x, y),
       bounds: () => this.scene.bounds(),
       toJSON: () => this.scene.toJSON(),
-      toSVG: opts => sceneToSVG(this.scene, opts),
+      toSVG: opts => { this.resolveConnectors(); return sceneToSVG(this.scene, opts); },
       loadJSON: d => this.loadDoc(d),
       stats: () => ({ ...this._stats }),
       drawnCount: () => { this.render(); return this.renderer.lastDrawn || 0; },
@@ -1077,6 +1418,9 @@ class App {
         const it = makePolygon(x, y, w, h, { ...this.drawStyle, ...style });
         this.history.push(addItemsCmd(this.scene, [it])); return it.id;
       },
+      addImage: (x, y, w, h, src, opts) => this.addImageItem(x, y, w, h, src, opts || {}),
+      placeImage: (src, sx, sy) => this.placeImageDataURL(src, { x: sx ?? this.camera.width / 2, y: sy ?? this.camera.height / 2 }),
+      imagesPending: () => this.imagesPending(),
       generate: (name, opts, flags) => this.generate(name, opts, flags),
       generators: () => Object.keys(GENERATORS),
       // z-order
@@ -1088,6 +1432,16 @@ class App {
       // level of detail
       setLOD: mode => this.setSelectionLOD(mode),
       visibleCount: () => this.visibleCount(),
+      // rotation
+      rotateSelection: (ang, pivot) => this.rotateSelection(ang, pivot),
+      rotHandle: () => this._rotHandleScreen(),
+      // grouping
+      group: () => this.groupSelection(),
+      ungroup: () => this.ungroupSelection(),
+      groupOf: id => { const it = this.scene.byId(id); return it ? (it.group || null) : null; },
+      // connectors
+      addConnector: (from, to, style) => this.addConnector(from, to, style || {}),
+      resolveConnectors: () => this.resolveConnectors(),
       // recursive stamp
       stamp: opts => this.recursiveStamp(opts),
       // bookmarks + fly-to

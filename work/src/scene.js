@@ -1,4 +1,8 @@
-import { uid, bboxOfPoints, distToSegment, dist, rectsIntersect, rectContains, pointInRect } from './util.js';
+import { uid, bboxOfPoints, distToSegment, dist, rectsIntersect, rectContains, pointInRect, rotatePoint } from './util.js';
+
+/** Item types that carry an optional `rot` (radians) about their own centre.
+ *  Point-based items (stroke/line/arrow) bake rotation into their points instead. */
+export const ROTATABLE = new Set(['rect', 'ellipse', 'polygon', 'image', 'text']);
 
 /**
  * Item shapes (all geometry in world coordinates):
@@ -7,6 +11,10 @@ import { uid, bboxOfPoints, distToSegment, dist, rectsIntersect, rectContains, p
  *   rect    : { x, y, w, h, color, width, fill }
  *   ellipse : { x, y, w, h, color, width, fill }
  *   text    : { x, y, text, color, size }   // size is world-units font size
+ *   image   : { x, y, w, h, src }           // src is a data URL (or any URL)
+ *   connector: { from, to, ax, ay, bx, by, color, width, arrow }
+ *             // from/to are item ids; ax..by are the resolved endpoint world
+ *             // coords (a cache kept fresh by App.resolveConnectors each render)
  */
 
 // Only attach `opacity` when it's actually translucent, to keep JSON tidy.
@@ -37,6 +45,34 @@ export function makePolygon(x, y, w, h, style) {
            sides: style.sides || 5, star: !!style.star,
            color: style.color, width: style.width, fill: style.fill || null, ...op(style) };
 }
+export function makeImage(x, y, w, h, src, style = {}) {
+  return { id: uid('img'), type: 'image', x, y, w, h, src, ...op(style) };
+}
+export function makeConnector(fromId, toId, style = {}) {
+  return { id: uid('c'), type: 'connector', from: fromId, to: toId,
+           ax: 0, ay: 0, bx: 0, by: 0,
+           color: style.color, width: style.width, arrow: style.arrow !== false, ...op(style) };
+}
+
+/** Point where the segment from box centre (cx,cy) toward (tx,ty) exits `box`. */
+export function boxEdgePoint(cx, cy, tx, ty, box) {
+  const dx = tx - cx, dy = ty - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy };
+  const eps = 1e-6 * (Math.abs(box.maxX - box.minX) + Math.abs(box.maxY - box.minY) + 1);
+  let best = Infinity;
+  const cand = [];
+  if (dx > 0) cand.push((box.maxX - cx) / dx); else if (dx < 0) cand.push((box.minX - cx) / dx);
+  if (dy > 0) cand.push((box.maxY - cy) / dy); else if (dy < 0) cand.push((box.minY - cy) / dy);
+  for (const t of cand) {
+    if (t < 0 || t > 1) continue;
+    const px = cx + dx * t, py = cy + dy * t;
+    if (px >= box.minX - eps && px <= box.maxX + eps && py >= box.minY - eps && py <= box.maxY + eps) {
+      best = Math.min(best, t);
+    }
+  }
+  if (!isFinite(best)) return { x: cx, y: cy };
+  return { x: cx + dx * best, y: cy + dy * best };
+}
 
 /** Vertices (world coords) of a polygon/star item, fitted to its bbox. */
 export function polygonVertices(it) {
@@ -62,34 +98,58 @@ function pointInPolygon(px, py, verts) {
   return inside;
 }
 
-/** World-space bounding box for any item type, padded by half stroke width. */
-export function itemBBox(it) {
-  let b;
+/** Rough text extents in world units (longest line × ~0.6em wide, 1.1em tall). */
+function textMetrics(it) {
+  const lines = String(it.text).split('\n');
+  const cols = lines.reduce((m, l) => Math.max(m, l.length), 1);
+  return { w: cols * it.size * 0.6, h: lines.length * it.size * 1.1 };
+}
+
+/** Axis-aligned bbox in the item's OWN (unrotated) frame — no padding. */
+function localBox(it) {
   switch (it.type) {
     case 'stroke':
     case 'line':
     case 'arrow':
-      b = bboxOfPoints(it.points);
-      break;
+      return bboxOfPoints(it.points);
+    case 'connector':
+      return bboxOfPoints([{ x: it.ax, y: it.ay }, { x: it.bx, y: it.by }]);
     case 'rect':
     case 'ellipse':
-    case 'polygon': {
+    case 'polygon':
+    case 'image': {
       const minX = Math.min(it.x, it.x + it.w);
       const minY = Math.min(it.y, it.y + it.h);
-      b = { minX, minY, maxX: minX + Math.abs(it.w), maxY: minY + Math.abs(it.h) };
-      break;
+      return { minX, minY, maxX: minX + Math.abs(it.w), maxY: minY + Math.abs(it.h) };
     }
     case 'text': {
-      // Rough: width ~ 0.6 em per char on the longest line.
-      const lines = String(it.text).split('\n');
-      const cols = lines.reduce((m, l) => Math.max(m, l.length), 1);
-      const w = cols * it.size * 0.6;
-      const h = lines.length * it.size * 1.1;
-      b = { minX: it.x, minY: it.y, maxX: it.x + w, maxY: it.y + h };
-      break;
+      const { w, h } = textMetrics(it);
+      return { minX: it.x, minY: it.y, maxX: it.x + w, maxY: it.y + h };
     }
     default:
-      b = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+      return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  }
+}
+
+/** Centre of a rotatable item, in world units (the pivot its `rot` turns about). */
+export function rotCenter(it) {
+  if (it.type === 'text') { const { w, h } = textMetrics(it); return { x: it.x + w / 2, y: it.y + h / 2 }; }
+  return { x: it.x + it.w / 2, y: it.y + it.h / 2 };
+}
+
+/** World-space bounding box for any item type, padded by half stroke width.
+ *  For a rotated item this is the AABB of its rotated corners. */
+export function itemBBox(it) {
+  let b = localBox(it);
+  if (it.rot && ROTATABLE.has(it.type)) {
+    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    let nx0 = Infinity, ny0 = Infinity, nx1 = -Infinity, ny1 = -Infinity;
+    for (const [px, py] of [[b.minX, b.minY], [b.maxX, b.minY], [b.maxX, b.maxY], [b.minX, b.maxY]]) {
+      const r = rotatePoint(px, py, cx, cy, it.rot);
+      if (r.x < nx0) nx0 = r.x; if (r.y < ny0) ny0 = r.y;
+      if (r.x > nx1) nx1 = r.x; if (r.y > ny1) ny1 = r.y;
+    }
+    b = { minX: nx0, minY: ny0, maxX: nx1, maxY: ny1 };
   }
   const pad = (it.width || 0) / 2 + 1e-9;
   return { minX: b.minX - pad, minY: b.minY - pad, maxX: b.maxX + pad, maxY: b.maxY + pad };
@@ -97,6 +157,13 @@ export function itemBBox(it) {
 
 /** Does an item lie under world point (x,y) within `tol` world units? */
 export function hitTest(it, x, y, tol) {
+  // For a rotated box, map the query point into the item's local frame so the
+  // existing axis-aligned tests below work unchanged.
+  if (it.rot && ROTATABLE.has(it.type)) {
+    const c = rotCenter(it);
+    const p = rotatePoint(x, y, c.x, c.y, -it.rot);
+    x = p.x; y = p.y;
+  }
   const reach = tol + (it.width || 0) / 2;
   switch (it.type) {
     case 'stroke':
@@ -109,6 +176,8 @@ export function hitTest(it, x, y, tol) {
       if (p.length === 1) return dist(x, y, p[0].x, p[0].y) <= reach;
       return false;
     }
+    case 'connector':
+      return distToSegment(x, y, it.ax, it.ay, it.bx, it.by) <= reach;
     case 'polygon': {
       const verts = polygonVertices(it);
       if (it.fill && pointInPolygon(x, y, verts)) return true;
@@ -117,6 +186,12 @@ export function hitTest(it, x, y, tol) {
         if (distToSegment(x, y, a.x, a.y, b.x, b.y) <= reach) return true;
       }
       return false;
+    }
+    case 'image': {
+      // images are opaque rectangles: a hit anywhere inside (plus edge reach)
+      const r = normRect(it);
+      return x >= r.minX - reach && x <= r.maxX + reach &&
+             y >= r.minY - reach && y <= r.maxY + reach;
     }
     case 'rect': {
       const r = normRect(it);
@@ -135,8 +210,8 @@ export function hitTest(it, x, y, tol) {
       return ring <= reach;
     }
     case 'text': {
-      const b = itemBBox(it);
-      return pointInRect(x, y, b);
+      // local (unrotated) box — the point is already in local space above
+      return pointInRect(x, y, localBox(it));
     }
   }
   return false;
@@ -171,6 +246,7 @@ export function lodVisible(it, scale) {
 
 /** Scale an item in place about (cx,cy) by factor s (geometry + stroke width). */
 export function scaleItemAbout(it, cx, cy, s) {
+  if (it.type === 'connector') return it; // endpoints are item-anchored; nothing to scale
   switch (it.type) {
     case 'stroke':
     case 'line':
@@ -191,9 +267,31 @@ export function scaleItemAbout(it, cx, cy, s) {
   return it;
 }
 
+/**
+ * Rotate a set of items in place by `ang` radians about world pivot (px,py).
+ * Box items accumulate `ang` into their `rot` and have their centre swung about
+ * the pivot; point items (stroke/line/arrow) bake the rotation into their points.
+ */
+export function rotateItemsAbout(items, px, py, ang) {
+  for (const it of items) {
+    if (it.type === 'stroke' || it.type === 'line' || it.type === 'arrow') {
+      it.points = it.points.map(p => rotatePoint(p.x, p.y, px, py, ang));
+    } else if (ROTATABLE.has(it.type)) {
+      const c = rotCenter(it);
+      const nc = rotatePoint(c.x, c.y, px, py, ang);
+      // shift x,y so the (unchanged-size) box re-centres on the swung centre
+      it.x += nc.x - c.x; it.y += nc.y - c.y;
+      it.rot = (it.rot || 0) + ang;
+    }
+  }
+  return items;
+}
+
 /** Translate an item in place by (dx,dy) world units. Returns the item. */
 export function translateItem(it, dx, dy) {
   switch (it.type) {
+    case 'connector':
+      break; // endpoints follow the items it links; no independent position
     case 'stroke':
     case 'line':
     case 'arrow':
@@ -287,6 +385,7 @@ export class Scene {
     for (let i = this.items.length - 1; i >= 0; i--) {
       const it = this.items[i];
       if (filter && !filter(it)) continue;
+      if (it.type === 'connector' && (!this._index.get(it.from) || !this._index.get(it.to))) continue;
       if (hitTest(it, x, y, tol)) return it;
     }
     return null;

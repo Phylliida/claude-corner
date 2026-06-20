@@ -28,6 +28,13 @@ export function distToSegment(px, py, ax, ay, bx, by) {
   return dist(px, py, ax + t * dx, ay + t * dy);
 }
 
+/** Rotate point (px,py) by `ang` radians about centre (cx,cy). */
+export function rotatePoint(px, py, cx, cy, ang) {
+  const c = Math.cos(ang), s = Math.sin(ang);
+  const dx = px - cx, dy = py - cy;
+  return { x: cx + dx * c - dy * s, y: cy + dx * s + dy * c };
+}
+
 /** Axis-aligned bbox of a list of {x,y} points. */
 export function bboxOfPoints(points) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
