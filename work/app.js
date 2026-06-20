@@ -32,6 +32,9 @@
     AUTOSAVE_MS: 400,
     STORAGE_KEY: "infinitedraw:v2",
     PALETTE: ["#ffffff", "#34d2ff", "#ff6b6b", "#ffd166", "#7cfc8a", "#c792ea", "#000000"],
+    // Velocity taper: fast pen movement → thinner line (organic/ink feel).
+    TAPER_VREF: 22, // on-screen px/sample at which the line reaches its thinnest
+    TAPER_SMOOTH: 0.35, // low-pass factor for the speed signal (0..1; higher = snappier)
   };
 
   // ---- DOM ----
@@ -61,6 +64,8 @@
     opacity: 1, // 0..1 stroke alpha for new strokes
     zoomDependent: true,
     smooth: true, // render pen paths as smooth curves
+    taper: false, // vary pen width with drawing speed
+    taperAmount: 55, // 0..100 strength: how thin a fast flick gets
     grid: true,
     minimap: true,
     bg: "#0d0f15",
@@ -186,7 +191,7 @@
   function frame() { return state.frames[state.current]; }
 
   function cloneStroke(s) {
-    return { id: uid(), type: s.type, color: s.color, width: s.width, alpha: s.alpha, points: s.points.map((p) => ({ x: p.x, y: p.y })) };
+    return { id: uid(), type: s.type, color: s.color, width: s.width, alpha: s.alpha, widths: s.widths ? s.widths.slice() : undefined, points: s.points.map((p) => ({ x: p.x, y: p.y })) };
   }
 
   function gotoFrame(i) {
@@ -283,6 +288,7 @@
   function copyFrame() {
     clipboard = frame().strokes.map((s) => ({
       type: s.type, color: s.color, width: s.width, alpha: s.alpha,
+      widths: s.widths ? s.widths.slice() : undefined,
       points: s.points.map((p) => ({ x: p.x, y: p.y })),
     }));
     toast(clipboard.length ? `Copied ${clipboard.length} stroke(s)` : "Nothing to copy");
@@ -293,6 +299,7 @@
     const f = frame();
     const added = clipboard.map((s) => ({
       id: uid(), type: s.type, color: s.color, width: s.width, alpha: s.alpha,
+      widths: s.widths ? s.widths.slice() : undefined,
       points: s.points.map((p) => ({ x: p.x, y: p.y })),
     }));
     commit({
@@ -308,6 +315,17 @@
     return state.zoomDependent ? state.brushSize / state.scale : state.brushSize;
   }
 
+  // Velocity taper: map an on-screen speed (px between consecutive samples) to a
+  // width factor in [minFactor, 1]. Slow → 1 (full width), fast → minFactor.
+  // taperAmount drives how dramatic the thinning is (0 = none, 100 = down to 10%).
+  function taperMinFactor() { return 1 - (state.taperAmount / 100) * 0.9; }
+  function speedToFactor(speedPx) {
+    const min = taperMinFactor();
+    const t = Math.min(1, Math.max(0, speedPx / CONFIG.TAPER_VREF));
+    return 1 - (1 - min) * t;
+  }
+  function taperActive() { return state.taper && state.tool === "pen"; }
+
   function addStroke(stroke) {
     const s = stroke.id ? stroke : Object.assign({ id: uid() }, stroke);
     const f = frame();
@@ -321,20 +339,34 @@
   // Programmatic stroke building (used by UI pointer handlers and by tests).
   function beginStroke(world, opts) {
     opts = opts || {};
+    const taper = opts.taper != null ? opts.taper : taperActive();
+    const base = opts.width != null ? opts.width : strokeWorldWidth();
     drawing = {
       type: opts.type || (state.tool === "rect" ? "rect" : state.tool === "ellipse" ? "ellipse" : "path"),
-      tool: state.tool,
+      tool: opts.tool || state.tool,
       color: opts.color || state.color,
-      width: opts.width != null ? opts.width : strokeWorldWidth(),
+      width: base,
       alpha: opts.alpha != null ? opts.alpha : state.opacity,
       points: [{ x: world.x, y: world.y }],
+      // taper bookkeeping: per-point world widths + a smoothed speed signal
+      taper: taper,
+      widths: taper ? [base] : null,
+      _speed: null,
     };
     render();
   }
   function extendStroke(world) {
     if (!drawing) return;
     if (drawing.type === "path" && drawing.tool === "pen") {
+      const prev = drawing.points[drawing.points.length - 1];
       drawing.points.push({ x: world.x, y: world.y });
+      if (drawing.widths) {
+        // on-screen distance since the last sample ≈ pen speed (samples arrive
+        // at a roughly steady rate), low-pass filtered for an organic taper.
+        const raw = Math.hypot(world.x - prev.x, world.y - prev.y) * state.scale;
+        drawing._speed = drawing._speed == null ? raw : drawing._speed + (raw - drawing._speed) * CONFIG.TAPER_SMOOTH;
+        drawing.widths.push(speedToFactor(drawing._speed) * drawing.width);
+      }
     } else {
       // line / rect / ellipse: only first + last matter
       drawing.points[1] = { x: world.x, y: world.y };
@@ -350,13 +382,22 @@
       // A pen tap with a single point still becomes a dot.
       if (d.type === "path" && d.points.length === 1) {
         d.points.push({ x: d.points[0].x + 0.001, y: d.points[0].y + 0.001 });
+        if (d.widths) d.widths.push(d.widths[0]);
       }
       if (d.points.length >= 2 || d.type === "path") {
-        committed = addStroke({ type: d.type, color: d.color, width: d.width, alpha: d.alpha, points: d.points });
+        const stroke = { type: d.type, color: d.color, width: d.width, alpha: d.alpha, points: d.points };
+        // Only keep a widths array if it actually varies along the stroke;
+        // a flat array would just be a heavier way to store one number.
+        if (d.widths && d.widths.length === d.points.length && widthsVary(d.widths)) stroke.widths = d.widths;
+        committed = addStroke(stroke);
       }
     }
     render();
     return committed;
+  }
+  function widthsVary(ws) {
+    for (let i = 1; i < ws.length; i++) if (Math.abs(ws[i] - ws[0]) > 1e-9) return true;
+    return false;
   }
 
   // Eraser: remove strokes near a world point.
@@ -432,6 +473,41 @@
     return Math.max(CONFIG.MIN_RENDER_WIDTH, s.width * state.scale);
   }
 
+  // Variable-width "ribbon": a disc at every point plus a trapezoid per segment,
+  // all in ONE path filled once. The nonzero winding rule fills the union region
+  // a single time, so overlapping discs/quads composite correctly even at
+  // alpha < 1 (no double-darkening), and the discs give free round caps + joins.
+  function traceRibbon(c, scr, halfW) {
+    c.beginPath();
+    for (let i = 0; i < scr.length; i++) {
+      const r = halfW[i];
+      c.moveTo(scr[i].x + r, scr[i].y);
+      c.arc(scr[i].x, scr[i].y, r, 0, Math.PI * 2);
+    }
+    for (let i = 1; i < scr.length; i++) {
+      const a = scr[i - 1], b = scr[i];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) continue;
+      const nx = -dy / len, ny = dx / len;
+      const ra = halfW[i - 1], rb = halfW[i];
+      // Wind the quad the same way as the discs (arc(...,2π) is positively wound)
+      // so the nonzero rule unions them instead of cancelling in the overlap.
+      c.moveTo(a.x + nx * ra, a.y + ny * ra);
+      c.lineTo(a.x - nx * ra, a.y - ny * ra);
+      c.lineTo(b.x - nx * rb, b.y - ny * rb);
+      c.lineTo(b.x + nx * rb, b.y + ny * rb);
+      c.closePath();
+    }
+    c.fill();
+  }
+  function screenHalfWidths(s) {
+    return s.widths.map((w) => Math.max(CONFIG.MIN_RENDER_WIDTH, w * state.scale) / 2);
+  }
+  function hasTaper(s) {
+    return !!(s.widths && s.type === "path" && s.widths.length === s.points.length);
+  }
+
   function drawStroke(c, s, alpha, tint) {
     c.save();
     const sa = s.alpha == null ? 1 : s.alpha;
@@ -441,6 +517,11 @@
     c.lineWidth = strokeScreenWidth(s);
     c.lineJoin = "round";
     c.lineCap = "round";
+    if (hasTaper(s)) {
+      traceRibbon(c, s.points.map((p) => worldToScreen(p.x, p.y)), screenHalfWidths(s));
+      c.restore();
+      return;
+    }
     const pts = s.points;
     if (s.type === "rect") {
       const a = worldToScreen(pts[0].x, pts[0].y);
@@ -682,11 +763,16 @@
       current: state.current,
       frames: state.frames.map((f) => ({
         hold: f.hold || 1,
-        strokes: f.strokes.map((s) => ({ type: s.type, color: s.color, width: s.width, alpha: s.alpha, points: s.points })),
+        strokes: f.strokes.map((s) => {
+          const o = { type: s.type, color: s.color, width: s.width, alpha: s.alpha, points: s.points };
+          if (s.widths) o.widths = s.widths;
+          return o;
+        }),
       })),
       settings: {
         tool: state.tool, color: state.color, brushSize: state.brushSize, opacity: state.opacity,
-        zoomDependent: state.zoomDependent, smooth: state.smooth, grid: state.grid, minimap: state.minimap, bg: state.bg,
+        zoomDependent: state.zoomDependent, smooth: state.smooth, taper: state.taper, taperAmount: state.taperAmount,
+        grid: state.grid, minimap: state.minimap, bg: state.bg,
         fps: state.fps, onion: state.onion, onionDepth: state.onionDepth, loop: state.loop, pingpong: state.pingpong,
       },
     };
@@ -697,6 +783,7 @@
     state.frames = data.frames.map((f) => makeFrame((f.strokes || []).map((s) => ({
       id: uid(), type: s.type || "path", color: s.color || "#fff",
       width: s.width || 1, alpha: typeof s.alpha === "number" ? s.alpha : 1,
+      widths: Array.isArray(s.widths) ? s.widths.slice() : undefined,
       points: (s.points || []).map((p) => ({ x: p.x, y: p.y })),
     })), f.hold || 1));
     state.current = Math.max(0, Math.min(state.frames.length - 1, data.current || 0));
@@ -709,6 +796,8 @@
     if (typeof s.opacity === "number") state.opacity = s.opacity;
     if (typeof s.zoomDependent === "boolean") state.zoomDependent = s.zoomDependent;
     if (typeof s.smooth === "boolean") state.smooth = s.smooth;
+    if (typeof s.taper === "boolean") state.taper = s.taper;
+    if (typeof s.taperAmount === "number") state.taperAmount = s.taperAmount;
     if (typeof s.grid === "boolean") state.grid = s.grid;
     if (typeof s.minimap === "boolean") state.minimap = s.minimap;
     if (typeof s.bg === "string") state.bg = s.bg;
@@ -787,6 +876,13 @@
     scheduleSave();
   }
   function setBg(c) { state.bg = c; $("bg").value = c; render(); scheduleSave(); }
+  function setTaper(v) { state.taper = !!v; $("taper").checked = state.taper; scheduleSave(); }
+  function setTaperAmount(n) {
+    state.taperAmount = Math.max(0, Math.min(100, Math.round(n)));
+    $("taperAmount").value = state.taperAmount;
+    $("taperAmountOut").textContent = state.taperAmount;
+    scheduleSave();
+  }
   function setMinimap(v) {
     state.minimap = !!v;
     $("minimap").classList.toggle("collapsed", !state.minimap);
@@ -913,6 +1009,8 @@
     $("opacity").value = Math.round(state.opacity * 100); $("opacityOut").textContent = Math.round(state.opacity * 100) + "%";
     $("zoomDependent").checked = state.zoomDependent;
     $("smooth").checked = state.smooth;
+    $("taper").checked = state.taper;
+    $("taperAmount").value = state.taperAmount; $("taperAmountOut").textContent = state.taperAmount;
     $("fps").value = state.fps; $("fpsOut").textContent = state.fps;
     $("onion").checked = state.onion;
     $("onionDepth").value = state.onionDepth; $("onionDepthOut").textContent = state.onionDepth;
@@ -1025,6 +1123,7 @@
       case "i": setTool("eyedropper"); break;
       case "h": setTool("pan"); break;
       case "g": state.grid = !state.grid; render(); scheduleSave(); break;
+      case "t": setTaper(!state.taper); toast(state.taper ? "Velocity taper on" : "Velocity taper off"); break;
       case "m": setMinimap(!state.minimap); break;
       case "0": resetView(); break;
       case "f": fitView(); break;
@@ -1055,6 +1154,8 @@
   $("opacity").addEventListener("input", (e) => setOpacity(+e.target.value));
   $("zoomDependent").addEventListener("change", (e) => setZoomDependent(e.target.checked));
   $("smooth").addEventListener("change", (e) => { state.smooth = e.target.checked; render(); scheduleSave(); });
+  $("taper").addEventListener("change", (e) => setTaper(e.target.checked));
+  $("taperAmount").addEventListener("input", (e) => setTaperAmount(+e.target.value));
   $("undo").addEventListener("click", undo);
   $("redo").addEventListener("click", redo);
   $("clearFrame").addEventListener("click", clearFrame);
@@ -1161,6 +1262,11 @@
         c.lineJoin = "round"; c.lineCap = "round";
         const pts = s.points;
         const P = (p) => worldToScreen(p.x, p.y);
+        if (hasTaper(s)) {
+          traceRibbon(c, pts.map(P), screenHalfWidths(s));
+          c.restore();
+          return;
+        }
         if (s.type === "rect") {
           const a = P(pts[0]), b = P(pts[1]);
           c.strokeRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
@@ -1240,6 +1346,8 @@
     setSize, getSize: () => state.brushSize,
     setOpacity, getOpacity: () => state.opacity,
     setZoomDependent, isZoomDependent: () => state.zoomDependent,
+    setTaper, isTaper: () => state.taper,
+    setTaperAmount, getTaperAmount: () => state.taperAmount,
     strokeWorldWidth, strokeScreenWidth,
     beginStroke, extendStroke, endStroke, addStroke, eraseAt, pickColorAt,
     // convenience: draw a full stroke through a list of world points

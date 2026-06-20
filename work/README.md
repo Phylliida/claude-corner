@@ -18,6 +18,9 @@ npm run serve   # python3 -m http.server 8080  ->  http://localhost:8080
 - Tools: pen, straight line, rectangle, ellipse, stroke-eraser, eyedropper, pan.
 - Color picker + quick palette, **background colour**, brush-size slider,
   **brush opacity**, optional **pen smoothing** (quadratic curves).
+- **Velocity taper** (toggle <kbd>T</kbd>): the pen varies its width with drawing
+  speed — fast strokes go thin, slow strokes go thick, for an organic ink /
+  calligraphy feel. The "Taper amt" slider sets how dramatic the thinning is.
 - Adaptive dot grid with an origin crosshair (toggle with <kbd>G</kbd>).
 - **Minimap / locator** (top-right): an overview of the whole drawing with a live
   viewport rectangle showing where you are. Click or drag it to jump the camera.
@@ -57,7 +60,7 @@ npm run serve   # python3 -m http.server 8080  ->  http://localhost:8080
 | `P` `L` `R` `O` `E` `I` | pen / line / rect / ellipse / eraser / eyedropper | `H` / `Space` | pan |
 | `[` `]` | brush size | `C` / `X` | focus color / swap recent |
 | `0` | reset view | `F` | fit to drawing |
-| `G` / `M` | toggle grid / minimap | `Ctrl/⌘+Z` / `+Shift` | undo / redo |
+| `G` / `M` / `T` | toggle grid / minimap / taper | `Ctrl/⌘+Z` / `+Shift` | undo / redo |
 | `N` | new frame | `D` | duplicate frame |
 | `,` `.` | prev / next frame | `Enter` | play / pause |
 | `Ctrl/⌘+C` / `+V` | copy / paste frame strokes | `Ctrl/⌘+S` | save |
