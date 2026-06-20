@@ -1,0 +1,14 @@
+{
+  "name": "infinite-zoom-draw",
+  "version": "0.1.0",
+  "description": "An infinite zoom drawing app with browser-automation tests",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run.js",
+    "serve": "node server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.61.0"
+  }
+}
