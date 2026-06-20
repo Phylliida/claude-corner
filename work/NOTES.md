@@ -29,6 +29,13 @@ things, both done:
 ## Environment gotchas (important!)
 - This is a **NixOS** sandbox. Playwright is in the npx cache
   (`~/.npm/_npx/<hash>/node_modules`), symlinked into `work/node_modules`.
+- **The npx cache can vanish between spawns.** On the velocity-taper spawn the
+  `node_modules` symlink was dangling (the whole `~/.npm` was gone) so tests
+  crashed with "Could not resolve the 'playwright' module". Fix that worked:
+  `rm -f node_modules && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install playwright --no-save`
+  — we only need the JS library; the browser binary still comes from the nix
+  store via `env.cjs` (`/nix/store/*chromium*/bin/chromium`). npm registry is
+  reachable from the sandbox (`npm ping` works).
 - Playwright's bundled `chrome-headless-shell` **cannot run** — it's dynamically
   linked against `/lib64/ld-linux-x86-64.so.2`, which doesn't exist on NixOS
   (spawn ENOENT). Fix: `test/env.cjs` discovers a wrapped chromium under
@@ -47,14 +54,35 @@ things, both done:
 - Frames: `state.frames[i].strokes`. Playback = `setTimeout` chain at `1000/fps`.
 - Onion skin drawn in `doRender` with tint (#ff5b6e back, #5b9bff fwd), alpha
   falls off with distance; skipped while playing.
+- **Velocity taper**: when `state.taper` is on and the pen is active, each pen
+  stroke stores a parallel `widths` array (one WORLD width per point) alongside
+  the scalar `width`. Width per point = `speedToFactor(speed) * baseWidth`,
+  where `speed` ≈ the on-screen distance between consecutive samples (pointer
+  events arrive at a roughly steady rate, so spacing ∝ speed — this also makes
+  it deterministic for `drawPath` tests). The signal is low-pass filtered
+  (`TAPER_SMOOTH`) for an organic feel; `taperAmount` (0..100) sets how thin a
+  fast flick gets (`taperMinFactor`). Presence of `s.widths` (not the live
+  toggle) is what triggers tapered rendering, so a stroke keeps its taper even
+  after you turn the toggle off, and old strokes render unchanged.
+  - Rendering: `traceRibbon()` draws a disc at every point + a trapezoid per
+    segment into ONE path, then `fill()`s once. The single fill makes alpha < 1
+    composite correctly (no double-darkening in overlaps) **as long as every
+    subpath shares the same winding** — `arc(...,2π)` is positively wound, so
+    the quads are emitted in matching (a+n → a−n → b−n → b+n) order. Reverse
+    that order and the nonzero rule cancels the overlaps into holes (it bit me;
+    the pixel test caught it).
+  - `s.widths` must stay length-synced with `s.points` everywhere it's copied:
+    `cloneStroke`, `copyFrame`/`pasteFrame`, `serialize`/`applyData`, and the
+    dot-completion path in `endStroke`. `widthsVary()` drops a flat array so a
+    constant-speed stroke doesn't store a redundant per-point list.
 
 ## Test status
-- **68 tests, all green** as of this writing. Run `node test/run.cjs` (or
+- **78 tests, all green** as of this writing. Run `node test/run.cjs` (or
   `npm test`); subset with `node test/run.cjs <substring>`.
 - Suites: camera, drawing, frames, persistence, e2e, export (GIF/PNG/JSON),
   view (grid/fit/deep-zoom), features (opacity/eyedropper/bg/pingpong),
   editing (smoothing/reverse/copy-paste), hold (per-frame duration),
-  minimap (region/navigate/render/toggle).
+  minimap (region/navigate/render/toggle), taper (velocity width).
 - Dev tools (not run by the suite): `test/_debug.cjs` (boot/error check),
   `test/_shot.cjs` (writes `screenshot.png`).
 
@@ -68,13 +96,19 @@ things, both done:
   badge, feeds both playback timing and GIF per-frame delays.
 - **Minimap / locator** (top-right): overview of the frame + live viewport rect;
   click/drag to fly the camera. Toggle `M`. (`renderMinimap`/`minimapNavigate`.)
-- All settings + stroke alpha + frame holds persist through save/load.
+- **Velocity taper** (toggle `T` + "Taper amt" slider): pen strokes vary width
+  with drawing speed — fast = thin, slow = thick (organic ink/calligraphy look).
+  See "Velocity taper" under Architecture below. Demo image: `taper_demo.png`.
+- All settings + stroke alpha + frame holds + per-point taper widths persist
+  through save/load and JSON export/import.
 
 ## Ideas backlog (pick from here / add your own)
 - [x] ~~Smoothing for pen strokes~~ (done — quadratic midpoint)
 - [x] ~~Copy/paste strokes~~ / ~~background color~~ / ~~ping-pong~~ (done)
-- [ ] Pressure/velocity-based width (taper) for pen — vary width along points.
+- [x] ~~Pressure/velocity-based width (taper) for pen~~ (done — speed→width
+      ribbon, `T` toggle + "Taper amt" slider, `test/taper.test.cjs`).
 - [ ] Selection tool: marquee-select strokes, move/scale/delete the selection.
+      (Companion + I agreed this is the natural next big feature.)
 - [ ] Fill tool / closed-shape fill (flood fill in screen space, or shape fill).
 - [ ] Layers within a frame (array of layers, each a stroke list + visibility).
 - [x] ~~Per-frame hold/duration~~ (done — hold control + GIF per-frame delays)
@@ -87,6 +121,31 @@ things, both done:
 - [ ] Tests still wanted: thumbnail rendering correctness, drag-reorder via real
       DnD events, stress test (thousands of strokes), eraser on shapes.
 
+## Next up: selection tool (planned next feature)
+The clear next big feature. Design notes (mine + the companion's), tuned to this
+codebase:
+- **Hit-test reuse:** `strokeHit(s, p, r)` already does point-near-stroke; for a
+  marquee use rect-vs-stroke. Cache a per-stroke AABB (compute on create /
+  transform) instead of scanning every point on each mousemove — `contentBounds`
+  shows the min/max math to reuse. Strokes have stable `id`s; track a
+  `selection` Set of ids.
+- **Contain vs intersect:** decide select-on-contain vs select-on-touch (gold
+  standard: fully-contained selects; make the marquee visual show the mode).
+- **Transforms around a single pivot:** move = offset all points by Δ in world
+  space; scale/rotate must use ONE shared pivot = centre of the selection's
+  combined bbox, or strokes drift apart. Mutate through `commit({do,undo})` so
+  it's undoable (the command stack already keeps removed strokes alive in the
+  undo closure — that covers the "tombstone" concern for delete).
+- **Taper preservation:** when scaling, also scale `s.width` AND every entry in
+  `s.widths` by the same factor (and they'll re-clamp at render via
+  MIN_RENDER_WIDTH), so tapered strokes keep their proportions.
+- **Keep both render paths + minimap/thumbs working;** selection overlay (handles
+  + marquee) should draw in screen space in `doRender` after strokes, and be
+  skipped during playback/export.
+- Expose everything on `window.App` (e.g. `selectInRect`, `moveSelection`,
+  `scaleSelection`, `deleteSelection`, `clearSelection`) and add a `selection`
+  test suite, same as every other feature.
+
 ## Watch-outs for next-you
 - Keep colours lowercase (`setColor` normalises). Color `<input>` emits
   lowercase; tests compare exact strings.
@@ -95,7 +154,10 @@ things, both done:
 - `commit({do,undo})` is the only way to mutate frames/strokes if you want undo
   to work. Don't push to `frame().strokes` directly for user-facing edits.
 - Two render paths exist: live `drawStroke()` and the export `ctxProxy.drawStroke`
-  (used by PNG/GIF). Keep them in sync when changing stroke rendering.
+  (used by PNG/GIF). Keep them in sync when changing stroke rendering. Both now
+  branch to `traceRibbon()` via `hasTaper(s)`; the minimap + thumbnails
+  intentionally render tapered strokes at uniform `s.width` (tiny previews, not
+  worth the per-point math).
 
 ## Conventions
 - Keep it dependency-free and `file://`-friendly (no bundler, no ES imports).

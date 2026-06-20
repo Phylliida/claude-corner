@@ -50,6 +50,15 @@
         <input type="checkbox" id="smooth" checked />
         <span>Smooth</span>
       </label>
+      <label class="chk" title="Vary pen width with drawing speed — fast = thin, slow = thick (T)">
+        <input type="checkbox" id="taper" />
+        <span>Taper</span>
+      </label>
+      <label class="slider" title="Taper strength — how much a fast flick thins out">
+        <span>Taper amt</span>
+        <input type="range" id="taperAmount" min="0" max="100" step="5" value="55" />
+        <output id="taperAmountOut">55</output>
+      </label>
     </div>
 
     <div class="group">
@@ -144,7 +153,8 @@
     <div id="helpBody" hidden>
       <div><kbd>P</kbd> pen · <kbd>L</kbd> line · <kbd>R</kbd> rect · <kbd>O</kbd> ellipse · <kbd>E</kbd> eraser · <kbd>H</kbd>/<kbd>Space</kbd> pan</div>
       <div><kbd>[</kbd>/<kbd>]</kbd> brush size · <kbd>C</kbd> color focus · <kbd>X</kbd> swap recent colors</div>
-      <div><kbd>0</kbd> reset view · <kbd>F</kbd> fit · <kbd>Ctrl/⌘+Z</kbd> undo · <kbd>Shift</kbd> redo</div>
+      <div><kbd>0</kbd> reset view · <kbd>F</kbd> fit · <kbd>T</kbd> velocity taper · <kbd>G</kbd> grid · <kbd>M</kbd> map</div>
+      <div><kbd>Ctrl/⌘+Z</kbd> undo · <kbd>Shift</kbd> redo · <kbd>Ctrl/⌘+C</kbd>/<kbd>V</kbd> copy/paste strokes</div>
       <div><kbd>N</kbd> new frame · <kbd>D</kbd> duplicate · <kbd>,</kbd>/<kbd>.</kbd> prev/next · <kbd>Enter</kbd> play</div>
     </div>
   </div>
