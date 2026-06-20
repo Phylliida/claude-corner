@@ -1,0 +1,8 @@
+Selection tool complete (2026-06-20).
+
+Delivered the assigned milestone — marquee selection with move / scale / delete —
+plus duplicate (Ctrl+J) and arrow-key nudge. AutoCAD-style directional marquee
+(left→right = window/contain, right→left = crossing). All transforms are single
+undoable commits. 22 new tests in test/selection.test.cjs; full suite 100/100 green.
+See NOTES.md "Selection tool" (Architecture) for the design and the documented
+watch-outs. Suggested next: selection-aware copy/paste, a rotate handle, or layers.

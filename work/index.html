@@ -18,6 +18,7 @@
       <button data-tool="ellipse" class="tool" title="Ellipse (O)">◯</button>
       <button data-tool="eraser" class="tool" title="Eraser (E)">🧽</button>
       <button data-tool="eyedropper" class="tool" title="Eyedropper — pick a colour (I)">💧</button>
+      <button data-tool="select" class="tool" title="Select — marquee, move, scale, delete (V). Drag right→left for crossing select.">⬚</button>
       <button data-tool="pan" class="tool" title="Pan / hold Space (H)">✋</button>
     </div>
 
@@ -151,7 +152,9 @@
     <strong>InfiniteDraw</strong> · scroll = zoom · drag = draw · Space/middle-drag = pan ·
     <button id="helpToggle" class="link">shortcuts</button>
     <div id="helpBody" hidden>
-      <div><kbd>P</kbd> pen · <kbd>L</kbd> line · <kbd>R</kbd> rect · <kbd>O</kbd> ellipse · <kbd>E</kbd> eraser · <kbd>H</kbd>/<kbd>Space</kbd> pan</div>
+      <div><kbd>P</kbd> pen · <kbd>L</kbd> line · <kbd>R</kbd> rect · <kbd>O</kbd> ellipse · <kbd>E</kbd> eraser · <kbd>V</kbd> select · <kbd>H</kbd>/<kbd>Space</kbd> pan</div>
+      <div><kbd>V</kbd> select: drag = marquee (→ window, ← crossing) · drag inside = move · handles = scale · arrows = nudge (<kbd>Shift</kbd> ×10)</div>
+      <div><kbd>Del</kbd> delete · <kbd>Ctrl/⌘+A</kbd> all · <kbd>Ctrl/⌘+J</kbd> duplicate · <kbd>Shift</kbd>+drag/click adds · <kbd>Esc</kbd> clear</div>
       <div><kbd>[</kbd>/<kbd>]</kbd> brush size · <kbd>C</kbd> color focus · <kbd>X</kbd> swap recent colors</div>
       <div><kbd>0</kbd> reset view · <kbd>F</kbd> fit · <kbd>T</kbd> velocity taper · <kbd>G</kbd> grid · <kbd>M</kbd> map</div>
       <div><kbd>Ctrl/⌘+Z</kbd> undo · <kbd>Shift</kbd> redo · <kbd>Ctrl/⌘+C</kbd>/<kbd>V</kbd> copy/paste strokes</div>

@@ -35,6 +35,10 @@
     // Velocity taper: fast pen movement → thinner line (organic/ink feel).
     TAPER_VREF: 22, // on-screen px/sample at which the line reaches its thinnest
     TAPER_SMOOTH: 0.35, // low-pass factor for the speed signal (0..1; higher = snappier)
+    // Selection tool
+    HANDLE_SIZE: 8, // on-screen px: the drawn square for each resize handle
+    HANDLE_HIT: 11, // on-screen px: generous half-extent for grabbing a handle
+    SELECT_SLACK: 6, // on-screen px added to a stroke's half-width when click-picking
   };
 
   // ---- DOM ----
@@ -82,6 +86,10 @@
   // In-progress drawing
   let drawing = null; // { type, color, width, points: [...] }
   let panState = null; // { startScreen, startCam }
+  // Selection: a Set of stroke ids in the current frame, plus the in-progress
+  // marquee/move/scale gesture. Selection is per-frame and not serialized.
+  const selection = new Set();
+  let selDrag = null; // { mode:'marquee'|'move'|'scale', ... }
   let spaceHeld = false;
   let playTimer = null;
   let saveTimer = null;
@@ -196,6 +204,7 @@
 
   function gotoFrame(i) {
     state.current = Math.max(0, Math.min(state.frames.length - 1, i));
+    selection.clear(); // selection ids are scoped to one frame
     render();
     updateFrameUI();
     scheduleSave();
@@ -210,6 +219,7 @@
   }
 
   function addFrame() {
+    selection.clear();
     const at = state.current + 1;
     const f = makeFrame();
     commit({
@@ -219,6 +229,7 @@
     toast("Frame added");
   }
   function dupFrame() {
+    selection.clear();
     const at = state.current + 1;
     const copy = makeFrame(frame().strokes.map(cloneStroke), frame().hold);
     commit({
@@ -233,6 +244,7 @@
       clearFrame();
       return;
     }
+    selection.clear();
     const at = state.current;
     const removed = state.frames[at];
     commit({
@@ -243,6 +255,7 @@
   }
   function moveFrame(from, to) {
     if (from === to || to < 0 || to >= state.frames.length) return;
+    selection.clear();
     commit({
       do: () => { const [f] = state.frames.splice(from, 1); state.frames.splice(to, 0, f); state.current = to; },
       undo: () => { const [f] = state.frames.splice(to, 1); state.frames.splice(from, 0, f); state.current = from; },
@@ -257,6 +270,7 @@
       do: () => { f.strokes = []; },
       undo: () => { f.strokes = old; },
     });
+    selection.clear();
     toast("Frame cleared");
   }
 
@@ -276,6 +290,7 @@
 
   function reverseFrames() {
     if (state.frames.length < 2) return;
+    selection.clear();
     const n = state.frames.length;
     // reverse() is its own inverse, so do === undo
     const flip = () => { state.frames.reverse(); state.current = n - 1 - state.current; };
@@ -458,6 +473,382 @@
     return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
   }
 
+  // ---- Selection ----
+  // World-space AABB of a single stroke, accounting for its (possibly per-point
+  // tapered) width so the box visually encloses the painted ribbon.
+  function strokeBounds(s) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const ws = s.widths;
+    for (let i = 0; i < s.points.length; i++) {
+      const p = s.points[i];
+      const hw = (ws && ws[i] != null ? ws[i] : s.width) / 2;
+      if (p.x - hw < minX) minX = p.x - hw;
+      if (p.y - hw < minY) minY = p.y - hw;
+      if (p.x + hw > maxX) maxX = p.x + hw;
+      if (p.y + hw > maxY) maxY = p.y + hw;
+    }
+    if (minX === Infinity) return null;
+    return { minX, minY, maxX, maxY };
+  }
+  function selectionBounds() {
+    let b = null;
+    for (const s of frame().strokes) {
+      if (!selection.has(s.id)) continue;
+      const sb = strokeBounds(s);
+      if (!sb) continue;
+      if (!b) b = { minX: sb.minX, minY: sb.minY, maxX: sb.maxX, maxY: sb.maxY };
+      else {
+        b.minX = Math.min(b.minX, sb.minX); b.minY = Math.min(b.minY, sb.minY);
+        b.maxX = Math.max(b.maxX, sb.maxX); b.maxY = Math.max(b.maxY, sb.maxY);
+      }
+    }
+    return b;
+  }
+  function selectionCenter() {
+    const b = selectionBounds();
+    return b ? { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 } : { x: 0, y: 0 };
+  }
+  function rectFromWorld(a, b) {
+    return { minX: Math.min(a.x, b.x), minY: Math.min(a.y, b.y), maxX: Math.max(a.x, b.x), maxY: Math.max(a.y, b.y) };
+  }
+  function rectContains(outer, inner) {
+    return inner.minX >= outer.minX && inner.maxX <= outer.maxX && inner.minY >= outer.minY && inner.maxY <= outer.maxY;
+  }
+  function rectsOverlap(r1, r2) {
+    return !(r2.minX > r1.maxX || r2.maxX < r1.minX || r2.minY > r1.maxY || r2.maxY < r1.minY);
+  }
+  function pointInRect(p, r) {
+    return p.x >= r.minX && p.x <= r.maxX && p.y >= r.minY && p.y <= r.maxY;
+  }
+  // Do two segments p1p2 and p3p4 cross? (standard orientation test)
+  function segsCross(p1, p2, p3, p4) {
+    const d = (a, b, c) => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    const d1 = d(p3, p4, p1), d2 = d(p3, p4, p2), d3 = d(p1, p2, p3), d4 = d(p1, p2, p4);
+    return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+  }
+  // Crossing test: does any part of the stroke touch the rect? Broad phase is
+  // the AABB overlap; narrow phase checks vertices-inside then segment crossings.
+  function strokeIntersectsRect(s, rect) {
+    const b = strokeBounds(s);
+    if (!b || !rectsOverlap(rect, b)) return false;
+    for (const p of s.points) if (pointInRect(p, rect)) return true;
+    // Shapes are defined by their bounding box; an AABB overlap already counts.
+    if (s.type === "rect" || s.type === "ellipse") return true;
+    const corners = [
+      { x: rect.minX, y: rect.minY }, { x: rect.maxX, y: rect.minY },
+      { x: rect.maxX, y: rect.maxY }, { x: rect.minX, y: rect.maxY },
+    ];
+    for (let i = 1; i < s.points.length; i++) {
+      const a = s.points[i - 1], c = s.points[i];
+      for (let e = 0; e < 4; e++) if (segsCross(a, c, corners[e], corners[(e + 1) % 4])) return true;
+    }
+    return false;
+  }
+  // Ids of strokes selected by a marquee. mode 'contain' = fully enclosed
+  // (window); mode 'crossing' = merely touched.
+  function strokesInRect(rect, mode) {
+    const ids = [];
+    for (const s of frame().strokes) {
+      const b = strokeBounds(s);
+      if (!b) continue;
+      const hit = mode === "crossing" ? strokeIntersectsRect(s, rect) : rectContains(rect, b);
+      if (hit) ids.push(s.id);
+    }
+    return ids;
+  }
+  function selectInRect(rect, mode, additive) {
+    const ids = strokesInRect(rect, mode || "contain");
+    if (!additive) selection.clear();
+    for (const id of ids) selection.add(id);
+    afterSelectionChange();
+    return selection.size;
+  }
+  // Topmost stroke under a world point (for click-to-select), or null.
+  function pickStrokeAt(w) {
+    const f = frame();
+    for (let i = f.strokes.length - 1; i >= 0; i--) {
+      const s = f.strokes[i];
+      if (strokeHit(s, w, s.width / 2 + CONFIG.SELECT_SLACK / state.scale)) return s;
+    }
+    return null;
+  }
+  function selectAll() {
+    selection.clear();
+    for (const s of frame().strokes) selection.add(s.id);
+    afterSelectionChange();
+    return selection.size;
+  }
+  function clearSelection() {
+    if (!selection.size) return;
+    selection.clear();
+    afterSelectionChange();
+  }
+  function selectIds(ids) {
+    selection.clear();
+    for (const id of ids) selection.add(id);
+    afterSelectionChange();
+    return selection.size;
+  }
+  function afterSelectionChange() { render(); }
+
+  // Snapshot/restore the geometry of the current selection so a move/scale can
+  // be applied live and then committed as one undoable do/undo step.
+  function snapshotSelection() {
+    const snap = [];
+    for (const s of frame().strokes) {
+      if (!selection.has(s.id)) continue;
+      snap.push({
+        s,
+        width: s.width,
+        widths: s.widths ? s.widths.slice() : null,
+        points: s.points.map((p) => ({ x: p.x, y: p.y })),
+      });
+    }
+    return snap;
+  }
+  function restoreSnapshot(snap) {
+    for (const e of snap) {
+      e.s.points = e.points.map((p) => ({ x: p.x, y: p.y }));
+      e.s.width = e.width;
+      if (e.widths) e.s.widths = e.widths.slice();
+      else delete e.s.widths;
+    }
+  }
+  function snapsDiffer(a, b) {
+    for (let i = 0; i < a.length; i++) {
+      if (Math.abs(a[i].width - b[i].width) > 1e-9) return true;
+      const pa = a[i].points, pb = b[i].points;
+      for (let j = 0; j < pa.length; j++) {
+        if (Math.abs(pa[j].x - pb[j].x) > 1e-9 || Math.abs(pa[j].y - pb[j].y) > 1e-9) return true;
+      }
+    }
+    return false;
+  }
+  // Apply a translation to the live strokes, recomputed from `snap` (the geometry
+  // at gesture start) each call so dragging never accumulates rounding drift.
+  function applyMoveFromSnap(snap, dx, dy) {
+    for (const e of snap) {
+      for (let i = 0; i < e.points.length; i++) {
+        e.s.points[i].x = e.points[i].x + dx;
+        e.s.points[i].y = e.points[i].y + dy;
+      }
+    }
+  }
+  // Scale about a world pivot. Widths (scalar + per-point taper) scale by the
+  // geometric mean of the axis factors so tapered strokes keep their proportions.
+  function applyScaleFromSnap(snap, fx, fy, pivot) {
+    const wf = Math.sqrt(Math.abs(fx * fy)) || 1;
+    for (const e of snap) {
+      for (let i = 0; i < e.points.length; i++) {
+        e.s.points[i].x = pivot.x + (e.points[i].x - pivot.x) * fx;
+        e.s.points[i].y = pivot.y + (e.points[i].y - pivot.y) * fy;
+      }
+      e.s.width = e.width * wf;
+      if (e.widths) for (let i = 0; i < e.widths.length; i++) e.s.widths[i] = e.widths[i] * wf;
+    }
+  }
+
+  // Public, undoable transforms (used by the API + keyboard; the pointer drag
+  // builds the same do/undo step directly from its live snapshot).
+  function moveSelection(dx, dy) {
+    if (!selection.size) return 0;
+    const orig = snapshotSelection();
+    applyMoveFromSnap(orig, dx, dy);
+    const final = snapshotSelection();
+    commit({ do: () => restoreSnapshot(final), undo: () => restoreSnapshot(orig) });
+    return selection.size;
+  }
+  function scaleSelection(fx, fy, pivot) {
+    if (!selection.size) return 0;
+    pivot = pivot || selectionCenter();
+    const orig = snapshotSelection();
+    applyScaleFromSnap(orig, fx, fy, pivot);
+    const final = snapshotSelection();
+    commit({ do: () => restoreSnapshot(final), undo: () => restoreSnapshot(orig) });
+    return selection.size;
+  }
+  // Clone the selected strokes (fresh ids, offset a touch so the copy is
+  // visible) and leave the clones selected. cloneStroke already deep-copies
+  // points + the per-point taper widths.
+  function duplicateSelection() {
+    if (!selection.size) return 0;
+    const f = frame();
+    const clones = [];
+    for (const s of f.strokes) if (selection.has(s.id)) clones.push(cloneStroke(s));
+    if (!clones.length) return 0;
+    const off = 12 / state.scale;
+    for (const c of clones) for (const p of c.points) { p.x += off; p.y += off; }
+    commit({
+      do: () => { for (const c of clones) f.strokes.push(c); },
+      undo: () => { for (const c of clones) { const i = f.strokes.indexOf(c); if (i >= 0) f.strokes.splice(i, 1); } },
+    });
+    selection.clear();
+    for (const c of clones) selection.add(c.id);
+    afterSelectionChange();
+    return clones.length;
+  }
+  // Nudge the selection by a screen-pixel amount (kept constant on-screen across
+  // zoom levels by dividing through the current scale).
+  function nudgeSelection(dxScreen, dyScreen) {
+    if (!selection.size) return 0;
+    return moveSelection(dxScreen / state.scale, dyScreen / state.scale);
+  }
+  function deleteSelection() {
+    if (!selection.size) return 0;
+    const f = frame();
+    const removed = [];
+    for (let i = 0; i < f.strokes.length; i++) {
+      if (selection.has(f.strokes[i].id)) removed.push({ index: i, stroke: f.strokes[i] });
+    }
+    if (!removed.length) return 0;
+    commit({
+      do: () => { for (let k = removed.length - 1; k >= 0; k--) f.strokes.splice(removed[k].index, 1); },
+      undo: () => { for (const r of removed) f.strokes.splice(r.index, 0, r.stroke); },
+    });
+    for (const r of removed) selection.delete(r.stroke.id);
+    afterSelectionChange();
+    return removed.length;
+  }
+
+  // The 8 resize handles, as normalized anchors on the selection bbox.
+  const HANDLES = [
+    { ax: 0, ay: 0 }, { ax: 0.5, ay: 0 }, { ax: 1, ay: 0 },
+    { ax: 1, ay: 0.5 }, { ax: 1, ay: 1 }, { ax: 0.5, ay: 1 },
+    { ax: 0, ay: 1 }, { ax: 0, ay: 0.5 },
+  ];
+  function handleScreenPositions() {
+    const b = selectionBounds();
+    if (!b) return [];
+    const tl = worldToScreen(b.minX, b.minY), br = worldToScreen(b.maxX, b.maxY);
+    const x0 = Math.min(tl.x, br.x), x1 = Math.max(tl.x, br.x);
+    const y0 = Math.min(tl.y, br.y), y1 = Math.max(tl.y, br.y);
+    return HANDLES.map((h) => ({ h, x: x0 + (x1 - x0) * h.ax, y: y0 + (y1 - y0) * h.ay }));
+  }
+  function handleAt(sp) {
+    for (const hp of handleScreenPositions()) {
+      if (Math.abs(sp.x - hp.x) <= CONFIG.HANDLE_HIT && Math.abs(sp.y - hp.y) <= CONFIG.HANDLE_HIT) return hp;
+    }
+    return null;
+  }
+
+  // ---- Selection pointer gestures ----
+  function selPointerDown(sp, w, e) {
+    const additive = e.shiftKey;
+    // 1) grab a resize handle?
+    if (selection.size) {
+      const hp = handleAt(sp);
+      if (hp) {
+        const b = selectionBounds();
+        const pivot = {
+          x: b.minX + (b.maxX - b.minX) * (1 - hp.h.ax),
+          y: b.minY + (b.maxY - b.minY) * (1 - hp.h.ay),
+        };
+        selDrag = { mode: "scale", handle: hp.h, startBounds: b, pivot, snap: snapshotSelection() };
+        return;
+      }
+    }
+    const hit = pickStrokeAt(w);
+    // 2) drag inside the existing selection → move it
+    if (selection.size && !additive) {
+      const b = selectionBounds();
+      const inside = b && pointInRect(w, b);
+      if ((hit && selection.has(hit.id)) || inside) {
+        selDrag = { mode: "move", startWorld: w, snap: snapshotSelection() };
+        return;
+      }
+    }
+    // 3) clicked a stroke → (re)select it, then start a move
+    if (hit) {
+      if (additive) { if (selection.has(hit.id)) selection.delete(hit.id); else selection.add(hit.id); }
+      else { selection.clear(); selection.add(hit.id); }
+      afterSelectionChange();
+      selDrag = { mode: "move", startWorld: w, snap: snapshotSelection() };
+      return;
+    }
+    // 4) empty space → marquee
+    if (!additive) selection.clear();
+    selDrag = { mode: "marquee", startWorld: w, rect: rectFromWorld(w, w), modeSel: "contain", additive, baseSel: new Set(selection) };
+    afterSelectionChange();
+  }
+  function selPointerMove(sp, w) {
+    if (!selDrag) return;
+    if (selDrag.mode === "move") {
+      applyMoveFromSnap(selDrag.snap, w.x - selDrag.startWorld.x, w.y - selDrag.startWorld.y);
+      render();
+    } else if (selDrag.mode === "scale") {
+      const b = selDrag.startBounds, h = selDrag.handle, pivot = selDrag.pivot;
+      let fx = 1, fy = 1;
+      if (h.ax !== 0.5) {
+        const old = Math.abs((b.minX + (b.maxX - b.minX) * h.ax) - pivot.x);
+        fx = old > 1e-9 ? Math.abs(w.x - pivot.x) / old : 1;
+      }
+      if (h.ay !== 0.5) {
+        const old = Math.abs((b.minY + (b.maxY - b.minY) * h.ay) - pivot.y);
+        fy = old > 1e-9 ? Math.abs(w.y - pivot.y) / old : 1;
+      }
+      applyScaleFromSnap(selDrag.snap, Math.max(0.02, fx), Math.max(0.02, fy), pivot);
+      render();
+    } else if (selDrag.mode === "marquee") {
+      selDrag.rect = rectFromWorld(selDrag.startWorld, w);
+      // CAD convention: drag right→left = crossing (touch), left→right = window.
+      selDrag.modeSel = w.x < selDrag.startWorld.x ? "crossing" : "contain";
+      const ids = strokesInRect(selDrag.rect, selDrag.modeSel);
+      selection.clear();
+      if (selDrag.additive) for (const id of selDrag.baseSel) selection.add(id);
+      for (const id of ids) selection.add(id);
+      render();
+    }
+  }
+  function selPointerUp() {
+    const d = selDrag;
+    selDrag = null;
+    if (!d) return;
+    if (d.mode === "move" || d.mode === "scale") {
+      const final = snapshotSelection();
+      if (snapsDiffer(d.snap, final)) {
+        commit({ do: () => restoreSnapshot(final), undo: () => restoreSnapshot(d.snap) });
+      } else {
+        restoreSnapshot(d.snap); // a no-op drag (e.g. a plain click) — don't pollute history
+        render();
+      }
+    } else if (d.mode === "marquee") {
+      afterSelectionChange();
+      if (selection.size) toast(`${selection.size} selected${d.modeSel === "crossing" ? " · crossing" : ""}`);
+    }
+  }
+  function drawSelectionOverlay(c) {
+    if (selDrag && selDrag.mode === "marquee") {
+      const r = selDrag.rect;
+      const tl = worldToScreen(r.minX, r.minY), br = worldToScreen(r.maxX, r.maxY);
+      const x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+      const w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+      c.save();
+      c.lineWidth = 1;
+      if (selDrag.modeSel === "crossing") {
+        c.strokeStyle = "rgba(124,252,138,0.95)"; c.fillStyle = "rgba(124,252,138,0.08)"; c.setLineDash([5, 4]);
+      } else {
+        c.strokeStyle = "rgba(52,210,255,0.95)"; c.fillStyle = "rgba(52,210,255,0.08)"; c.setLineDash([]);
+      }
+      c.fillRect(x, y, w, h); c.strokeRect(x, y, w, h);
+      c.restore();
+    }
+    const b = selectionBounds();
+    if (!b) return;
+    const tl = worldToScreen(b.minX, b.minY), br = worldToScreen(b.maxX, b.maxY);
+    const x0 = Math.min(tl.x, br.x), x1 = Math.max(tl.x, br.x), y0 = Math.min(tl.y, br.y), y1 = Math.max(tl.y, br.y);
+    c.save();
+    c.strokeStyle = "rgba(52,210,255,0.95)"; c.lineWidth = 1.25; c.setLineDash([4, 3]);
+    c.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    c.setLineDash([]);
+    c.fillStyle = "#0d0f15";
+    const hs = CONFIG.HANDLE_SIZE;
+    for (const hp of handleScreenPositions()) {
+      c.fillRect(hp.x - hs / 2, hp.y - hs / 2, hs, hs);
+      c.strokeRect(hp.x - hs / 2, hp.y - hs / 2, hs, hs);
+    }
+    c.restore();
+  }
+
   // ---- Rendering ----
   function cssW() { return canvas.clientWidth || window.innerWidth; }
   function cssH() { return canvas.clientHeight || window.innerHeight; }
@@ -623,6 +1014,8 @@
 
     for (const s of frame().strokes) drawStroke(ctx, s, 1);
     if (drawing) drawStroke(ctx, drawing, 0.9);
+
+    if (state.tool === "select" && !state.playing) drawSelectionOverlay(ctx);
 
     renderMinimap();
   }
@@ -807,6 +1200,7 @@
     if (typeof s.loop === "boolean") state.loop = s.loop;
     if (typeof s.pingpong === "boolean") state.pingpong = s.pingpong;
     undoStack.length = 0; redoStack.length = 0;
+    selection.clear();
     syncControls();
     render();
     updateFrameUI();
@@ -852,6 +1246,8 @@
     state.tool = t;
     document.querySelectorAll(".tool").forEach((b) => b.classList.toggle("active", b.dataset.tool === t));
     canvas.classList.toggle("panning", t === "pan");
+    canvas.classList.toggle("selecting", t === "select");
+    render(); // show/hide the selection overlay immediately
     scheduleSave();
   }
   function setColor(c) {
@@ -1054,6 +1450,10 @@
       return;
     }
     const w = screenToWorld(sp.x, sp.y);
+    if (state.tool === "select") {
+      selPointerDown(sp, w, e);
+      return;
+    }
     if (state.tool === "eyedropper") {
       const c = pickColorAt(w);
       toast(c ? "Picked " + c : "Nothing to pick");
@@ -1074,6 +1474,7 @@
       panState.lastScreen = sp;
       return;
     }
+    if (selDrag) { selPointerMove(sp, screenToWorld(sp.x, sp.y)); return; }
     if (!drawing) return;
     const w = screenToWorld(sp.x, sp.y);
     if (drawing._erasing) { eraseAt(w); return; }
@@ -1086,6 +1487,7 @@
       canvas.classList.remove("active");
       return;
     }
+    if (selDrag) { selPointerUp(); return; }
     if (drawing && drawing._erasing) { drawing = null; return; }
     if (drawing) endStroke();
   }
@@ -1112,6 +1514,35 @@
     if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); if (save()) toast("Saved"); return; }
     if (mod && e.key.toLowerCase() === "c") { e.preventDefault(); copyFrame(); return; }
     if (mod && e.key.toLowerCase() === "v") { e.preventDefault(); pasteFrame(); return; }
+    if (mod && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      setTool("select");
+      const n = selectAll();
+      toast(n ? `${n} selected` : "Nothing to select");
+      return;
+    }
+    if (mod && e.key.toLowerCase() === "j" && state.tool === "select" && selection.size) {
+      e.preventDefault();
+      const n = duplicateSelection();
+      if (n) toast(`Duplicated ${n}`);
+      return;
+    }
+    if (state.tool === "select" && selection.size && e.key.indexOf("Arrow") === 0) {
+      e.preventDefault();
+      const step = e.shiftKey ? 10 : 1; // on-screen px per press (×10 with Shift)
+      if (e.key === "ArrowLeft") nudgeSelection(-step, 0);
+      else if (e.key === "ArrowRight") nudgeSelection(step, 0);
+      else if (e.key === "ArrowUp") nudgeSelection(0, -step);
+      else if (e.key === "ArrowDown") nudgeSelection(0, step);
+      return;
+    }
+    if ((e.key === "Delete" || e.key === "Backspace") && state.tool === "select" && selection.size) {
+      e.preventDefault();
+      const n = deleteSelection();
+      toast(`${n} deleted`);
+      return;
+    }
+    if (e.key === "Escape" && selection.size) { clearSelection(); toast("Selection cleared"); return; }
     if (e.key === " ") { spaceHeld = true; canvas.classList.add("panning"); return; }
 
     switch (e.key.toLowerCase()) {
@@ -1121,6 +1552,7 @@
       case "o": setTool("ellipse"); break;
       case "e": setTool("eraser"); break;
       case "i": setTool("eyedropper"); break;
+      case "v": setTool("select"); break;
       case "h": setTool("pan"); break;
       case "g": state.grid = !state.grid; render(); scheduleSave(); break;
       case "t": setTaper(!state.taper); toast(state.taper ? "Velocity taper on" : "Velocity taper off"); break;
@@ -1350,6 +1782,15 @@
     setTaperAmount, getTaperAmount: () => state.taperAmount,
     strokeWorldWidth, strokeScreenWidth,
     beginStroke, extendStroke, endStroke, addStroke, eraseAt, pickColorAt,
+    // selection
+    selectInRect: (rect, mode, additive) => selectInRect(rect, mode, additive),
+    selectAll, clearSelection, selectIds, deleteSelection, moveSelection, scaleSelection,
+    duplicateSelection, nudgeSelection,
+    getSelection: () => Array.from(selection),
+    selectionSize: () => selection.size,
+    isSelected: (id) => selection.has(id),
+    selectionBounds, strokeBounds,
+    pickStrokeAt,
     // convenience: draw a full stroke through a list of world points
     drawPath(points, opts) {
       opts = opts || {};

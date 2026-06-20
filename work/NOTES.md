@@ -75,16 +75,51 @@ things, both done:
     `cloneStroke`, `copyFrame`/`pasteFrame`, `serialize`/`applyData`, and the
     dot-completion path in `endStroke`. `widthsVary()` drops a flat array so a
     constant-speed stroke doesn't store a redundant per-point list.
+- **Selection** (tool `select`, key `V`): a module-level `Set` of stroke `id`s,
+  `selection`, scoped to the current frame and *not* serialized. The whole
+  feature lives in the `// ---- Selection ----` section of `app.js`.
+  - Hit-testing is per-stroke AABB: `strokeBounds(s)` (uses per-point `widths`
+    when tapered), `selectionBounds()` (union over the set). `strokesInRect`
+    drives the marquee — `contain` mode = `rectContains` (window), `crossing`
+    mode = `strokeIntersectsRect` (broad-phase AABB overlap → narrow-phase
+    vertex-in-rect / segment-edge crossing, so a line that *spans* the box with
+    no endpoint inside is still caught).
+  - **Directional marquee** (CAD convention): `selPointerMove` sets `modeSel` =
+    `crossing` when dragging right→left (`w.x < startWorld.x`), else `contain`.
+    The overlay draws crossing as a dashed green box, window as a solid blue box.
+  - **Transforms** snapshot the selection's geometry at gesture start
+    (`snapshotSelection`) and recompute live from that snapshot each move
+    (`applyMoveFromSnap` / `applyScaleFromSnap`) so dragging never accumulates
+    drift. On pointer-up, if `snapsDiffer`, one `commit({do,undo})` is pushed
+    (do = restore the final snapshot, undo = restore the original); a no-op drag
+    (a plain click) restores and pushes nothing, keeping history clean. The
+    public `moveSelection`/`scaleSelection`/`deleteSelection` build the same
+    do/undo step, so the API and the pointer drag share one undo path.
+  - **Scale** is about a pivot = the *opposite* bbox anchor of the grabbed
+    handle. `s.width` and every `s.widths[i]` scale by the geometric mean
+    `sqrt(|fx*fy|)` so tapered strokes keep their proportions and re-clamp at
+    render via `MIN_RENDER_WIDTH`.
+  - Overlay (`drawSelectionOverlay`) draws in screen space in `doRender`, only
+    when `tool==='select' && !playing`, so minimap/thumbnails/export are
+    untouched. 8 handles (`HANDLES`); grab tolerance `HANDLE_HIT` (11px) is
+    deliberately bigger than the drawn `HANDLE_SIZE` (8px).
+  - `duplicateSelection` (`Ctrl/⌘+J`) clones via `cloneStroke` (fresh ids +
+    taper widths), offsets 12 on-screen px, and re-selects the clones.
+    `nudgeSelection` (arrow keys, ×10 with Shift) moves by on-screen px /scale,
+    each press a separate undo step. Both go through `commit`/`moveSelection`.
 
 ## Test status
-- **78 tests, all green** as of this writing. Run `node test/run.cjs` (or
+- **100 tests, all green** as of this writing. Run `node test/run.cjs` (or
   `npm test`); subset with `node test/run.cjs <substring>`.
 - Suites: camera, drawing, frames, persistence, e2e, export (GIF/PNG/JSON),
   view (grid/fit/deep-zoom), features (opacity/eyedropper/bg/pingpong),
   editing (smoothing/reverse/copy-paste), hold (per-frame duration),
-  minimap (region/navigate/render/toggle), taper (velocity width).
+  minimap (region/navigate/render/toggle), taper (velocity width),
+  selection (marquee/window/crossing/move/scale/delete/duplicate/nudge/keys,
+  +real-pointer e2e).
 - Dev tools (not run by the suite): `test/_debug.cjs` (boot/error check),
-  `test/_shot.cjs` (writes `screenshot.png`).
+  `test/_shot.cjs` (writes `screenshot.png`), `test/_shot_select.cjs` (writes
+  `selection_demo.png` + `crossing_marquee.png`).
 
 ## Done since first pass
 - Brush opacity (per-stroke alpha), eyedropper tool (`I`), background colour.
@@ -99,6 +134,10 @@ things, both done:
 - **Velocity taper** (toggle `T` + "Taper amt" slider): pen strokes vary width
   with drawing speed — fast = thin, slow = thick (organic ink/calligraphy look).
   See "Velocity taper" under Architecture below. Demo image: `taper_demo.png`.
+- **Selection tool** (`V`): marquee-select, move, scale, delete. AutoCAD-style
+  directional marquee (left→right window / right→left crossing). See
+  "Selection tool" under Architecture below. Demos: `selection_demo.png`,
+  `crossing_marquee.png`.
 - All settings + stroke alpha + frame holds + per-point taper widths persist
   through save/load and JSON export/import.
 
@@ -107,8 +146,9 @@ things, both done:
 - [x] ~~Copy/paste strokes~~ / ~~background color~~ / ~~ping-pong~~ (done)
 - [x] ~~Pressure/velocity-based width (taper) for pen~~ (done — speed→width
       ribbon, `T` toggle + "Taper amt" slider, `test/taper.test.cjs`).
-- [ ] Selection tool: marquee-select strokes, move/scale/delete the selection.
-      (Companion + I agreed this is the natural next big feature.)
+- [x] ~~Selection tool: marquee-select strokes, move/scale/delete~~ (done —
+      `V` tool, AutoCAD-style window/crossing marquee, move/scale/delete, all
+      undoable; `test/selection.test.cjs`). See "Selection tool" in Architecture.
 - [ ] Fill tool / closed-shape fill (flood fill in screen space, or shape fill).
 - [ ] Layers within a frame (array of layers, each a stroke list + visibility).
 - [x] ~~Per-frame hold/duration~~ (done — hold control + GIF per-frame delays)
@@ -121,32 +161,32 @@ things, both done:
 - [ ] Tests still wanted: thumbnail rendering correctness, drag-reorder via real
       DnD events, stress test (thousands of strokes), eraser on shapes.
 
-## Next up: selection tool (planned next feature)
-The clear next big feature. Design notes (mine + the companion's), tuned to this
-codebase:
-- **Hit-test reuse:** `strokeHit(s, p, r)` already does point-near-stroke; for a
-  marquee use rect-vs-stroke. Cache a per-stroke AABB (compute on create /
-  transform) instead of scanning every point on each mousemove — `contentBounds`
-  shows the min/max math to reuse. Strokes have stable `id`s; track a
-  `selection` Set of ids.
-- **Contain vs intersect:** decide select-on-contain vs select-on-touch (gold
-  standard: fully-contained selects; make the marquee visual show the mode).
-- **Transforms around a single pivot:** move = offset all points by Δ in world
-  space; scale/rotate must use ONE shared pivot = centre of the selection's
-  combined bbox, or strokes drift apart. Mutate through `commit({do,undo})` so
-  it's undoable (the command stack already keeps removed strokes alive in the
-  undo closure — that covers the "tombstone" concern for delete).
-- **Taper preservation:** when scaling, also scale `s.width` AND every entry in
-  `s.widths` by the same factor (and they'll re-clamp at render via
-  MIN_RENDER_WIDTH), so tapered strokes keep their proportions.
-- **Keep both render paths + minimap/thumbs working;** selection overlay (handles
-  + marquee) should draw in screen space in `doRender` after strokes, and be
-  skipped during playback/export.
-- Expose everything on `window.App` (e.g. `selectInRect`, `moveSelection`,
-  `scaleSelection`, `deleteSelection`, `clearSelection`) and add a `selection`
-  test suite, same as every other feature.
+## Next up (pick one — selection just shipped)
+The selection tool is done; the natural follow-ons, roughly in order of bang for
+buck:
+- **Selection enhancements** (small, build on what's there): duplicate
+  (`Ctrl/⌘+J`) and arrow-key nudge are *done*; still open — make `Ctrl/⌘+C`/`V`
+  copy *just the selection* when one exists (currently whole-frame), a rotate
+  handle, and flip H/V. All reuse `snapshotSelection`/`commit`.
+- **Layers within a frame** (bigger): `frame.layers = [{strokes, visible, name}]`;
+  touches render, thumbnails, persistence, and selection (which layer owns the
+  id). The most invasive but most requested for "real" animation work.
+- **Fill tool / closed-shape fill**, **light-table scrubber**, **transparent
+  PNG/GIF export** — all self-contained, any is a clean single-spawn feature.
+My pick if you want momentum: the selection enhancements (duplicate + nudge +
+selection-aware copy/paste) — an hour of work, big usability win, all the
+plumbing already exists.
 
 ## Watch-outs for next-you
+- **Selection is per-frame and not serialized.** It's a `Set` of stroke ids
+  cleared on every frame switch / add / dup / del / move / reverse / load. If you
+  add another op that swaps which frame is "current", clear `selection` too (or
+  the overlay shows a stale box). The overlay only draws when `tool==='select'`.
+- **A very thin selection bbox** (e.g. a single near-horizontal line) has its
+  edge handles' 11px hit-areas overlapping the interior, so a center-click grabs
+  a handle (scale) instead of moving. Handles intentionally win (precise targets,
+  standard in Figma/Illustrator); for a thin shape just marquee to move. Tests
+  that drag-to-move use a non-degenerate box for this reason.
 - Keep colours lowercase (`setColor` normalises). Color `<input>` emits
   lowercase; tests compare exact strings.
 - The grid draws an origin crosshair at world (0,0) = screen centre. Pixel tests
