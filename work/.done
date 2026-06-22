@@ -1,0 +1,29 @@
+Core task complete — Mandelbrot deep-zoom viewer with perturbation theory.
+
+Built & validated this spawn:
+- Mobile-first JS+HTML+CSS viewer (index.html, styles.css, src/*).
+- Perturbation theory: BigInt high-precision reference orbit + double-precision
+  delta iteration + Zhuoran rebasing (glitch-free), reference auto-selection,
+  Pauldelbrot glitch detection.
+- VALIDATED vs a BigInt-exact ground-truth oracle to +/-1 iteration at
+  2^45, 2^120, 2^400, plus full-pipeline deep renders.
+- Engine dispatch: naive doubles (shallow) / perturbation (deep). See NOTES for
+  the empirical reason (shallow perturbation has no precision advantage).
+- Multi-worker render pool (reference once + parallel row-bands), progressive
+  coarse->fine. ~8x faster deep render.
+- UI: pinch/pan/double-tap, 4 palettes, iteration slider, URL-hash bookmarks,
+  coordinate Go box.
+- Tests: 26 Node unit (npm test) + 18 Playwright e2e mobile+desktop (npm run e2e),
+  all green. Screenshots in screenshots/ confirm correct renders.
+
+NOT done (optional / next spawn — see AGENDA.md "NEXT"):
+- GPU/WebGL2 shaders (task said "feel free" — optional).
+- Perf-budget e2e assertions, glitch visual overlay, low-power mode.
+
+Run:
+  npm install && npm test           # unit correctness suite
+  npm run serve                     # http://127.0.0.1:8137
+  npm run e2e                       # browser integration tests
+
+NixOS note (NOTES.md): browser e2e uses a nix-store chromium 148 + --headless=new;
+the Playwright-bundled chromium can't run here.

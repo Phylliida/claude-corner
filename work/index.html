@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#000010" />
+  <title>Mandelbrot Deep Zoom</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <canvas id="view" aria-label="Mandelbrot view"></canvas>
+
+  <div id="hud" class="hud">
+    <div id="status" class="status" data-testid="status">starting…</div>
+    <div id="zoom" class="zoom" data-testid="zoom">2^0.0</div>
+  </div>
+
+  <button id="panelToggle" class="panel-toggle" aria-label="Toggle controls">☰</button>
+
+  <section id="panel" class="panel" data-testid="panel" aria-label="Controls">
+    <header class="panel-head">
+      <h1>Mandelbrot · deep zoom</h1>
+      <button id="panelClose" class="icon-btn" aria-label="Close">×</button>
+    </header>
+
+    <div class="row">
+      <button id="zoomIn" class="btn" data-testid="zoomIn">Zoom +</button>
+      <button id="zoomOut" class="btn" data-testid="zoomOut">Zoom −</button>
+      <button id="reset" class="btn" data-testid="reset">Reset</button>
+    </div>
+
+    <label class="field">
+      <span>Iterations <em id="iterVal">—</em></span>
+      <input id="iter" type="range" min="100" max="200000" step="100" data-testid="iter" />
+    </label>
+    <label class="check">
+      <input id="autoIter" type="checkbox" checked data-testid="autoIter" />
+      <span>Auto iterations (scale with depth)</span>
+    </label>
+
+    <label class="field">
+      <span>Palette</span>
+      <select id="palette" data-testid="palette">
+        <option value="ultra">Ultra</option>
+        <option value="fire">Fire</option>
+        <option value="rainbow">Rainbow</option>
+        <option value="gray">Gray</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Color cycle <em id="cycleVal"></em></span>
+      <input id="cycle" type="range" min="4" max="256" step="1" value="48" data-testid="cycle" />
+    </label>
+    <label class="field">
+      <span>Color shift</span>
+      <input id="shift" type="range" min="0" max="1" step="0.01" value="0" data-testid="shift" />
+    </label>
+
+    <fieldset class="coords">
+      <legend>Coordinates (high precision)</legend>
+      <label>Re <textarea id="reIn" rows="2" spellcheck="false" data-testid="reIn"></textarea></label>
+      <label>Im <textarea id="imIn" rows="2" spellcheck="false" data-testid="imIn"></textarea></label>
+      <label>Radius <input id="radIn" type="text" spellcheck="false" data-testid="radIn" /></label>
+      <div class="row">
+        <button id="goto" class="btn" data-testid="goto">Go</button>
+        <button id="copyLink" class="btn" data-testid="copyLink">Copy link</button>
+        <button id="save" class="btn" data-testid="save">Save PNG</button>
+      </div>
+    </fieldset>
+
+    <div class="row places">
+      <button class="btn place" data-cx="-0.5" data-cy="0" data-r="1.5">Home</button>
+      <button class="btn place" data-cx="-0.743643887037158704752191506114774" data-cy="0.131825904205311970493132056385139" data-r="5e-13">Seahorse</button>
+      <button class="btn place" data-cx="-0.7436438870371587" data-cy="0.13182590420531197" data-r="1e-7">Spiral</button>
+      <button class="btn place" data-cx="-1.749999999999999" data-cy="0" data-r="1e-12">Antenna</button>
+    </div>
+
+    <details class="about">
+      <summary>About / debug</summary>
+      <div id="debug" class="debug" data-testid="debug"></div>
+      <p class="tiny">Perturbation theory + Zhuoran rebasing. Naive doubles for
+      shallow zoom, high-precision reference orbit + double deltas for deep zoom
+      (validated vs a BigInt-exact oracle to 2^400).</p>
+    </details>
+  </section>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
