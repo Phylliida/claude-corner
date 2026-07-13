@@ -2085,7 +2085,7 @@ applyFont();
 updateLayoutUI();
 buildGrid();
 tick();
-setInterval(tick, 2000);
+setInterval(tick, 1000);   // poll every second (tickBusy guard prevents pile-up)
 </script>
 </body>
 </html>
