@@ -1891,41 +1891,51 @@ function setHideEdits(v) {
 }
 function toggleEdits() { setHideEdits(!hideEdits); }
 
-// Concise render of one event: the initial prompt (very first user message) is kept in
-// full; assistant turns keep text and reduce tool calls to their title (e.g. "▸ Bash"),
-// dropping thinking. File edits are the exception — when they're not being hidden they
-// keep their full diff (that's usually the thing you want to see). Everything else —
-// later user turns, tool results, thinking-only assistant turns — returns null (hidden).
-function renderConcise(ev, isFirstPrompt) {
-  if (ev.role !== 'assistant') {
-    if (!isFirstPrompt) return null;   // hide all user turns except the initial prompt
-    const parts = [];
-    for (const b of ev.blocks) {
-      if (b.type === 'text' && (b.text || '').trim()) parts.push(div('msg-text', b.text));
-    }
-    if (!parts.length) return null;
-    const wrap = document.createElement('div');
-    wrap.className = 'msg msg-user';
-    for (const p of parts) wrap.appendChild(p);
-    return wrap;
-  }
+function toolTitle(b) {   // a tool call reduced to its name, e.g. "▸ Bash"
+  const t = div('block-tool');
+  t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
+  return t;
+}
+function renderEditBanner(b) {   // a file edit collapsed to a banner: name + target, no diff
+  const inp = b.input || {};
+  const el = div('block-tool');
+  el.appendChild(div('block-tool-name', '▸ ' + (b.name || 'Edit')));
+  const path = inp.file_path || inp.notebook_path || '';
+  if (path) el.appendChild(div('tool-path', path));
+  return el;
+}
+
+// The active view's message renderer, honoring both toggles:
+//  - hide edits: file edits collapse to a banner (name + target, no diff) in either mode.
+//  - concise: keep the initial prompt + assistant text; reduce non-edit tool calls to a
+//    title; drop thinking, tool results, and other user turns. Full edits (with diff)
+//    still show unless hide-edits is on.
+// With both toggles off this matches the shared renderMessage.
+function renderActiveMessage(ev, isFirstPrompt) {
+  const assistant = ev.role === 'assistant';
   const parts = [];
   for (const b of ev.blocks) {
-    if (b.type === 'text') {
-      if ((b.text || '').trim()) parts.push(div('msg-text', b.text));
-    } else if (b.type === 'tool_use') {
-      if (isFileEdit(b)) {
-        parts.push(renderToolUse(b));   // keep the full edit + diff (hide-edits already removed it if on)
-      } else {
-        const t = div('block-tool');
-        t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
-        parts.push(t);
+    let node = null;
+    if (b.type === 'tool_use' && isFileEdit(b)) {
+      node = hideEdits ? renderEditBanner(b) : renderToolUse(b);
+    } else if (conciseMode) {
+      if (!assistant) {
+        if (isFirstPrompt && b.type === 'text' && (b.text || '').trim()) node = div('msg-text', b.text);
+      } else if (b.type === 'text') {
+        if ((b.text || '').trim()) node = div('msg-text', b.text);
+      } else if (b.type === 'tool_use') {
+        node = toolTitle(b);
       }
+      // thinking / tool_result → hidden in concise
+    } else {
+      node = renderBlock(b);   // full mode: normal rendering of every block
     }
+    if (node) parts.push(node);
   }
   if (!parts.length) return null;
   const wrap = document.createElement('div');
-  wrap.className = 'msg msg-assistant';
+  wrap.className = 'msg msg-' + ev.role;
+  if (!conciseMode) wrap.appendChild(div('msg-role', ev.role));   // role header only in full mode
   for (const p of parts) wrap.appendChild(p);
   return wrap;
 }
@@ -2018,14 +2028,7 @@ class Cell {
     }
     return -1;
   }
-  makeNode(ev, idx, fp) {   // returns a DOM node, or null to hide this event
-    if (hideEdits) {
-      const blocks = ev.blocks.filter(b => !isFileEdit(b));
-      if (blocks.length !== ev.blocks.length) ev = { role: ev.role, blocks };
-    }
-    if (!ev.blocks.length) return null;
-    return conciseMode ? renderConcise(ev, idx === fp) : renderMessage(ev);
-  }
+  makeNode(ev, idx, fp) { return renderActiveMessage(ev, idx === fp); }  // null = hide
   renderAll() {
     const fp = this.firstPromptIdx();
     const frag = document.createDocumentFragment();
