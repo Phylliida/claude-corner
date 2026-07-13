@@ -1778,7 +1778,7 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     /* Native virtualization: skip layout/paint of off-screen messages while keeping
        them in the DOM, so the scrollbar spans the whole session. `auto` remembers each
        message's real height once seen (falling back to ~3rem before first render). */
-    .active-cell-body > .msg { content-visibility: auto; contain-intrinsic-size: auto 3rem; }
+    .active-cell-content > .msg { content-visibility: auto; contain-intrinsic-size: auto 3rem; }
     .active-cell-empty { color: var(--fg-dim); font-style: italic; padding: 1.2rem; text-align: center; }
   </style>
 </head>
@@ -1817,8 +1817,6 @@ function loadCellLanes() {
 }
 function saveCellLanes() { localStorage.setItem('activeCells', JSON.stringify(cellLanes)); }
 
-function nearBottom(el, px) { return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 60); }
-
 // --- view settings (font size) ---
 let tsize = parseInt(localStorage.getItem('activeFont') || '14', 10) || 14;
 function applyFont() {
@@ -1854,10 +1852,11 @@ class Cell {
     this.lastMtime = -1;
     this.sel = root.querySelector('select');
     this.body = root.querySelector('.active-cell-body');
+    this.content = root.querySelector('.active-cell-content');
     this.meta = root.querySelector('.active-cell-meta');
     this.live = root.querySelector('.active-cell-live');
     this.pin = root.querySelector('.active-pin');
-    this.pinned = true;   // follow newest output by default
+    this.pinned = true;   // follow newest output by default; only the button changes it
     this.sel.addEventListener('change', () => {
       this.laneId = this.sel.value || null;
       cellLanes[this.idx] = this.sel.value;
@@ -1866,11 +1865,11 @@ class Cell {
       tick();
     });
     this.pin.addEventListener('click', () => this.setPinned(!this.pinned));
-    // Scrolling up (away from the bottom) unpins; our own scroll-to-bottom lands at
-    // the bottom, so it never trips this.
-    this.body.addEventListener('scroll', () => {
-      if (this.pinned && !nearBottom(this.body, 40)) this.setPinned(false);
-    });
+    // While pinned, keep glued to the bottom whenever the content height changes —
+    // covers new messages, reflow, and content-visibility correcting a tall message's
+    // height after render (which is what left it short of the bottom before).
+    this.ro = new ResizeObserver(() => { if (this.pinned) this.scrollBottom(); });
+    this.ro.observe(this.content);
     this.updatePinUI();
     this.reset();
   }
@@ -1885,13 +1884,12 @@ class Cell {
   }
   reset() {
     this.sessionKey = null; this.events = []; this.lastMtime = -1;
-    this.body.innerHTML = '';
     this.setEmpty(this.laneId ? 'waiting for a session…' : 'pick a task above');
   }
   setEmpty(msg) {
-    this.body.innerHTML = '<div class="active-cell-empty">' + msg + '</div>';
+    this.content.innerHTML = '<div class="active-cell-empty">' + msg + '</div>';
   }
-  clearEmpty() { const e = this.body.querySelector('.active-cell-empty'); if (e) e.remove(); }
+  clearEmpty() { const e = this.content.querySelector('.active-cell-empty'); if (e) e.remove(); }
   scrollBottom() { this.body.scrollTop = this.body.scrollHeight; }
 
   // Fresh events for the current session (append-only) or a brand-new session. Every
@@ -1904,9 +1902,9 @@ class Cell {
       this.events = events;
       const frag = document.createDocumentFragment();
       for (const ev of events) frag.appendChild(renderMessage(ev));
-      this.body.innerHTML = '';
-      this.body.appendChild(frag);
-      this.scrollBottom();
+      this.content.innerHTML = '';
+      this.content.appendChild(frag);
+      this.scrollBottom();   // ResizeObserver keeps it pinned as heights settle
       return;
     }
     if (events.length <= this.events.length) { this.events = events; return; }
@@ -1914,12 +1912,8 @@ class Cell {
     for (let i = this.events.length; i < events.length; i++) frag.appendChild(renderMessage(events[i]));
     this.events = events;
     this.clearEmpty();
-    this.body.appendChild(frag);
-    if (this.pinned) {
-      this.scrollBottom();
-      // re-pin after layout settles (content-visibility corrects off-screen heights)
-      requestAnimationFrame(() => { if (this.pinned) this.scrollBottom(); });
-    }
+    this.content.appendChild(frag);
+    if (this.pinned) this.scrollBottom();   // ResizeObserver re-pins after layout settles
   }
 
   setMeta(rec, running) {
@@ -1964,7 +1958,7 @@ function buildGrid() {
       + '<span class="active-cell-live"></span>'
       + '<button class="active-pin" title="pin to newest — auto-scroll as new output arrives"></button>'
       + '</div>'
-      + '<div class="active-cell-body"></div>';
+      + '<div class="active-cell-body"><div class="active-cell-content"></div></div>';
     grid.appendChild(cell);
     cells.push(new Cell(i, cell));
   }
