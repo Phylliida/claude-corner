@@ -1891,17 +1891,56 @@ function setHideEdits(v) {
 }
 function toggleEdits() { setHideEdits(!hideEdits); }
 
-function toolTitle(b) {   // a tool call reduced to its name, e.g. "▸ Bash"
-  const t = div('block-tool');
-  t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
-  return t;
+// Added/removed line counts for one edit, from the shared line-diff (with a size guard
+// so a huge edit doesn't get diffed just for the banner).
+function diffStat(oldT, newT) {
+  oldT = oldT || ''; newT = newT || '';
+  if (oldT.length + newT.length > 40000) return { add: newT.split('\n').length, rem: oldT.split('\n').length };
+  let add = 0, rem = 0;
+  for (const r of diffLines(oldT, newT)) { if (r.t === '+') add++; else if (r.t === '-') rem++; }
+  return { add, rem };
 }
-function renderEditBanner(b) {   // a file edit collapsed to a banner: name + target, no diff
+function fmtStat(add, rem) {
+  const p = [];
+  if (add) p.push('+' + add);
+  if (rem) p.push('-' + rem);
+  return p.length ? p.join(' ') + ' lines' : 'no change';
+}
+function editLineStat(b) {
+  const inp = b.input || {};
+  if (b.name === 'Write') return '+' + (inp.content || '').split('\n').length + ' lines';
+  if (b.name === 'MultiEdit' && Array.isArray(inp.edits)) {
+    let a = 0, r = 0;
+    for (const e of inp.edits) { const s = diffStat(e.old_string, e.new_string); a += s.add; r += s.rem; }
+    return fmtStat(a, r) + '  (' + inp.edits.length + ' edits)';
+  }
+  if (inp.old_string !== undefined) { const s = diffStat(inp.old_string, inp.new_string); return fmtStat(s.add, s.rem); }
+  return '';
+}
+function readRange(inp) {
+  const o = inp.offset, l = inp.limit;
+  if (o && l) return 'lines ' + o + '-' + (o + l - 1);
+  if (o) return 'from line ' + o;
+  if (l) return 'first ' + l + ' lines';
+  return '';
+}
+function subLine(el, bits) {   // append a "a · b · c" detail line if any bits are non-empty
+  bits = bits.filter(Boolean);
+  if (bits.length) el.appendChild(div('tool-path', bits.join('  ·  ')));
+}
+
+function toolTitle(b) {   // concise: tool name, plus file + line range for Read
+  const el = div('block-tool');
+  el.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
+  const inp = b.input || {};
+  if (b.name === 'Read' && inp.file_path) subLine(el, [inp.file_path, readRange(inp)]);
+  return el;
+}
+function renderEditBanner(b) {   // hide-edits: name + file + how many lines changed, no diff
   const inp = b.input || {};
   const el = div('block-tool');
   el.appendChild(div('block-tool-name', '▸ ' + (b.name || 'Edit')));
-  const path = inp.file_path || inp.notebook_path || '';
-  if (path) el.appendChild(div('tool-path', path));
+  subLine(el, [inp.file_path || inp.notebook_path || '', editLineStat(b)]);
   return el;
 }
 
