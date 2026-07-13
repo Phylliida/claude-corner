@@ -1771,7 +1771,9 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
        in the transcript scales off it, and text reflows within the cell width (calc()
        keeps the ratios so nested elements don't compound). */
     .active-cell-body { font-size: var(--tsize, 14px); }
-    .active-cell-body .block-tool, .active-cell-body .diff-block { font-size: calc(var(--tsize, 14px) * 0.9); }
+    .active-cell-body .block-tool, .active-cell-body .diff-block,
+    .active-cell-body .block-result { font-size: calc(var(--tsize, 14px) * 0.9); }
+    .active-cell-body .block-thinking { font-size: var(--tsize, 14px); }
     .active-cell-body .msg-role, .active-cell-body .tool-path, .active-cell-body .tool-desc,
     .active-cell-body .tool-flag, .active-cell-body .tool-section-label,
     .active-cell-body .block-result-label { font-size: calc(var(--tsize, 14px) * 0.78); }
