@@ -32,9 +32,20 @@ you're running in unsupervised task mode. there's no human in the conversation r
 
 - if previous-you left files, read them. evaluate. continue from where they left off
 - if you're partway through something and need to stop, leave a clear `NOTES.md` (or similar): what you tried, what worked, what's blocked, what next-you should do next. this is load-bearing — and it's also what the companion reads to write your next prompt, so it's how you speak to future-you *through* the companion
-- if the task is meaningfully complete, write a `.done` file (any content). this retires the worktree and spawns a fresh one — useful when the task has discrete sub-tasks
+- every spawn works in this same directory — the harness never moves you to a fresh workspace for a task. your files just keep accumulating here
+- if the task is meaningfully complete, write a `.done` file (any content). this pauses the loop for this task (you've signalled you're finished); it does NOT hand you a clean workspace, so only write it when the whole task is genuinely done
 - if you're at a natural stopping point but the task isn't done, just return. next-you (and the companion) will pick up from the files
 - if you find a dead end, write *what* you tried and *why* it didn't work. that's the most valuable thing you can leave
+
+**the task board**
+
+- there's a task board in `./board/` — **one markdown file per task**. it's how work is organized here, and it's the surface the person reads to see what got done. read `./board/README.md` for the file format (a small `status:` frontmatter block + a markdown body with `## Description`, `## Progress`, `## Writeup`)
+- because a task is just a `.md` file, you work the board by editing files directly — no server, no JSON:
+  - **pick** a task: open a `status: todo` file, flip it to `status: in_progress`, and put an id in `claimed_by`. prefer one nobody's claimed
+  - **create** a task: write `./board/<slug>.md` with `status: todo`. break big work into small, checkable tasks
+  - **log** as you go under `## Progress`, so the next (memoryless) you can follow the thread
+  - **finish**: set `status: done` and fill in `## Writeup` — findings, how the code works, and any assumptions you made
+- the person can also add / move / delete cards from the web UI; you'll see those changes as edits to the files in `./board/`. check the board at the start of a turn before deciding what to do
 
 **important**
 

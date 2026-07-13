@@ -17,6 +17,8 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
+import board
+
 HOME = os.environ["HOME"]
 PROJECTS = Path(HOME) / ".claude" / "projects"
 
@@ -103,6 +105,68 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .tab-add:hover { color: var(--accent); border-color: var(--accent); }
     .lane-panel { margin-bottom: 1rem; }
+    /* --- task board (kanban) --- */
+    .board-wrap { margin-bottom: 1.2rem; }
+    .board-head {
+      display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem;
+      color: var(--fg-dim); font-size: 0.85rem;
+    }
+    .board-head .board-title { color: var(--accent2); font-size: 0.95rem; }
+    .board-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.7rem; align-items: start; }
+    @media (max-width: 780px) { .board-cols { grid-template-columns: 1fr; } }
+    .board-col { background: var(--bg2); border-radius: 6px; padding: 0.5rem; min-height: 3rem; }
+    .board-col-head {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 0.78rem; color: var(--fg-dim); text-transform: uppercase;
+      letter-spacing: 0.04em; padding: 0.1rem 0.3rem 0.45rem; font-weight: 600;
+    }
+    .board-col-count { color: var(--fg-dim); opacity: 0.7; font-weight: 400; }
+    .board-col.col-todo .board-col-head { color: var(--tool); }
+    .board-col.col-in_progress .board-col-head { color: var(--assistant); }
+    .board-col.col-done .board-col-head { color: var(--user); }
+    .board-card {
+      background: var(--bg3); border: 1px solid transparent; border-left: 3px solid var(--fg-dim);
+      border-radius: 4px; padding: 0.45rem 0.55rem; margin-bottom: 0.45rem; cursor: pointer;
+    }
+    .board-card:hover { border-color: var(--fg-dim); }
+    .board-card.col-todo { border-left-color: var(--tool); }
+    .board-card.col-in_progress { border-left-color: var(--assistant); }
+    .board-card.col-done { border-left-color: var(--user); }
+    .board-card-title { font-size: 0.88rem; color: var(--fg); }
+    .board-card.col-done .board-card-title { color: var(--fg-dim); }
+    .board-card-meta {
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.68rem;
+      color: var(--fg-dim); margin-top: 0.25rem; display: flex; gap: 0.5rem; flex-wrap: wrap;
+    }
+    .board-card-who { color: var(--accent); }
+    .board-card-body {
+      display: none; margin-top: 0.5rem; padding-top: 0.5rem;
+      border-top: 1px solid var(--bg2); font-size: 0.82rem;
+    }
+    .board-card.open .board-card-body { display: block; }
+    .board-card-body .md { color: var(--fg); overflow-wrap: anywhere; }
+    .board-card-body .md h1, .board-card-body .md h2, .board-card-body .md h3 {
+      font-size: 0.82rem; color: var(--accent2); margin: 0.6rem 0 0.2rem; font-weight: 600;
+    }
+    .board-card-body .md pre {
+      background: var(--bg); padding: 0.4rem 0.6rem; border-radius: 4px; overflow-x: auto;
+    }
+    .board-card-body .md code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+    .board-card-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-top: 0.55rem; }
+    .board-card-actions .btn { padding: 0.15rem 0.5rem; font-size: 0.72rem; }
+    .board-raw-edit {
+      display: none; width: 100%; margin-top: 0.5rem; min-height: 12em; resize: vertical;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--fg-dim); border-radius: 4px;
+      padding: 0.5rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem;
+    }
+    .board-card.editing .board-raw-edit { display: block; }
+    .board-card.editing .md { display: none; }
+    .board-add {
+      width: 100%; background: transparent; color: var(--fg-dim); border: 1px dashed var(--fg-dim);
+      border-radius: 4px; padding: 0.3rem; cursor: pointer; font-size: 0.8rem; font-family: inherit;
+    }
+    .board-add:hover { color: var(--accent); border-color: var(--accent); }
+    .board-empty { color: var(--fg-dim); font-size: 0.78rem; padding: 0.3rem; font-style: italic; }
     .template-details { margin-bottom: 1rem; }
     .template-details summary {
       color: var(--fg-dim); cursor: pointer; font-size: 0.82rem; margin-bottom: 0.5rem;
@@ -361,11 +425,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <textarea id="template-editor" class="prompt-textarea" spellcheck="false" placeholder="loading template..." style="min-height:10em"></textarea>
     </details>
   </div>
+
+  <div id="board-wrap" class="board-wrap" style="display:none">
+    <div class="board-head">
+      <span class="board-title">task board</span>
+      <span id="board-hint" class="budget-numbers"></span>
+    </div>
+    <div id="board-cols" class="board-cols"></div>
+  </div>
+
   <div id="content"><div class="loading">loading siblings...</div></div>
 
 <script>
-const expanded = { siblings: new Set(), sessions: new Set() };
+const expanded = { siblings: new Set(), sessions: new Set(), cards: new Set() };
 const loadedSessions = new Map();
+let lastBoard = null;         // { handle, tasks: [...] }
+let boardHandleCur = null;    // handle currently displayed
+let boardEditingId = null;    // task id whose raw editor is open (suppresses re-render)
 
 function fmtTime(ts) {
   if (!ts) return '?';
@@ -476,10 +552,202 @@ function laneSiblings() {
 function selectLane(id) {
   if (id === selectedLane) return;
   if (promptDirty && !confirm('discard unsaved prompt changes?')) return;
+  if (boardEditingId && !confirm('discard unsaved board card edits?')) return;
   selectedLane = id;
   promptDirty = false; templateDirty = false;
+  boardEditingId = null; lastBoard = null; boardHandleCur = null;
   if (lastState) { renderTabs(lastState); syncLanePanel(lastState); }
   renderSiblings(laneSiblings());
+  refreshBoard();
+}
+
+// --- task board (kanban over <workdir>/board/*.md) ---
+const BOARD_COLS = [
+  { key: 'todo',        label: 'todo' },
+  { key: 'in_progress', label: 'in progress' },
+  { key: 'done',        label: 'done' },
+];
+
+// The board handle is the same string used to address a work dir: a fixed-workdir
+// lane is 'lane:<id>'; otherwise the lane's newest sibling worktree.
+function boardHandle() {
+  const lane = currentLane();
+  if (!lane) return null;
+  if (lane.kind === 'corner') return null;   // corner = open space, not a task board
+  if (lane.workdir) return 'lane:' + lane.id;
+  const sibs = laneSiblings();   // newest first (server sorts by mtime desc)
+  return sibs.length ? sibs[0].name : null;
+}
+
+async function refreshBoard() {
+  const wrap = document.getElementById('board-wrap');
+  const handle = boardHandle();
+  if (!handle) {
+    boardHandleCur = null; lastBoard = null;
+    wrap.style.display = 'none';
+    return;
+  }
+  // Don't yank the raw editor out from under an in-progress edit.
+  if (boardEditingId && handle === boardHandleCur) return;
+  try {
+    const r = await fetch('/api/board/' + encodeURIComponent(handle), { cache: 'no-store' });
+    if (!r.ok) { wrap.style.display = 'none'; return; }
+    const j = await r.json();
+    lastBoard = j; boardHandleCur = handle;
+    renderBoard(j);
+  } catch (e) { /* leave last render up */ }
+}
+
+function boardCardKey(t) { return boardHandleCur + '/' + t.id; }
+
+function renderBoard(bd) {
+  const wrap = document.getElementById('board-wrap');
+  const cols = document.getElementById('board-cols');
+  const hint = document.getElementById('board-hint');
+  wrap.style.display = 'block';
+  const tasks = (bd && bd.tasks) || [];
+  const n = tasks.length;
+  hint.textContent = n ? (n + ' task' + (n === 1 ? '' : 's') + ' · board/*.md in the workdir · claude edits these directly')
+                       : 'no tasks yet · board/*.md in the workdir · add one or let claude create them';
+  cols.innerHTML = '';
+  for (const col of BOARD_COLS) {
+    const items = tasks.filter(t => t.status === col.key);
+    const colEl = document.createElement('div');
+    colEl.className = 'board-col col-' + col.key;
+    colEl.innerHTML = `<div class="board-col-head"><span>${col.label}</span>`
+      + `<span class="board-col-count">${items.length}</span></div>`;
+    for (const t of items) colEl.appendChild(createBoardCard(t));
+    if (col.key === 'todo') {
+      const add = document.createElement('button');
+      add.className = 'board-add';
+      add.textContent = '+ add task';
+      add.onclick = addBoardTask;
+      colEl.appendChild(add);
+    } else if (items.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'board-empty';
+      e.textContent = '—';
+      colEl.appendChild(e);
+    }
+    cols.appendChild(colEl);
+  }
+}
+
+function createBoardCard(t) {
+  const key = boardCardKey(t);
+  const el = document.createElement('div');
+  el.className = 'board-card col-' + t.status
+    + (expanded.cards.has(key) ? ' open' : '')
+    + (boardEditingId === t.id ? ' editing' : '');
+  el.dataset.taskId = t.id;
+
+  const metaBits = [t.id];
+  if (t.claimed_by) metaBits.push('<span class="board-card-who">@' + escapeHtml(t.claimed_by) + '</span>');
+  if (t.mtime) metaBits.push(fmtTime(t.mtime));
+
+  el.innerHTML =
+      `<div class="board-card-title">${escapeHtml(t.title)}</div>`
+    + `<div class="board-card-meta">${metaBits.join('<span>·</span>')}</div>`
+    + `<div class="board-card-body">`
+    +   `<div class="md">${renderMarkdown(t.body)}</div>`
+    +   `<textarea class="board-raw-edit" spellcheck="false"></textarea>`
+    +   `<div class="board-card-actions"></div>`
+    + `</div>`;
+
+  const title = el.querySelector('.board-card-title');
+  const meta = el.querySelector('.board-card-meta');
+  const actions = el.querySelector('.board-card-actions');
+  const raw = el.querySelector('.board-raw-edit');
+
+  const toggleOpen = () => {
+    el.classList.toggle('open');
+    if (el.classList.contains('open')) expanded.cards.add(key);
+    else { expanded.cards.delete(key); leaveEdit(); }
+  };
+  title.addEventListener('click', toggleOpen);
+  meta.addEventListener('click', toggleOpen);
+
+  function leaveEdit() {
+    if (boardEditingId === t.id) boardEditingId = null;
+    el.classList.remove('editing');
+  }
+
+  // move-to-status buttons (only the ones that aren't the current status)
+  for (const col of BOARD_COLS) {
+    if (col.key === t.status) continue;
+    const b = document.createElement('button');
+    b.className = 'btn';
+    b.textContent = '→ ' + col.label;
+    b.onclick = (ev) => { ev.stopPropagation(); moveBoardTask(t.id, col.key); };
+    actions.appendChild(b);
+  }
+  const editBtn = document.createElement('button');
+  editBtn.className = 'btn';
+  editBtn.textContent = boardEditingId === t.id ? 'view' : 'edit';
+  editBtn.onclick = (ev) => {
+    ev.stopPropagation();
+    if (boardEditingId === t.id) { leaveEdit(); editBtn.textContent = 'edit'; }
+    else { boardEditingId = t.id; raw.value = t.raw || ''; el.classList.add('editing'); editBtn.textContent = 'view'; raw.focus(); }
+  };
+  actions.appendChild(editBtn);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn btn-start';
+  saveBtn.textContent = 'save edit';
+  saveBtn.onclick = (ev) => { ev.stopPropagation(); saveBoardRaw(t.id, raw.value); };
+  actions.appendChild(saveBtn);
+
+  const del = document.createElement('button');
+  del.className = 'btn btn-danger';
+  del.textContent = 'delete';
+  del.onclick = (ev) => { ev.stopPropagation(); deleteBoardTask(t.id, t.title); };
+  actions.appendChild(del);
+
+  if (boardEditingId === t.id) raw.value = t.raw || '';
+  return el;
+}
+
+function renderMarkdown(text) {
+  try {
+    if (window.marked && marked.parse) return marked.parse(text || '');
+  } catch (e) { /* fall through */ }
+  return '<pre>' + escapeHtml(text || '') + '</pre>';
+}
+
+async function boardPost(path, body) {
+  const handle = boardHandleCur;
+  if (!handle) return null;
+  const r = await fetch('/api/board/' + encodeURIComponent(handle) + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) { alert('board error: ' + (j.error || r.status)); return null; }
+  return j;
+}
+
+async function addBoardTask() {
+  const title = prompt('new task title:');
+  if (!title || !title.trim()) return;
+  const body = prompt('description (optional):') || '';
+  const j = await boardPost('/task', { title: title.trim(), body });
+  if (j) refreshBoard();
+}
+
+async function moveBoardTask(id, status) {
+  const j = await boardPost('/task/' + encodeURIComponent(id) + '/status', { status });
+  if (j) refreshBoard();
+}
+
+async function saveBoardRaw(id, content) {
+  const j = await boardPost('/task/' + encodeURIComponent(id) + '/raw', { content });
+  if (j) { boardEditingId = null; refreshBoard(); }
+}
+
+async function deleteBoardTask(id, title) {
+  if (!confirm('delete task "' + (title || id) + '"? (removes board/' + id + '.md)')) return;
+  const j = await boardPost('/task/' + encodeURIComponent(id) + '/delete', {});
+  if (j) { expanded.cards.delete(boardHandleCur + '/' + id); refreshBoard(); }
 }
 
 async function createLane() {
@@ -764,6 +1032,7 @@ async function heartbeat() {
     lastSiblings = siblings;
     updateControlBar(s);
     syncSiblings(laneSiblings());
+    refreshBoard();
     // Append new messages to any currently-open sessions
     for (const key of Array.from(expanded.sessions)) {
       const [sib, sid] = key.split('/');
@@ -1548,6 +1817,84 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if any(p in FILE_EXCLUDE_DIRS for p in rel_parts) or full.name in FILE_EXCLUDE_NAMES:
             return abort(403)
         return send_file(full)
+
+    # --- task board (per-lane markdown board under <workdir>/board/) -----------
+    # A board handle is the same string used to address a work dir elsewhere:
+    # 'claude-<id>' for a sibling worktree, or 'lane:<id>' for a fixed-workdir
+    # lane. Claude edits the board files directly; these endpoints are the human
+    # side of the same store (the web UI's add / move / edit / delete).
+
+    def _board_work_dir(handle: str):
+        work = _resolve_work_dir(handle)
+        if work is None:
+            return None
+        board.ensure_board(work)
+        return work
+
+    @app.route("/api/board/<handle>")
+    def api_board_get(handle):
+        work = _board_work_dir(handle)
+        if work is None:
+            return jsonify({"error": "bad board handle"}), 400
+        return jsonify({"handle": handle, "tasks": board.list_tasks(work)})
+
+    @app.route("/api/board/<handle>/task", methods=["POST"])
+    def api_board_create(handle):
+        work = _board_work_dir(handle)
+        if work is None:
+            return jsonify({"error": "bad board handle"}), 400
+        data = request.get_json(force=True, silent=True) or {}
+        title = data.get("title", "")
+        if not isinstance(title, str) or not title.strip():
+            return jsonify({"error": "title must be a non-empty string"}), 400
+        body = data.get("body", "")
+        status = data.get("status", "todo")
+        by = data.get("by")
+        try:
+            task = board.create_task(work, title, body if isinstance(body, str) else "",
+                                     status if isinstance(status, str) else "todo",
+                                     by if isinstance(by, str) else None)
+        except OSError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        return jsonify(task)
+
+    @app.route("/api/board/<handle>/task/<task_id>/status", methods=["POST"])
+    def api_board_status(handle, task_id):
+        work = _board_work_dir(handle)
+        if work is None:
+            return jsonify({"error": "bad board handle"}), 400
+        data = request.get_json(force=True, silent=True) or {}
+        status = data.get("status")
+        if status not in board.STATUSES:
+            return jsonify({"error": f"status must be one of {board.STATUSES}"}), 400
+        by = data.get("by")
+        task = board.set_status(work, task_id, status, by if isinstance(by, str) else None)
+        if task is None:
+            return jsonify({"error": "task not found"}), 404
+        return jsonify(task)
+
+    @app.route("/api/board/<handle>/task/<task_id>/raw", methods=["POST"])
+    def api_board_raw(handle, task_id):
+        work = _board_work_dir(handle)
+        if work is None:
+            return jsonify({"error": "bad board handle"}), 400
+        data = request.get_json(force=True, silent=True) or {}
+        content = data.get("content", "")
+        if not isinstance(content, str):
+            return jsonify({"error": "content must be a string"}), 400
+        task = board.write_raw(work, task_id, content)
+        if task is None:
+            return jsonify({"error": "task not found"}), 404
+        return jsonify(task)
+
+    @app.route("/api/board/<handle>/task/<task_id>/delete", methods=["POST"])
+    def api_board_delete(handle, task_id):
+        work = _board_work_dir(handle)
+        if work is None:
+            return jsonify({"error": "bad board handle"}), 400
+        if not board.delete_task(work, task_id):
+            return jsonify({"error": "task not found"}), 404
+        return jsonify({"deleted": task_id})
 
     @app.route("/api/state")
     def api_state():

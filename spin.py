@@ -37,6 +37,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import board
+
 CORNER = Path(__file__).resolve().parent
 # Each "kind" maps to the CLAUDE.md template baked into a sibling at spawn time.
 # corner = open creative space; task = unsupervised repeated work (gets the
@@ -891,6 +893,43 @@ end this turn normally and next-you will pick up.]
 """
 
 
+def _board_hint(work_dir: Path) -> str:
+    """A note prepended to task-mode prompts pointing claude at the task board and
+    showing its current state. The board is just markdown files under board/ in the
+    working directory, so claude picks up / creates / finishes tasks by editing them
+    directly — no server, no JSON. The human sees the same files in the web UI."""
+    try:
+        board.ensure_board(work_dir)
+        digest = board.summary(work_dir)
+    except Exception:
+        digest = "(board unavailable)"
+    return f"""[task board — read this:
+
+there is a task board in ./board/ (one markdown file per task). you pick work FROM
+the board, or add new tasks TO it, by editing these files directly with your normal
+file tools — read ./board/README.md for the exact file format. the human browses
+this same board in the web UI, so it's how you show what you did.
+
+current board:
+{digest}
+
+how to work the board:
+- PICK a task: open a `status: todo` file in ./board/, set `status: in_progress`,
+  and put an id in `claimed_by`. prefer an unclaimed one. (nothing todo? add a task.)
+- ADD a task: create ./board/<slug>.md with `status: todo`. split big work into
+  small, checkable tasks.
+- LOG progress under `## Progress` as you go — that thread is how the next you (a
+  fresh, memoryless instance) picks up where you left off.
+- FINISH: set `status: done` and fill in `## Writeup` — findings, how the code
+  works, and any assumptions you made. be honest about what's partial or unverified.
+
+do a little real work on ONE task this turn, then leave the board updated.]
+
+---
+
+"""
+
+
 def ctrl_set_template(kind: str, text: str) -> str | None:
     """Write a kind's CLAUDE.md template (corner or task). Shared by every lane of
     that kind. Takes effect from the next NEW sibling onward — existing siblings
@@ -1288,8 +1327,12 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             # Clear the one-shot message now that this iteration has taken it.
             if feedback.strip() and filed and ctrl_consume_lane_message(lane_id, feedback):
                 log(label, "cleared the one-shot message")
-            if kind == "task" and _web_port > 0:
-                prompt = _task_notify_hint(_web_port, lane_id) + prompt
+            if kind == "task":
+                # Prepend the board hint (always, so claude sees/updates the board)
+                # then the notify-done hint (only when the web UI is up to receive it).
+                prompt = _board_hint(work_dir) + prompt
+                if _web_port > 0:
+                    prompt = _task_notify_hint(_web_port, lane_id) + prompt
             log(label, f"firing {sibling} (iter {iters})")
             rc, response_text = fire(work_dir, prompt, label)
             if response_text:
