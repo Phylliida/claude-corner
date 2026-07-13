@@ -162,6 +162,12 @@ think alongside it. A good prompt:
   like a colleague catching up on the work, not grading it
 - offers the next step as a peer would: share your read of the situation, suggest
   a direction or a couple of options, and trust Claude to make the call
+- asks whether Claude wants guidance on any design decisions it's weighing — if the
+  last instance hit a real fork (an architectural choice, an ambiguous requirement,
+  a tradeoff with no clean answer), invite it to name that decision and say whether
+  it'd like to talk it through with you or leave a question for Danielle, rather than
+  silently picking. make clear it's always welcome to say "i'm unsure about X, here
+  are the options" and pause for input instead of guessing
 - reminds Claude that files persist but conversation memory does not — read the
   working directory first before assuming anything
 - tells Claude that YOU are a real local model it can actually talk to: if it
