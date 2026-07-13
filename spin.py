@@ -113,6 +113,19 @@ _running_event.set()
 _zulip_script: Path | None = None
 _web_port: int = 0
 
+# Board-completion announcements: when a task settles into `status: done`, post its
+# full content to a Zulip stream, with the board directory as the topic. Detection is
+# by polling the board files (claude completes tasks by editing files directly, so
+# there's no event to hook). Configurable via env; disabled if there's no zulip script.
+BOARD_DONE_STREAM = os.environ.get("CLAUDE_CORNER_BOARD_STREAM", "Bot")
+BOARD_WATCH_INTERVAL = int(os.environ.get("CLAUDE_CORNER_BOARD_WATCH_INTERVAL", "20"))
+# key = "<board_dir>::<task_id>". _announced_done: already posted (or seeded at boot).
+# _pending_done: seen done but awaiting one stable poll (file mtime unchanged) so we
+# don't announce a half-written writeup mid-edit — maps key -> last-seen mtime.
+_announced_done: set[str] = set()
+_pending_done: dict[str, float] = {}
+_board_watch_seeded = False
+
 # Companion prompter: a local OpenAI-compatible model that, in task mode, reads
 # the original task plus claude's most-recent response and writes the prompt for
 # the next fresh claude instance. Gives the loop a second mind instead of a
@@ -892,6 +905,32 @@ def _send_zulip(message: str) -> dict:
     return out
 
 
+def _send_zulip_stream(stream: str, topic: str, message: str) -> dict:
+    """Post to a Zulip stream/channel under a topic, reusing the same node script as
+    the DM path (it switches to stream mode via env vars). Returns {zulip_sent, ...}."""
+    out: dict = {"zulip_sent": False}
+    if _zulip_script is None or not _zulip_script.is_file():
+        out["zulip_error"] = "no --zulip-script configured"
+        return out
+    env = dict(os.environ)
+    env["ZULIP_MESSAGE_TYPE"] = "stream"
+    env["ZULIP_STREAM"] = stream
+    env["ZULIP_TOPIC"] = topic[:60]   # Zulip caps topics at 60 chars
+    try:
+        r = subprocess.run(
+            ["node", str(_zulip_script), message],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        if r.returncode == 0:
+            out["zulip_sent"] = True
+            out["zulip_output"] = (r.stdout or "").strip()[:500]
+        else:
+            out["zulip_error"] = (r.stderr or r.stdout or "non-zero exit").strip()[:500]
+    except Exception as e:
+        out["zulip_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
     """Called by a sibling via HTTP when a task is complete. Sends the message
     via the configured zulip script (if any) and pauses the lane that called it.
@@ -1046,6 +1085,94 @@ def probe_loop(interval_sec: int) -> None:
                 print(f"[probe] failed to capture rate-limit data", flush=True)
         except Exception as e:
             print(f"[probe] error: {e}", flush=True)
+
+
+def _board_dirs_to_watch() -> dict[str, str]:
+    """Every board directory the completion watcher should scan, as {abs_dir: lane_id}.
+    Fixed-workdir (and board_dir) lanes resolve directly; sibling lanes contribute each
+    of their live sibling work dirs."""
+    dirs: dict[str, str] = {}
+    with _lanes_lock:
+        lanes = [dict(l) for l in _lanes.values()]
+    for l in lanes:
+        bd_setting = l.get("board_dir")
+        wd = l.get("workdir")
+        if wd:
+            p = board.resolve_dir(wd, bd_setting)
+            if p:
+                dirs[str(p)] = l["id"]
+        else:
+            for work in discover_resumable(l["id"]):
+                p = board.resolve_dir(work, bd_setting)
+                if p:
+                    dirs[str(p)] = l["id"]
+    return dirs
+
+
+def _completed_task_message(task: dict) -> str:
+    """The Zulip body for a completed task: a header line plus its full content."""
+    who = f" · by {task['claimed_by']}" if task.get("claimed_by") else ""
+    body = (task.get("body") or "").strip() or "_(no content)_"
+    if len(body) > 9000:
+        body = body[:9000] + "\n\n…(truncated)…"
+    return f"**✓ task done: {task['title']}**  (`{task['id']}`{who})\n\n{body}"
+
+
+def _scan_boards_for_completions(seed: bool) -> None:
+    """One pass of the completion watcher. On the seed pass, record every currently-done
+    task as already-announced (so a restart doesn't re-post history) without messaging.
+    Afterwards, announce a task once it is done AND its file has been stable for one poll
+    (guards against posting a writeup that's still mid-edit)."""
+    for bdir, lane_id in _board_dirs_to_watch().items():
+        try:
+            tasks = board.list_tasks(Path(bdir))
+        except Exception:
+            continue
+        live_done_keys = set()
+        for t in tasks:
+            key = f"{bdir}::{t['id']}"
+            if t["status"] != "done":
+                # a task that left 'done' (reopened) becomes eligible to re-announce
+                _announced_done.discard(key)
+                _pending_done.pop(key, None)
+                continue
+            live_done_keys.add(key)
+            if key in _announced_done:
+                continue
+            if seed:
+                _announced_done.add(key)
+                continue
+            mtime = t.get("mtime", 0.0)
+            if _pending_done.get(key) == mtime:
+                # stable across a poll — safe to announce. Only mark it done on a
+                # successful post, so a transient zulip failure retries next poll.
+                res = _send_zulip_stream(BOARD_DONE_STREAM, bdir, _completed_task_message(t))
+                if res.get("zulip_sent"):
+                    _announced_done.add(key)
+                    _pending_done.pop(key, None)
+                    print(f"[board-watch] announced done task {t['id']!r} "
+                          f"(lane {lane_id!r}) to #{BOARD_DONE_STREAM} topic={bdir}", flush=True)
+                else:
+                    print(f"[board-watch] failed to announce {t['id']!r}: "
+                          f"{res.get('zulip_error')} (will retry)", flush=True)
+            else:
+                _pending_done[key] = mtime   # wait one more poll for the file to settle
+        # forget pending entries whose task disappeared
+        for k in [k for k in _pending_done if k.startswith(bdir + "::") and k not in live_done_keys]:
+            _pending_done.pop(k, None)
+
+
+def board_watch_loop(interval_sec: int) -> None:
+    """Background thread: poll board files and post each newly-completed task to Zulip.
+    First pass seeds existing done tasks silently so only completions from now on fire."""
+    global _board_watch_seeded
+    while True:
+        try:
+            _scan_boards_for_completions(seed=not _board_watch_seeded)
+            _board_watch_seeded = True
+        except Exception as e:
+            print(f"[board-watch] error: {e}", flush=True)
+        time.sleep(interval_sec)
 
 
 def _format_stream_event(evt: dict) -> list[str]:
@@ -1732,6 +1859,15 @@ def main():
     print("[harness] starting in PAUSED state — open the web UI and start a lane to begin", flush=True)
     # Supervisor reconciles worker threads to each lane's slots (spawns on demand).
     threading.Thread(target=supervisor_loop, daemon=True).start()
+
+    # Board-completion watcher: announce each newly-finished task to a Zulip stream.
+    # Only runs when a zulip script is configured (nowhere to post otherwise).
+    if _zulip_script is not None and BOARD_WATCH_INTERVAL > 0:
+        threading.Thread(target=board_watch_loop, args=(BOARD_WATCH_INTERVAL,), daemon=True).start()
+        print(f"[harness] board-completion watcher on: finished tasks post to "
+              f"#{BOARD_DONE_STREAM} (topic = board dir), every {BOARD_WATCH_INTERVAL}s", flush=True)
+    else:
+        print("[harness] board-completion watcher off (no --zulip-script)", flush=True)
 
     if args.probe_interval > 0:
         print(f"[harness] running startup probe...", flush=True)
