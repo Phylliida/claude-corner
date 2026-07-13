@@ -1750,8 +1750,11 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     .active-cell-live.on { color: var(--user); }
     .active-cell-live.on::before { content: '● '; }
     .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
+    /* Native virtualization: skip layout/paint of off-screen messages while keeping
+       them in the DOM, so the scrollbar spans the whole session. `auto` remembers each
+       message's real height once seen (falling back to ~3rem before first render). */
+    .active-cell-body > .msg { content-visibility: auto; contain-intrinsic-size: auto 3rem; }
     .active-cell-empty { color: var(--fg-dim); font-style: italic; padding: 1.2rem; text-align: center; }
-    .active-loadmore { text-align: center; color: var(--fg-dim); font-size: 0.7rem; padding: 0.3rem; }
   </style>
 </head>
 <body>
@@ -1764,7 +1767,6 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
 
 <script>
 const NCELLS = 4;
-const WIN = 250, BATCH = 80, EDGE = 400;   // window cap, load batch, scroll trigger px
 let lanes = [];              // [{id,name,kind,...}] from /api/state
 let siblings = [];           // from /api/siblings
 let cellLanes = loadCellLanes();
@@ -1799,7 +1801,6 @@ class Cell {
       this.reset();
       tick();
     });
-    this.body.addEventListener('scroll', () => this.onScroll());
     this.reset();
   }
   reset() {
@@ -1808,98 +1809,36 @@ class Cell {
     this.setEmpty(this.laneId ? 'waiting for a session…' : 'pick a task above');
   }
   setEmpty(msg) {
-    if (this.body.querySelector('.active-cell-body > .msg')) return;
     this.body.innerHTML = '<div class="active-cell-empty">' + msg + '</div>';
   }
   clearEmpty() { const e = this.body.querySelector('.active-cell-empty'); if (e) e.remove(); }
-  node(i) { const el = renderMessage(this.events[i]); el.dataset.i = i; return el; }
-  firstIdx() { for (const c of this.body.children) if (c.dataset.i !== undefined) return +c.dataset.i; return null; }
-  lastIdx() { const ch = this.body.children; for (let k = ch.length - 1; k >= 0; k--) if (ch[k].dataset.i !== undefined) return +ch[k].dataset.i; return null; }
   scrollBottom() { this.body.scrollTop = this.body.scrollHeight; }
 
-  // Fresh events for the current session (append-only) or a brand-new session.
+  // Fresh events for the current session (append-only) or a brand-new session. Every
+  // message stays in the DOM so the scrollbar spans the whole session; off-screen ones
+  // are skipped by the browser via `content-visibility: auto` (see the cell CSS), so a
+  // long transcript stays fast without breaking the scrollbar.
   update(sessionKey, events) {
-    if (sessionKey !== this.sessionKey) {   // new (or first) session → windowed full render
+    if (sessionKey !== this.sessionKey) {          // new (or first) session → full render
       this.sessionKey = sessionKey;
       this.events = events;
+      const frag = document.createDocumentFragment();
+      for (const ev of events) frag.appendChild(renderMessage(ev));
       this.body.innerHTML = '';
-      const start = Math.max(0, events.length - WIN);
-      for (let i = start; i < events.length; i++) this.body.appendChild(this.node(i));
-      this.refreshLoadMore();
+      this.body.appendChild(frag);
       this.scrollBottom();
       return;
     }
     if (events.length <= this.events.length) { this.events = events; return; }
-    const oldLen = this.events.length;
-    const wasBottom = nearBottom(this.body);
+    const wasBottom = nearBottom(this.body, 80);   // stick to bottom only if already there
+    const frag = document.createDocumentFragment();
+    for (let i = this.events.length; i < events.length; i++) frag.appendChild(renderMessage(events[i]));
     this.events = events;
-    // Only extend the tail if we're currently showing it (not scrolled into history).
-    if (this.lastIdx() === oldLen - 1) {
-      this.clearEmpty();
-      for (let i = oldLen; i < events.length; i++) this.body.appendChild(this.node(i));
-      if (wasBottom) this.scrollBottom();
-      this.trimTop(wasBottom);
-    }
-    this.refreshLoadMore();
+    this.clearEmpty();
+    this.body.appendChild(frag);
+    if (wasBottom) this.scrollBottom();
   }
 
-  onScroll() {
-    if (this.body.scrollTop < EDGE) this.loadOlder();
-    else if (this.body.scrollHeight - this.body.scrollTop - this.body.clientHeight < EDGE) this.loadNewer();
-  }
-  loadOlder() {
-    const first = this.firstIdx();
-    if (first === null || first <= 0) return;
-    const from = Math.max(0, first - BATCH);
-    const before = this.body.scrollHeight;
-    const anchor = this.body.firstElementChild && this.body.firstElementChild.classList.contains('active-loadmore')
-      ? this.body.firstElementChild.nextSibling : this.body.firstElementChild;
-    for (let i = first - 1; i >= from; i--) this.body.insertBefore(this.node(i), anchor);
-    this.body.scrollTop += this.body.scrollHeight - before;   // keep viewport stable
-    this.trimBottom();
-    this.refreshLoadMore();
-  }
-  loadNewer() {
-    const last = this.lastIdx();
-    if (last === null || last >= this.events.length - 1) return;
-    const to = Math.min(this.events.length, last + 1 + BATCH);
-    for (let i = last + 1; i < to; i++) this.body.appendChild(this.node(i));
-    this.trimTop(false);
-  }
-  trimTop(atBottom) {
-    let removed = 0;
-    while (this.msgCount() > WIN) {
-      const c = this.firstMsg(); if (!c) break;
-      removed += c.offsetHeight; c.remove();
-    }
-    if (removed && !atBottom) this.body.scrollTop = Math.max(0, this.body.scrollTop - removed);
-    this.refreshLoadMore();
-  }
-  trimBottom() {
-    while (this.msgCount() > WIN) {
-      const c = this.body.lastElementChild;
-      if (!c || c.dataset.i === undefined) break;
-      if (c.offsetTop < this.body.scrollTop + this.body.clientHeight) break;  // still visible
-      c.remove();
-    }
-  }
-  msgCount() { let n = 0; for (const c of this.body.children) if (c.dataset.i !== undefined) n++; return n; }
-  firstMsg() { for (const c of this.body.children) if (c.dataset.i !== undefined) return c; return null; }
-  refreshLoadMore() {
-    const existing = this.body.querySelector('.active-loadmore');
-    const first = this.firstIdx();
-    if (first !== null && first > 0) {
-      if (!existing) {
-        const d = document.createElement('div');
-        d.className = 'active-loadmore';
-        d.textContent = '↑ ' + first + ' earlier message' + (first === 1 ? '' : 's') + ' (scroll up to load)';
-        this.body.insertBefore(d, this.body.firstChild);
-      } else {
-        existing.textContent = '↑ ' + first + ' earlier message' + (first === 1 ? '' : 's') + ' (scroll up to load)';
-        if (this.body.firstChild !== existing) this.body.insertBefore(existing, this.body.firstChild);
-      }
-    } else if (existing) { existing.remove(); }
-  }
   setMeta(rec, running) {
     if (rec) {
       this.meta.textContent = rec.sibling.replace(/^claude-/, '') + ' · ' + rec.sessionId.slice(0, 8) + ' · ' + fmtTime(rec.mtime);
