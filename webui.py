@@ -833,10 +833,29 @@ async function setLaneUntilBoard(id, on) {
   catch (e) { /* alerted */ }
 }
 
-function toggleLaneUntilBoard() {
+// Count tasks still open (todo / in progress) on the current lane's board.
+async function boardOpenCount() {
+  const handle = boardHandle();
+  if (!handle) return 0;
+  try {
+    const r = await fetch('/api/board/' + encodeURIComponent(handle), { cache: 'no-store' });
+    if (!r.ok) return 0;
+    const j = await r.json();
+    return (j.tasks || []).filter(t => t.status === 'todo' || t.status === 'in_progress').length;
+  } catch (e) { return 0; }
+}
+
+async function toggleLaneUntilBoard() {
   const lane = currentLane();
   if (!lane) return;
-  setLaneUntilBoard(lane.id, !lane.until_board_clear);
+  const turningOn = !lane.until_board_clear;
+  await setLaneUntilBoard(lane.id, turningOn);
+  // Turning the mode on should also start the lane if it's idle and there's still
+  // work to grind — no point arming "run until done" on a lane that's parked.
+  if (turningOn && lane.slots === 0) {
+    const open = await boardOpenCount();
+    if (open > 0) await setLaneSlots(lane.id, 1);
+  }
 }
 
 async function setLaneMessage(id, text) {
