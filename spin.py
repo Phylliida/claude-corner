@@ -994,6 +994,8 @@ how to work the board:
   fresh, memoryless instance) picks up where you left off.
 - FINISH: set `status: done` and fill in `## Writeup` — findings, how the code
   works, and any assumptions you made. be honest about what's partial or unverified.
+- COMMIT: once a task is done, commit your work with git (e.g. `git add -A && git
+  commit -m "<what you did>"`) so the finished task and its writeup are checkpointed.
 
 do a little real work on ONE task this turn, then leave the board updated.]
 
