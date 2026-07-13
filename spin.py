@@ -64,6 +64,8 @@ STATUSLINE_SRC = CORNER / "statusline.sh"
 STATUSLINE_LAST = CORNER / "statusline.last"
 RUNS = CORNER / "runs"
 DONE = ".done"
+# One-shot user feedback dropped into the workspace so claude can read it directly.
+MESSAGES_FILE = "MESSAGES_FROM_USER.md"
 PROBE_DIR = CORNER / "probe"
 PROBE_INPUT = PROBE_DIR / ".statusline.input"
 PROBE_OUTPUT = PROBE_DIR / ".statusline.last"
@@ -95,9 +97,15 @@ _baseline_seven_day: float | None = None  # 0..1 range
 _budget_fraction: float = 0.0              # 0..1 range
 _last_probe: dict | None = None             # most recent probe result, for status reporting
 
-# Pause/resume state: workers wait on this between iterations.
-# Default to paused — user must click "start" in the web UI to begin spawning siblings.
+# Global panic/budget brake — NOT the per-lane run control. Per-lane pause/resume
+# is governed entirely by each lane's "slots" (a paused lane has slots=0, so its
+# worker thread is stopped by the supervisor; resuming spawns a fresh worker that
+# picks the lane's workspace back up). This event only lets the master "stop all"
+# button and the budget limiter pause every lane at once, so it defaults to set
+# (released). The harness still boots with nothing running because load_lanes()
+# starts every lane at slots=0 — the user starts each lane independently.
 _running_event = threading.Event()
+_running_event.set()
 
 # Set in main() from CLI args / env. Used by ctrl_notify_done and the prompt-injection hint.
 _zulip_script: Path | None = None
@@ -261,7 +269,9 @@ def save_lanes() -> None:
     with _lanes_lock:
         data = [
             {"id": l["id"], "name": l["name"], "kind": l["kind"],
-             "slots": int(l.get("slots", 0)), "workdir": l.get("workdir") or None}
+             "slots": int(l.get("slots", 0)), "workdir": l.get("workdir") or None,
+             "continuous": bool(l.get("continuous", False)),
+             "message": l.get("message", "")}
             for l in _lanes.values()
         ]
     tmp = LANES_JSON.with_suffix(".json.tmp")
@@ -281,9 +291,11 @@ def _norm_workdir(workdir: str | None) -> str | None:
 
 
 def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None,
-              workdir: str | None = None) -> dict:
+              workdir: str | None = None, continuous: bool = False,
+              message: str = "") -> dict:
     lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots),
-            "workdir": _norm_workdir(workdir)}
+            "workdir": _norm_workdir(workdir), "continuous": bool(continuous),
+            "message": message or ""}
     _lanes[lane_id] = lane
     if prompt is not None or not _lane_prompt_path(lane_id).exists():
         _write_lane_prompt(lane_id, prompt if prompt is not None else "")
@@ -302,7 +314,8 @@ def load_lanes() -> None:
                     if entry.get("kind") in KINDS and entry.get("id"):
                         _add_lane(entry["id"], entry.get("name", entry["id"]),
                                   entry["kind"], entry.get("slots", 0), None,
-                                  entry.get("workdir"))
+                                  entry.get("workdir"), entry.get("continuous", False),
+                                  entry.get("message", ""))
             except (json.JSONDecodeError, OSError, TypeError) as e:
                 print(f"[harness] could not read {LANES_JSON.name}: {e}; re-migrating", flush=True)
         if "corner" not in _lanes:
@@ -315,6 +328,10 @@ def load_lanes() -> None:
             if _LEGACY_PROMPT["task"].exists():
                 seed = _LEGACY_PROMPT["task"].read_text()
             _add_lane("task", "task", "task", 0, seed)
+        # Always boot fully paused: a harness restart never auto-resumes lanes.
+        # Run state lives in slots and is the user's to set per lane from the UI.
+        for l in _lanes.values():
+            l["slots"] = 0
     save_lanes()
 
 
@@ -425,6 +442,27 @@ def save_iteration(work_dir: Path, msg: str, has_remote: bool) -> bool:
 
 def is_done(work_dir: Path) -> bool:
     return (work_dir / DONE).exists()
+
+
+def append_user_message(work_dir: Path, text: str) -> bool:
+    """Append a one-shot user message to MESSAGES_FROM_USER.md in the workspace,
+    timestamped, so claude can read it directly. Returns False on write error."""
+    text = (text or "").strip()
+    if not text:
+        return True
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    p = work_dir / MESSAGES_FILE
+    try:
+        new = not p.exists()
+        with p.open("a", encoding="utf-8") as f:
+            if new:
+                f.write("# Messages from the user\n\n"
+                        "Notes Danielle sent while this loop was running. "
+                        "Most recent at the bottom.\n")
+            f.write(f"\n## {stamp}\n\n{text}\n")
+        return True
+    except OSError:
+        return False
 
 
 def collect_statusline() -> str | None:
@@ -593,6 +631,8 @@ def ctrl_get_state() -> dict:
                 "prompt": lane_prompt(l["id"]),
                 "siblings": counts.get(l["id"], 0),
                 "workdir": l.get("workdir") or "",
+                "continuous": bool(l.get("continuous", False)),
+                "message": l.get("message", ""),
             })
     lanes.sort(key=lambda x: (x["kind"] != "corner", x["name"].lower(), x["id"]))
     return {
@@ -638,9 +678,11 @@ def ctrl_set_lane_prompt(lane_id: str, text: str) -> str | None:
 
 
 def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
-    """Set how many concurrent workers a lane should run (its run/pause control).
-    Setting >0 also flips the master gate on, so a single click starts the lane.
-    Fixed-workdir lanes are capped at 1 worker (two claudes can't share a cwd)."""
+    """Set how many concurrent workers a lane should run — this lane's run/pause
+    control, fully independent of every other lane. slots=0 pauses just this lane;
+    slots>0 resumes just this lane. Does NOT touch the global brake, so starting
+    one lane never starts another. Fixed-workdir lanes are capped at 1 worker (two
+    claudes can't share a cwd)."""
     try:
         slots = int(slots)
     except (TypeError, ValueError):
@@ -655,8 +697,6 @@ def ctrl_set_lane_slots(lane_id: str, slots: int) -> int | None:
         l["slots"] = max(0, min(slots, cap))
         val = l["slots"]
     save_lanes()
-    if val > 0:
-        _running_event.set()
     _reconcile_event.set()
     print(f"[harness] lane {lane_id!r} slots → {val}", flush=True)
     return val
@@ -679,6 +719,52 @@ def ctrl_set_lane_workdir(lane_id: str, workdir: str | None) -> dict | None:
     _reconcile_event.set()
     print(f"[harness] lane {lane_id!r} workdir → {norm or '(workspaces)'}", flush=True)
     return result
+
+
+def ctrl_set_lane_continuous(lane_id: str, enabled: bool) -> bool | None:
+    """Toggle a lane's continuous mode. When on, the lane ignores claude's own
+    stop signals — a .done marker is cleared and the loop keeps firing fresh
+    sessions, and a notify-done call sends its message without pausing. Use it
+    for lanes where claude tends to stop early; the lane then runs until you
+    pause it (or the global brake/budget kicks in)."""
+    val = bool(enabled)
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["continuous"] = val
+    save_lanes()
+    print(f"[harness] lane {lane_id!r} continuous → {val}", flush=True)
+    return val
+
+
+def ctrl_set_lane_message(lane_id: str, text: str) -> str | None:
+    """Set a one-shot feedback message for a lane. It's folded into the prompt the
+    companion model reads when it writes the next claude prompt, then cleared the
+    moment the companion consumes it (see ctrl_consume_lane_message). Pass '' to
+    clear a pending message by hand. Returns the stored text, or None if no lane."""
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["message"] = text or ""
+        val = l["message"]
+    save_lanes()
+    print(f"[harness] lane {lane_id!r} message → {val[:80]!r}" + ("…" if len(val) > 80 else ""), flush=True)
+    return val
+
+
+def ctrl_consume_lane_message(lane_id: str, consumed: str) -> bool:
+    """Clear a lane's pending message, but only if it still equals what was just
+    used — so a message the user typed while the companion was generating isn't
+    lost. Returns True if it was cleared."""
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l or l.get("message", "") != consumed:
+            return False
+        l["message"] = ""
+    save_lanes()
+    return True
 
 
 def ctrl_create_lane(name: str, kind: str = "task", workdir: str | None = None) -> dict | None:
@@ -735,10 +821,12 @@ def ctrl_delete_lane(lane_id: str) -> bool:
     return True
 
 
-def ctrl_notify_done(message: str) -> dict:
+def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
     """Called by a sibling via HTTP when a task is complete. Sends the message
-    via the configured zulip script (if any) and pauses the harness."""
-    result: dict = {"message": message, "zulip_sent": False, "paused": False}
+    via the configured zulip script (if any) and pauses the lane that called it.
+    Pausing only the calling lane (not the global brake) keeps every other lane
+    running — one task finishing no longer stops the others."""
+    result: dict = {"message": message, "lane": lane_id, "zulip_sent": False, "paused": False}
     if _zulip_script is not None and _zulip_script.is_file():
         try:
             r = subprocess.run(
@@ -755,19 +843,31 @@ def ctrl_notify_done(message: str) -> dict:
     else:
         result["zulip_error"] = "no --zulip-script configured"
 
-    _running_event.clear()
-    result["paused"] = True
+    lane = get_lane(lane_id) if lane_id else None
+    if lane is not None and lane.get("continuous"):
+        # Continuous lane: deliver the message but ignore the stop — keep running.
+        result["paused"] = False
+        result["continuous"] = True
+    elif lane is not None:
+        ctrl_set_lane_slots(lane_id, 0)  # pause only the lane that finished
+        result["paused"] = True
+    else:
+        # No (or unknown) lane id — fall back to the global brake so an unscoped
+        # completion signal still halts work rather than being silently ignored.
+        _running_event.clear()
+        result["paused"] = True
     print(
-        f"[harness] notify-done received: zulip_sent={result['zulip_sent']} "
-        f"message={message[:120]!r}",
+        f"[harness] notify-done received: lane={lane_id!r} "
+        f"zulip_sent={result['zulip_sent']} message={message[:120]!r}",
         flush=True,
     )
     return result
 
 
-def _task_notify_hint(port: int) -> str:
+def _task_notify_hint(port: int, lane_id: str) -> str:
     """The harness-note prepended to task-mode prompts so claude knows how to
-    signal task completion. Sits above the companion/task message that follows."""
+    signal task completion. Sits above the companion/task message that follows.
+    The lane id is baked into the curl so notify-done pauses only this lane."""
     return f"""[harness note — read this:
 
 you are running in unsupervised task mode. nobody is going to respond to you.
@@ -777,10 +877,10 @@ running this Bash command from inside your sandbox:
 
 curl -s -X POST http://127.0.0.1:{port}/api/notify-done \\
   -H 'Content-Type: application/json' \\
-  -d '{{"message": "<your one-paragraph completion summary>"}}'
+  -d '{{"message": "<your one-paragraph completion summary>", "lane": "{lane_id}"}}'
 
 replace the message with a real summary: what you did, what's left, where you
-left off. the harness sends it to her via zulip and pauses itself.
+left off. the harness sends it to her via zulip and pauses this lane.
 
 please don't call this just because you're stopping one iteration — only when
 the overall task is done or fully blocked. for iteration-boundary stopping, just
@@ -939,10 +1039,12 @@ def _set_last_companion(sibling: str, iters: int, prompt: str) -> None:
     }
 
 
-def call_prompter(task_text: str, last_response: str, slot: int) -> str | None:
+def call_prompter(task_text: str, last_response: str, slot: int,
+                  feedback: str | None = None) -> str | None:
     """Ask the companion model to write the next claude prompt from the task and
-    claude's most recent response. Returns None on any failure so the caller can
-    fall back to the static task prompt."""
+    claude's most recent response. An optional one-shot feedback message from the
+    human is woven in. Returns None on any failure so the caller can fall back to
+    the static task prompt."""
     if not _prompter_enabled:
         return None
     snippet = last_response.strip()
@@ -950,7 +1052,15 @@ def call_prompter(task_text: str, last_response: str, slot: int) -> str | None:
         snippet = snippet[:8000] + "\n…(truncated)…"
     user = (
         "ORIGINAL PROMPT (the task or invitation Claude was given):\n" + task_text.strip() +
-        "\n\n---\n\nCLAUDE'S MOST RECENT RESPONSE (end of the last iteration):\n" + snippet +
+        "\n\n---\n\nCLAUDE'S MOST RECENT RESPONSE (end of the last iteration):\n" + snippet
+    )
+    if feedback and feedback.strip():
+        user += (
+            "\n\n---\n\nEXTRA FEEDBACK FROM DANIELLE (the human watching this loop, "
+            "just for this one prompt) — weave it into what you write for Claude:\n"
+            + feedback.strip()
+        )
+    user += (
         "\n\n---\n\nWrite the next prompt for the fresh Claude instance now. "
         "Output only the prompt text."
     )
@@ -1151,11 +1261,21 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 break
             iters += 1
             task_text = lane_prompt(lane_id)
+            # One-shot user feedback for this lane: drop it into the workspace so
+            # claude can read it directly, and (if the companion runs) weave it into
+            # the next prompt. Cleared once delivered, via compare-and-clear so a
+            # message typed during a slow companion call isn't lost.
+            feedback = (get_lane(lane_id) or {}).get("message") or ""
+            filed = True
+            if feedback.strip():
+                filed = append_user_message(work_dir, feedback)
+                log(label, f"logged your message to {MESSAGES_FILE}" if filed
+                    else f"could not write {MESSAGES_FILE}; will retry next iteration")
             # Let the local companion write the next prompt from the lane prompt +
             # claude's most recent response. First iteration (no response yet) and
             # any companion failure fall back to the static lane prompt.
             if _prompter_enabled and last_response:
-                gen = call_prompter(task_text, last_response, label)
+                gen = call_prompter(task_text, last_response, label, feedback if filed else "")
                 if gen:
                     prompt = gen
                     _set_last_companion(sibling, iters, gen)
@@ -1165,8 +1285,11 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                     log(label, "companion unavailable; using static lane prompt")
             else:
                 prompt = task_text
+            # Clear the one-shot message now that this iteration has taken it.
+            if feedback.strip() and filed and ctrl_consume_lane_message(lane_id, feedback):
+                log(label, "cleared the one-shot message")
             if kind == "task" and _web_port > 0:
-                prompt = _task_notify_hint(_web_port) + prompt
+                prompt = _task_notify_hint(_web_port, lane_id) + prompt
             log(label, f"firing {sibling} (iter {iters})")
             rc, response_text = fire(work_dir, prompt, label)
             if response_text:
@@ -1182,15 +1305,26 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 if save_iteration(work_dir, f"iter {iters} - {stamp}", bool(remote)):
                     log(label, f"committed iter {iters} for {sibling}")
 
+            # Re-read continuous each iteration so toggling it takes effect live.
+            continuous = bool((get_lane(lane_id) or {}).get("continuous"))
             if is_done(work_dir):
-                if managed and not sticky:
+                if continuous:
+                    # Continuous lane: claude's stop signal is ignored. Clear the
+                    # marker so it doesn't re-trip, and keep firing fresh sessions.
+                    try:
+                        (work_dir / DONE).unlink()
+                    except OSError:
+                        pass
+                    log(label, f"{sibling} marked .done, but lane is continuous — clearing and continuing")
+                elif managed and not sticky:
                     log(label, f"{sibling} marked .done, retiring")
                     break
-                # sticky lane (task or fixed workdir): no fresh workspace to spawn —
-                # treat .done as task-complete and pause the lane (stays in this dir).
-                log(label, f"{sibling} marked .done, pausing lane (stays in this workspace)")
-                ctrl_set_lane_slots(lane_id, 0)
-                return
+                else:
+                    # sticky lane (task or fixed workdir): no fresh workspace to spawn —
+                    # treat .done as task-complete and pause the lane (stays in this dir).
+                    log(label, f"{sibling} marked .done, pausing lane (stays in this workspace)")
+                    ctrl_set_lane_slots(lane_id, 0)
+                    return
             if not sticky and args.max_iters_per_sibling and iters >= args.max_iters_per_sibling:
                 log(label, f"{sibling} hit iter cap, retiring")
                 break
@@ -1418,6 +1552,8 @@ def main():
                 set_lane_prompt=ctrl_set_lane_prompt,
                 set_lane_slots=ctrl_set_lane_slots,
                 set_lane_workdir=ctrl_set_lane_workdir,
+                set_lane_continuous=ctrl_set_lane_continuous,
+                set_lane_message=ctrl_set_lane_message,
                 create_lane=ctrl_create_lane,
                 rename_lane=ctrl_rename_lane,
                 delete_lane=ctrl_delete_lane,

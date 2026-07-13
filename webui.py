@@ -318,6 +318,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div id="lane-panel" class="lane-panel">
     <div class="controlbar">
       <button id="lane-run" class="btn">…</button>
+      <button id="lane-continuous" class="btn" title="keep this lane running even if claude marks done or calls notify-done">…</button>
       <label for="lane-slots">workers</label>
       <input id="lane-slots" type="number" min="0" step="1" />
       <button class="btn" onclick="applyLaneSlots()">set</button>
@@ -333,6 +334,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn" onclick="clearLaneWorkdir()">clear</button>
       <span id="lane-workdir-hint" class="budget-numbers"></span>
     </div>
+    <div class="controlbar">
+      <label for="lane-message">message</label>
+      <span id="lane-message-hint" class="budget-numbers"></span>
+      <span style="flex:1"></span>
+      <button class="btn btn-start" onclick="sendLaneMessage()">send</button>
+      <button class="btn" onclick="clearLaneMessage()">clear</button>
+    </div>
+    <textarea id="lane-message" class="prompt-textarea" spellcheck="false" style="min-height:4em" placeholder="one-shot note — woven into the companion's next prompt and logged to MESSAGES_FROM_USER.md, then cleared"></textarea>
     <div class="controlbar">
       <label for="prompt-editor">prompt</label>
       <span id="prompt-dirty-badge" class="budget-numbers prompt-dirty"></span>
@@ -380,6 +389,13 @@ let promptServerValue = '';
 promptEditor.addEventListener('input', () => {
   promptDirty = (promptEditor.value !== promptServerValue);
   promptDirtyBadge.textContent = promptDirty ? '(unsaved)' : '';
+});
+
+const messageEditor = document.getElementById('lane-message');
+let messageDirty = false;
+let messageServerValue = '';
+messageEditor.addEventListener('input', () => {
+  messageDirty = (messageEditor.value !== messageServerValue);
 });
 
 const templateEditor = document.getElementById('template-editor');
@@ -532,6 +548,39 @@ function toggleLaneRun() {
   setLaneSlots(lane.id, lane.slots > 0 ? 0 : 1);
 }
 
+async function setLaneContinuous(id, on) {
+  try { await laneFetch('/api/control/lane/continuous', { lane: id, continuous: on }); heartbeat(); }
+  catch (e) { /* alerted */ }
+}
+
+function toggleLaneContinuous() {
+  const lane = currentLane();
+  if (!lane) return;
+  setLaneContinuous(lane.id, !lane.continuous);
+}
+
+async function setLaneMessage(id, text) {
+  try {
+    await laneFetch('/api/control/lane/message', { lane: id, message: text });
+    messageServerValue = text;
+    messageDirty = false;
+    heartbeat();
+  } catch (e) { /* alerted */ }
+}
+
+function sendLaneMessage() {
+  const lane = currentLane();
+  if (!lane) return;
+  setLaneMessage(lane.id, messageEditor.value);
+}
+
+function clearLaneMessage() {
+  const lane = currentLane();
+  if (!lane) return;
+  messageEditor.value = '';
+  setLaneMessage(lane.id, '');
+}
+
 function renderTabs(s) {
   const bar = document.getElementById('tabbar');
   bar.innerHTML = '';
@@ -570,13 +619,25 @@ function syncLanePanel(s) {
     runBtn.className = 'btn btn-start';
   }
   runBtn.onclick = toggleLaneRun;
+  const contBtn = document.getElementById('lane-continuous');
+  if (contBtn) {
+    if (lane.continuous) {
+      contBtn.textContent = '∞ continuous: ON';
+      contBtn.className = 'btn btn-start';
+    } else {
+      contBtn.textContent = '∞ continuous: off';
+      contBtn.className = 'btn';
+    }
+    contBtn.onclick = toggleLaneContinuous;
+  }
   const slotsInput = document.getElementById('lane-slots');
   slotsInput.max = (lane.kind === 'corner' && !lane.workdir) ? (s.max_slots_per_lane || 4) : 1;
   if (document.activeElement !== slotsInput) slotsInput.value = lane.slots;
   const state = lane.running ? 'running'
-    : (lane.slots > 0 ? 'armed (master paused — click run)' : 'paused');
+    : (lane.slots > 0 ? 'armed (all stopped — click ‘start all’)' : 'paused');
   const where = lane.workdir ? 'fixed workdir' : `${lane.siblings} sibling(s)`;
-  document.getElementById('lane-info').textContent = `${lane.kind} · ${where} · ${state}`;
+  const cont = lane.continuous ? ' · continuous' : '';
+  document.getElementById('lane-info').textContent = `${lane.kind} · ${where} · ${state}${cont}`;
   document.getElementById('lane-delete').style.display = (lane.id === 'corner') ? 'none' : '';
 
   // workdir input + hint
@@ -587,6 +648,19 @@ function syncLanePanel(s) {
     wdHint.textContent = lane.workdir
       ? 'runs claude directly here — no worktree, no git, no template (max 1 worker)'
       : 'per-iteration git worktrees under runs/ (default)';
+  }
+
+  // one-shot message box synced to the lane's pending message (don't clobber typing)
+  const msgVal = lane.message || '';
+  if (!messageDirty && document.activeElement !== messageEditor) {
+    messageEditor.value = msgVal;
+    messageServerValue = msgVal;
+  }
+  const msgHint = document.getElementById('lane-message-hint');
+  if (msgHint) {
+    msgHint.textContent = (lane.message && lane.message.trim())
+      ? '⏳ pending — goes to the companion next iteration, then clears'
+      : 'delivered messages clear automatically';
   }
 
   // prompt editor synced to the selected lane (don't clobber unsaved edits)
@@ -1494,14 +1568,16 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
     def api_notify_done():
         """Called by a sibling (typically via curl from inside the sandbox) to
         signal task completion. Sends a zulip message via the configured script
-        and pauses the harness."""
+        and pauses the calling lane (other lanes keep running)."""
         if controls is None or not hasattr(controls, "notify_done"):
             return jsonify({"error": "no controls wired"}), 500
         data = request.get_json(force=True, silent=True) or {}
         message = data.get("message", "")
         if not isinstance(message, str) or not message.strip():
             return jsonify({"error": "message must be a non-empty string"}), 400
-        result = controls.notify_done(message.strip())
+        lane = data.get("lane")
+        lane = lane.strip() if isinstance(lane, str) and lane.strip() else None
+        result = controls.notify_done(message.strip(), lane)
         return jsonify(result)
 
     @app.route("/api/control/template", methods=["POST"])
@@ -1565,6 +1641,34 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if res is None:
             return jsonify({"error": f"unknown lane {lane!r}"}), 404
         return jsonify(res)
+
+    @app.route("/api/control/lane/continuous", methods=["POST"])
+    def api_set_lane_continuous():
+        if controls is None or not hasattr(controls, "set_lane_continuous"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        enabled = data.get("continuous")
+        if not isinstance(lane, str) or not isinstance(enabled, bool):
+            return jsonify({"error": "lane must be a string and continuous a bool"}), 400
+        res = controls.set_lane_continuous(lane, enabled)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify({"continuous": res})
+
+    @app.route("/api/control/lane/message", methods=["POST"])
+    def api_set_lane_message():
+        if controls is None or not hasattr(controls, "set_lane_message"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        text = data.get("message", "")
+        if not isinstance(lane, str) or not isinstance(text, str):
+            return jsonify({"error": "lane and message must be strings"}), 400
+        res = controls.set_lane_message(lane, text)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify({"message": res})
 
     @app.route("/api/control/lanes", methods=["POST"])
     def api_create_lane():
