@@ -1759,6 +1759,13 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     .active-cell-live { flex: none; font-size: 0.62rem; color: var(--fg-dim); }
     .active-cell-live.on { color: var(--user); }
     .active-cell-live.on::before { content: '● '; }
+    .active-pin {
+      flex: none; cursor: pointer; font-family: inherit; font-size: 0.66rem;
+      padding: 0.12rem 0.45rem; border-radius: 3px;
+      background: var(--bg2); color: var(--fg-dim); border: 1px solid var(--fg-dim);
+    }
+    .active-pin:hover { color: var(--fg); }
+    .active-pin.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
     .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
     /* Font size is user-adjustable via the settings popover (--tsize, px). Everything
        in the transcript scales off it, and text reflows within the cell width (calc()
@@ -1849,6 +1856,8 @@ class Cell {
     this.body = root.querySelector('.active-cell-body');
     this.meta = root.querySelector('.active-cell-meta');
     this.live = root.querySelector('.active-cell-live');
+    this.pin = root.querySelector('.active-pin');
+    this.pinned = true;   // follow newest output by default
     this.sel.addEventListener('change', () => {
       this.laneId = this.sel.value || null;
       cellLanes[this.idx] = this.sel.value;
@@ -1856,7 +1865,23 @@ class Cell {
       this.reset();
       tick();
     });
+    this.pin.addEventListener('click', () => this.setPinned(!this.pinned));
+    // Scrolling up (away from the bottom) unpins; our own scroll-to-bottom lands at
+    // the bottom, so it never trips this.
+    this.body.addEventListener('scroll', () => {
+      if (this.pinned && !nearBottom(this.body, 40)) this.setPinned(false);
+    });
+    this.updatePinUI();
     this.reset();
+  }
+  setPinned(v) {
+    this.pinned = v;
+    this.updatePinUI();
+    if (v) this.scrollBottom();
+  }
+  updatePinUI() {
+    this.pin.classList.toggle('on', this.pinned);
+    this.pin.textContent = this.pinned ? '⤓ pinned' : '⤓ pin';
   }
   reset() {
     this.sessionKey = null; this.events = []; this.lastMtime = -1;
@@ -1885,13 +1910,16 @@ class Cell {
       return;
     }
     if (events.length <= this.events.length) { this.events = events; return; }
-    const wasBottom = nearBottom(this.body, 80);   // stick to bottom only if already there
     const frag = document.createDocumentFragment();
     for (let i = this.events.length; i < events.length; i++) frag.appendChild(renderMessage(events[i]));
     this.events = events;
     this.clearEmpty();
     this.body.appendChild(frag);
-    if (wasBottom) this.scrollBottom();
+    if (this.pinned) {
+      this.scrollBottom();
+      // re-pin after layout settles (content-visibility corrects off-screen heights)
+      requestAnimationFrame(() => { if (this.pinned) this.scrollBottom(); });
+    }
   }
 
   setMeta(rec, running) {
@@ -1934,6 +1962,7 @@ function buildGrid() {
       + '<select></select>'
       + '<span class="active-cell-meta"></span>'
       + '<span class="active-cell-live"></span>'
+      + '<button class="active-pin" title="pin to newest — auto-scroll as new output arrives"></button>'
       + '</div>'
       + '<div class="active-cell-body"></div>';
     grid.appendChild(cell);
