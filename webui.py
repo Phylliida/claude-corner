@@ -12,15 +12,187 @@ Usage:
 from __future__ import annotations
 import json
 import os
+import re
 import threading
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
 
 import board
 
 HOME = os.environ["HOME"]
 PROJECTS = Path(HOME) / ".claude" / "projects"
+
+# Shared transcript-rendering helpers, served at /render.js and loaded by both the
+# main page and the /active grid so there's a single copy of the message renderer.
+RENDER_JS = r"""
+function fmtTime(ts) {
+  if (!ts) return '?';
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  return sameDay
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderMarkdown(text) {
+  try {
+    if (window.marked && marked.parse) return marked.parse(text || '');
+  } catch (e) { /* fall through */ }
+  return '<pre>' + escapeHtml(text || '') + '</pre>';
+}
+
+function div(cls, text) {
+  const e = document.createElement('div');
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// LCS-based line diff. Returns [{t: ' '|'+'|'-', l: line}, ...].
+function diffLines(oldText, newText) {
+  const a = (oldText || '').split('\n');
+  const b = (newText || '').split('\n');
+  const m = a.length, n = b.length;
+  const dp = [];
+  for (let i = 0; i <= m; i++) dp.push(new Int32Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = (a[i] === b[j])
+        ? dp[i+1][j+1] + 1
+        : Math.max(dp[i+1][j], dp[i][j+1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j])          { out.push({t: ' ', l: a[i]}); i++; j++; }
+    else if (dp[i+1][j] >= dp[i][j+1]) { out.push({t: '-', l: a[i++]}); }
+    else                                { out.push({t: '+', l: b[j++]}); }
+  }
+  while (i < m) out.push({t: '-', l: a[i++]});
+  while (j < n) out.push({t: '+', l: b[j++]});
+  return out;
+}
+
+function renderDiff(oldText, newText) {
+  const wrap = div('diff-block');
+  const rows = diffLines(oldText, newText);
+  if (rows.length === 0) {
+    wrap.appendChild(div('diff-row', '(no change)'));
+    return wrap;
+  }
+  for (const r of rows) {
+    const row = div('diff-row diff-' + ({'+':'add','-':'del',' ':'same'}[r.t]));
+    const p = document.createElement('span');
+    p.className = 'diff-prefix';
+    p.textContent = r.t === ' ' ? '  ' : r.t + ' ';
+    const c = document.createElement('span');
+    c.className = 'diff-content';
+    c.textContent = r.l;
+    row.appendChild(p);
+    row.appendChild(c);
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function renderToolUse(b) {
+  const wrap = div('block-tool');
+  wrap.appendChild(div('block-tool-name', '▸ ' + b.name));
+  const inp = b.input || {};
+  const body = div('block-tool-input');
+
+  if (b.name === 'Edit' || b.name === 'MultiEdit' || b.name === 'NotebookEdit') {
+    if (inp.file_path) wrap.appendChild(div('tool-path', inp.file_path));
+    if (inp.old_string !== undefined) {
+      body.appendChild(renderDiff(inp.old_string, inp.new_string || ''));
+    } else if (inp.edits) {
+      inp.edits.forEach((ed, i) => {
+        body.appendChild(div('tool-section-label', `edit ${i+1}`));
+        body.appendChild(renderDiff(ed.old_string || '', ed.new_string || ''));
+      });
+    }
+    const extras = [];
+    if (inp.replace_all) extras.push('replace_all');
+    Object.keys(inp).forEach(k => {
+      if (!['file_path','old_string','new_string','replace_all','edits'].includes(k))
+        extras.push(`${k}=${JSON.stringify(inp[k])}`);
+    });
+    if (extras.length) body.appendChild(div('tool-flag', '(' + extras.join(', ') + ')'));
+  } else if (b.name === 'Write') {
+    if (inp.file_path) wrap.appendChild(div('tool-path', 'write → ' + inp.file_path));
+    body.appendChild(div('tool-content', inp.content || ''));
+  } else if (b.name === 'Bash') {
+    const cmdRow = div('tool-cmd');
+    const prefix = document.createElement('span');
+    prefix.className = 'tool-cmd-prefix';
+    prefix.textContent = '$ ';
+    cmdRow.appendChild(prefix);
+    cmdRow.appendChild(document.createTextNode(inp.command || ''));
+    body.appendChild(cmdRow);
+    if (inp.description) body.appendChild(div('tool-desc', inp.description));
+    if (inp.run_in_background) body.appendChild(div('tool-flag', '(background)'));
+    if (inp.timeout) body.appendChild(div('tool-flag', `(timeout=${inp.timeout}ms)`));
+  } else if (b.name === 'Read') {
+    let txt = 'read ' + (inp.file_path || '?');
+    if (inp.offset || inp.limit) txt += ` (offset=${inp.offset || 0}, limit=${inp.limit || 'all'})`;
+    body.appendChild(div('tool-cmd', txt));
+  } else if (b.name === 'Glob' || b.name === 'Grep') {
+    const cmdRow = div('tool-cmd');
+    const summary = b.name + ': ' + (inp.pattern || inp.path || '?');
+    cmdRow.textContent = summary;
+    body.appendChild(cmdRow);
+    Object.keys(inp).forEach(k => {
+      if (!['pattern'].includes(k)) {
+        body.appendChild(div('tool-desc', `${k}: ${JSON.stringify(inp[k])}`));
+      }
+    });
+  } else if (b.name === 'TodoWrite') {
+    if (Array.isArray(inp.todos)) {
+      inp.todos.forEach(t => {
+        const status = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '→' : '○';
+        body.appendChild(div('tool-cmd', `${status} ${t.content || t.activeForm || ''}`));
+      });
+    } else {
+      body.appendChild(div('tool-content', JSON.stringify(inp, null, 2)));
+    }
+  } else {
+    body.appendChild(div('tool-content', JSON.stringify(inp, null, 2)));
+  }
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function renderBlock(b) {
+  if (b.type === 'text') return div('msg-text', b.text);
+  if (b.type === 'tool_use') return renderToolUse(b);
+  if (b.type === 'tool_result') {
+    const el = div('block-result');
+    el.appendChild(div('block-result-label', '⇒ result'));
+    el.appendChild(div(null, b.content));
+    return el;
+  }
+  if (b.type === 'thinking') return div('block-thinking', '✧ ' + b.text);
+  return div('msg-text', '[' + b.type + ']');
+}
+
+function renderMessage(ev) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-' + ev.role;
+  const role = document.createElement('div');
+  role.className = 'msg-role';
+  role.textContent = ev.role;
+  wrap.appendChild(role);
+  for (const b of ev.blocks) wrap.appendChild(renderBlock(b));
+  return wrap;
+}
+"""
 
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -30,6 +202,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/tokyo-night-dark.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
+  <script src="/render.js"></script>
   <style>
     :root {
       --bg: #1a1b26; --fg: #c0caf5; --fg-dim: #565f89;
@@ -360,6 +533,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span id="state-pill" class="pill pill-down">connecting…</span>
     <button id="btn-toggle" class="btn">…</button>
     <div id="status" class="status-bar">loading...</div>
+    <a class="btn" href="/active" title="2×2 live view of working claudes">▦ active view</a>
     <button id="btn-msgorder" class="btn" title="order of messages within each session transcript" onclick="toggleMsgOrder()">…</button>
     <button class="refresh" onclick="refreshAll()">↻ refresh</button>
   </div>
@@ -486,16 +660,6 @@ let lastBoard = null;         // { handle, tasks: [...] }
 let boardHandleCur = null;    // handle currently displayed
 let boardEditingId = null;    // task id whose raw editor is open (suppresses re-render)
 
-function fmtTime(ts) {
-  if (!ts) return '?';
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  return sameDay
-    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
-
 let lastState = null;
 let budgetInputDirty = false;
 const budgetInput = document.getElementById('budget-input');
@@ -530,10 +694,6 @@ templateEditor.addEventListener('input', () => {
 // --- lanes / tabs ---
 let selectedLane = null;
 let lastSiblings = [];
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
 
 function currentLane() {
   if (!lastState || !Array.isArray(lastState.lanes)) return null;
@@ -748,13 +908,6 @@ function createBoardCard(t) {
 
   if (boardEditingId === t.id) raw.value = t.raw || '';
   return el;
-}
-
-function renderMarkdown(text) {
-  try {
-    if (window.marked && marked.parse) return marked.parse(text || '');
-  } catch (e) { /* fall through */ }
-  return '<pre>' + escapeHtml(text || '') + '</pre>';
 }
 
 async function boardPost(path, body) {
@@ -1540,152 +1693,8 @@ async function updateOpenSession(sibling, sessId) {
   } catch (e) {}
 }
 
-function renderMessage(ev) {
-  const wrap = document.createElement('div');
-  wrap.className = 'msg msg-' + ev.role;
-  const role = document.createElement('div');
-  role.className = 'msg-role';
-  role.textContent = ev.role;
-  wrap.appendChild(role);
-  for (const b of ev.blocks) wrap.appendChild(renderBlock(b));
-  return wrap;
-}
-
-function div(cls, text) {
-  const e = document.createElement('div');
-  if (cls) e.className = cls;
-  if (text !== undefined) e.textContent = text;
-  return e;
-}
-
-// LCS-based line diff. Returns [{t: ' '|'+'|'-', l: line}, ...].
-function diffLines(oldText, newText) {
-  const a = (oldText || '').split('\n');
-  const b = (newText || '').split('\n');
-  const m = a.length, n = b.length;
-  // dp[i][j] = length of LCS of a[i:], b[j:]
-  const dp = [];
-  for (let i = 0; i <= m; i++) dp.push(new Int32Array(n + 1));
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      dp[i][j] = (a[i] === b[j])
-        ? dp[i+1][j+1] + 1
-        : Math.max(dp[i+1][j], dp[i][j+1]);
-    }
-  }
-  const out = [];
-  let i = 0, j = 0;
-  while (i < m && j < n) {
-    if (a[i] === b[j])          { out.push({t: ' ', l: a[i]}); i++; j++; }
-    else if (dp[i+1][j] >= dp[i][j+1]) { out.push({t: '-', l: a[i++]}); }
-    else                                { out.push({t: '+', l: b[j++]}); }
-  }
-  while (i < m) out.push({t: '-', l: a[i++]});
-  while (j < n) out.push({t: '+', l: b[j++]});
-  return out;
-}
-
-function renderDiff(oldText, newText) {
-  const wrap = div('diff-block');
-  const rows = diffLines(oldText, newText);
-  if (rows.length === 0) {
-    wrap.appendChild(div('diff-row', '(no change)'));
-    return wrap;
-  }
-  for (const r of rows) {
-    const row = div('diff-row diff-' + ({'+':'add','-':'del',' ':'same'}[r.t]));
-    const p = document.createElement('span');
-    p.className = 'diff-prefix';
-    p.textContent = r.t === ' ' ? '  ' : r.t + ' ';
-    const c = document.createElement('span');
-    c.className = 'diff-content';
-    c.textContent = r.l;
-    row.appendChild(p);
-    row.appendChild(c);
-    wrap.appendChild(row);
-  }
-  return wrap;
-}
-
-function renderToolUse(b) {
-  const wrap = div('block-tool');
-  wrap.appendChild(div('block-tool-name', '▸ ' + b.name));
-  const inp = b.input || {};
-  const body = div('block-tool-input');
-
-  if (b.name === 'Edit' || b.name === 'MultiEdit' || b.name === 'NotebookEdit') {
-    if (inp.file_path) wrap.appendChild(div('tool-path', inp.file_path));
-    if (inp.old_string !== undefined) {
-      body.appendChild(renderDiff(inp.old_string, inp.new_string || ''));
-    } else if (inp.edits) {
-      inp.edits.forEach((ed, i) => {
-        body.appendChild(div('tool-section-label', `edit ${i+1}`));
-        body.appendChild(renderDiff(ed.old_string || '', ed.new_string || ''));
-      });
-    }
-    const extras = [];
-    if (inp.replace_all) extras.push('replace_all');
-    Object.keys(inp).forEach(k => {
-      if (!['file_path','old_string','new_string','replace_all','edits'].includes(k))
-        extras.push(`${k}=${JSON.stringify(inp[k])}`);
-    });
-    if (extras.length) body.appendChild(div('tool-flag', '(' + extras.join(', ') + ')'));
-  } else if (b.name === 'Write') {
-    if (inp.file_path) wrap.appendChild(div('tool-path', 'write → ' + inp.file_path));
-    body.appendChild(div('tool-content', inp.content || ''));
-  } else if (b.name === 'Bash') {
-    const cmdRow = div('tool-cmd');
-    const prefix = document.createElement('span');
-    prefix.className = 'tool-cmd-prefix';
-    prefix.textContent = '$ ';
-    cmdRow.appendChild(prefix);
-    cmdRow.appendChild(document.createTextNode(inp.command || ''));
-    body.appendChild(cmdRow);
-    if (inp.description) body.appendChild(div('tool-desc', inp.description));
-    if (inp.run_in_background) body.appendChild(div('tool-flag', '(background)'));
-    if (inp.timeout) body.appendChild(div('tool-flag', `(timeout=${inp.timeout}ms)`));
-  } else if (b.name === 'Read') {
-    let txt = 'read ' + (inp.file_path || '?');
-    if (inp.offset || inp.limit) txt += ` (offset=${inp.offset || 0}, limit=${inp.limit || 'all'})`;
-    body.appendChild(div('tool-cmd', txt));
-  } else if (b.name === 'Glob' || b.name === 'Grep') {
-    const cmdRow = div('tool-cmd');
-    const summary = b.name + ': ' + (inp.pattern || inp.path || '?');
-    cmdRow.textContent = summary;
-    body.appendChild(cmdRow);
-    Object.keys(inp).forEach(k => {
-      if (!['pattern'].includes(k)) {
-        body.appendChild(div('tool-desc', `${k}: ${JSON.stringify(inp[k])}`));
-      }
-    });
-  } else if (b.name === 'TodoWrite') {
-    if (Array.isArray(inp.todos)) {
-      inp.todos.forEach(t => {
-        const status = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '→' : '○';
-        body.appendChild(div('tool-cmd', `${status} ${t.content || t.activeForm || ''}`));
-      });
-    } else {
-      body.appendChild(div('tool-content', JSON.stringify(inp, null, 2)));
-    }
-  } else {
-    body.appendChild(div('tool-content', JSON.stringify(inp, null, 2)));
-  }
-  wrap.appendChild(body);
-  return wrap;
-}
-
-function renderBlock(b) {
-  if (b.type === 'text') return div('msg-text', b.text);
-  if (b.type === 'tool_use') return renderToolUse(b);
-  if (b.type === 'tool_result') {
-    const el = div('block-result');
-    el.appendChild(div('block-result-label', '⇒ result'));
-    el.appendChild(div(null, b.content));
-    return el;
-  }
-  if (b.type === 'thinking') return div('block-thinking', '✧ ' + b.text);
-  return div('msg-text', '[' + b.type + ']');
-}
+// Transcript render helpers (fmtTime/escapeHtml/div/renderMessage/renderBlock/…)
+// are served from /render.js and shared with the /active grid — see RENDER_JS.
 
 updateMsgOrderButton();
 refreshAll();
@@ -1694,6 +1703,324 @@ setInterval(heartbeat, 5000);  // 5-s heartbeat: state, statusline, budget, conn
 </body>
 </html>
 """
+
+
+# The /active page: a 2x2 grid, each cell shows the live tail of one lane's most
+# recent session. Reuses /render.js (message renderer) and /app.css (the main page's
+# styles, extracted below). Each cell is a windowed/virtualized scroller so a very
+# long session stays fast: only a bounded window of messages is in the DOM at once.
+ACTIVE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>claude-corner · active</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
+  <script src="/render.js"></script>
+  <link rel="stylesheet" href="/app.css"/>
+  <style>
+    .active-topbar { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.7rem; flex-wrap: wrap; }
+    .active-topbar h1 { font-size: 1.2rem; }
+    .active-grid {
+      display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+      gap: 0.6rem; height: calc(100vh - 5.2rem);
+    }
+    @media (max-width: 760px) {
+      .active-grid { grid-template-columns: 1fr; grid-template-rows: repeat(4, 70vh); height: auto; }
+    }
+    .active-cell {
+      display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+      background: var(--bg2); border: 1px solid var(--bg3); border-radius: 6px;
+    }
+    .active-cell-head {
+      flex: none; display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.35rem 0.5rem; background: var(--bg3);
+    }
+    .active-cell-head select {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--fg-dim);
+      border-radius: 3px; padding: 0.2rem 0.4rem; font-size: 0.82rem; font-family: inherit;
+      max-width: 55%;
+    }
+    .active-cell-meta {
+      color: var(--fg-dim); font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 0.66rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+    }
+    .active-cell-live { flex: none; font-size: 0.62rem; color: var(--fg-dim); }
+    .active-cell-live.on { color: var(--user); }
+    .active-cell-live.on::before { content: '● '; }
+    .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
+    .active-cell-empty { color: var(--fg-dim); font-style: italic; padding: 1.2rem; text-align: center; }
+    .active-loadmore { text-align: center; color: var(--fg-dim); font-size: 0.7rem; padding: 0.3rem; }
+  </style>
+</head>
+<body>
+  <div class="active-topbar">
+    <a class="btn" href="/">← board</a>
+    <h1>active view</h1>
+    <span id="active-status" class="active-cell-meta">connecting…</span>
+  </div>
+  <div id="active-grid" class="active-grid"></div>
+
+<script>
+const NCELLS = 4;
+const WIN = 250, BATCH = 80, EDGE = 400;   // window cap, load batch, scroll trigger px
+let lanes = [];              // [{id,name,kind,...}] from /api/state
+let siblings = [];           // from /api/siblings
+let cellLanes = loadCellLanes();
+
+function loadCellLanes() {
+  try {
+    const v = JSON.parse(localStorage.getItem('activeCells') || '[]');
+    if (Array.isArray(v)) return [0,1,2,3].map(i => v[i] || '');
+  } catch (e) {}
+  return ['','','',''];
+}
+function saveCellLanes() { localStorage.setItem('activeCells', JSON.stringify(cellLanes)); }
+
+function nearBottom(el, px) { return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 60); }
+
+// One virtualized cell: keeps a bounded window of a session's messages in the DOM.
+class Cell {
+  constructor(idx, root) {
+    this.idx = idx;
+    this.laneId = cellLanes[idx] || null;
+    this.sessionKey = null;
+    this.events = [];
+    this.lastMtime = -1;
+    this.sel = root.querySelector('select');
+    this.body = root.querySelector('.active-cell-body');
+    this.meta = root.querySelector('.active-cell-meta');
+    this.live = root.querySelector('.active-cell-live');
+    this.sel.addEventListener('change', () => {
+      this.laneId = this.sel.value || null;
+      cellLanes[this.idx] = this.sel.value;
+      saveCellLanes();
+      this.reset();
+      tick();
+    });
+    this.body.addEventListener('scroll', () => this.onScroll());
+    this.reset();
+  }
+  reset() {
+    this.sessionKey = null; this.events = []; this.lastMtime = -1;
+    this.body.innerHTML = '';
+    this.setEmpty(this.laneId ? 'waiting for a session…' : 'pick a task above');
+  }
+  setEmpty(msg) {
+    if (this.body.querySelector('.active-cell-body > .msg')) return;
+    this.body.innerHTML = '<div class="active-cell-empty">' + msg + '</div>';
+  }
+  clearEmpty() { const e = this.body.querySelector('.active-cell-empty'); if (e) e.remove(); }
+  node(i) { const el = renderMessage(this.events[i]); el.dataset.i = i; return el; }
+  firstIdx() { for (const c of this.body.children) if (c.dataset.i !== undefined) return +c.dataset.i; return null; }
+  lastIdx() { const ch = this.body.children; for (let k = ch.length - 1; k >= 0; k--) if (ch[k].dataset.i !== undefined) return +ch[k].dataset.i; return null; }
+  scrollBottom() { this.body.scrollTop = this.body.scrollHeight; }
+
+  // Fresh events for the current session (append-only) or a brand-new session.
+  update(sessionKey, events) {
+    if (sessionKey !== this.sessionKey) {   // new (or first) session → windowed full render
+      this.sessionKey = sessionKey;
+      this.events = events;
+      this.body.innerHTML = '';
+      const start = Math.max(0, events.length - WIN);
+      for (let i = start; i < events.length; i++) this.body.appendChild(this.node(i));
+      this.refreshLoadMore();
+      this.scrollBottom();
+      return;
+    }
+    if (events.length <= this.events.length) { this.events = events; return; }
+    const oldLen = this.events.length;
+    const wasBottom = nearBottom(this.body);
+    this.events = events;
+    // Only extend the tail if we're currently showing it (not scrolled into history).
+    if (this.lastIdx() === oldLen - 1) {
+      this.clearEmpty();
+      for (let i = oldLen; i < events.length; i++) this.body.appendChild(this.node(i));
+      if (wasBottom) this.scrollBottom();
+      this.trimTop(wasBottom);
+    }
+    this.refreshLoadMore();
+  }
+
+  onScroll() {
+    if (this.body.scrollTop < EDGE) this.loadOlder();
+    else if (this.body.scrollHeight - this.body.scrollTop - this.body.clientHeight < EDGE) this.loadNewer();
+  }
+  loadOlder() {
+    const first = this.firstIdx();
+    if (first === null || first <= 0) return;
+    const from = Math.max(0, first - BATCH);
+    const before = this.body.scrollHeight;
+    const anchor = this.body.firstElementChild && this.body.firstElementChild.classList.contains('active-loadmore')
+      ? this.body.firstElementChild.nextSibling : this.body.firstElementChild;
+    for (let i = first - 1; i >= from; i--) this.body.insertBefore(this.node(i), anchor);
+    this.body.scrollTop += this.body.scrollHeight - before;   // keep viewport stable
+    this.trimBottom();
+    this.refreshLoadMore();
+  }
+  loadNewer() {
+    const last = this.lastIdx();
+    if (last === null || last >= this.events.length - 1) return;
+    const to = Math.min(this.events.length, last + 1 + BATCH);
+    for (let i = last + 1; i < to; i++) this.body.appendChild(this.node(i));
+    this.trimTop(false);
+  }
+  trimTop(atBottom) {
+    let removed = 0;
+    while (this.msgCount() > WIN) {
+      const c = this.firstMsg(); if (!c) break;
+      removed += c.offsetHeight; c.remove();
+    }
+    if (removed && !atBottom) this.body.scrollTop = Math.max(0, this.body.scrollTop - removed);
+    this.refreshLoadMore();
+  }
+  trimBottom() {
+    while (this.msgCount() > WIN) {
+      const c = this.body.lastElementChild;
+      if (!c || c.dataset.i === undefined) break;
+      if (c.offsetTop < this.body.scrollTop + this.body.clientHeight) break;  // still visible
+      c.remove();
+    }
+  }
+  msgCount() { let n = 0; for (const c of this.body.children) if (c.dataset.i !== undefined) n++; return n; }
+  firstMsg() { for (const c of this.body.children) if (c.dataset.i !== undefined) return c; return null; }
+  refreshLoadMore() {
+    const existing = this.body.querySelector('.active-loadmore');
+    const first = this.firstIdx();
+    if (first !== null && first > 0) {
+      if (!existing) {
+        const d = document.createElement('div');
+        d.className = 'active-loadmore';
+        d.textContent = '↑ ' + first + ' earlier message' + (first === 1 ? '' : 's') + ' (scroll up to load)';
+        this.body.insertBefore(d, this.body.firstChild);
+      } else {
+        existing.textContent = '↑ ' + first + ' earlier message' + (first === 1 ? '' : 's') + ' (scroll up to load)';
+        if (this.body.firstChild !== existing) this.body.insertBefore(existing, this.body.firstChild);
+      }
+    } else if (existing) { existing.remove(); }
+  }
+  setMeta(rec, running) {
+    if (rec) {
+      this.meta.textContent = rec.sibling.replace(/^claude-/, '') + ' · ' + rec.sessionId.slice(0, 8) + ' · ' + fmtTime(rec.mtime);
+      this.live.classList.toggle('on', !!running);
+      this.live.textContent = running ? 'live' : '';
+    } else {
+      this.meta.textContent = this.laneId ? 'no session yet' : '';
+      this.live.classList.remove('on'); this.live.textContent = '';
+    }
+  }
+  refreshOptions() {
+    const want = this.laneId || '';
+    const cur = Array.from(this.sel.options).map(o => o.value).join('|');
+    const next = [''].concat(lanes.map(l => l.id)).join('|');
+    if (cur === next) { this.sel.value = want; return; }
+    this.sel.innerHTML = '';
+    const none = document.createElement('option'); none.value = ''; none.textContent = '— pick a task —';
+    this.sel.appendChild(none);
+    for (const l of lanes) {
+      const o = document.createElement('option'); o.value = l.id;
+      o.textContent = l.name + (l.kind === 'corner' ? ' (corner)' : '');
+      this.sel.appendChild(o);
+    }
+    this.sel.value = want;
+  }
+}
+
+const cells = [];
+
+function buildGrid() {
+  const grid = document.getElementById('active-grid');
+  grid.innerHTML = '';
+  for (let i = 0; i < NCELLS; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'active-cell';
+    cell.innerHTML =
+      '<div class="active-cell-head">'
+      + '<select></select>'
+      + '<span class="active-cell-meta"></span>'
+      + '<span class="active-cell-live"></span>'
+      + '</div>'
+      + '<div class="active-cell-body"></div>';
+    grid.appendChild(cell);
+    cells.push(new Cell(i, cell));
+  }
+}
+
+function laneById(id) { return lanes.find(l => l.id === id) || null; }
+
+// Most recent session across a lane's siblings: {sibling, sessionId, mtime}.
+function mostRecentSession(laneId) {
+  let best = null;
+  for (const s of siblings) {
+    if ((s.lane || 'corner') !== laneId) continue;
+    for (const sess of (s.sessions || [])) {
+      if (!best || sess.mtime > best.mtime) best = { sibling: s.name, sessionId: sess.id, mtime: sess.mtime };
+    }
+  }
+  return best;
+}
+
+async function fetchSession(sibling, sessionId) {
+  try {
+    const r = await fetch('/api/session/' + sibling + '/' + sessionId, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+let tickBusy = false;
+async function tick() {
+  if (tickBusy) return;
+  tickBusy = true;
+  try {
+    const [stRes, sibRes] = await Promise.all([
+      fetch('/api/state', { cache: 'no-store' }),
+      fetch('/api/siblings', { cache: 'no-store' }),
+    ]);
+    if (stRes.ok) { const s = await stRes.json(); lanes = Array.isArray(s.lanes) ? s.lanes : []; }
+    if (sibRes.ok) siblings = await sibRes.json();
+    document.getElementById('active-status').textContent =
+      lanes.length + ' task' + (lanes.length === 1 ? '' : 's') + ' · updated ' + new Date().toLocaleTimeString();
+
+    for (const cell of cells) {
+      cell.refreshOptions();
+      if (!cell.laneId) { cell.setMeta(null); continue; }
+      const rec = mostRecentSession(cell.laneId);
+      const lane = laneById(cell.laneId);
+      if (!rec) { if (cell.sessionKey) cell.reset(); cell.setMeta(null); continue; }
+      const key = rec.sibling + '/' + rec.sessionId;
+      cell.setMeta(rec, lane && lane.running);
+      // Skip the fetch if nothing changed since last time (same session, same mtime).
+      if (key === cell.sessionKey && rec.mtime === cell.lastMtime) continue;
+      cell.lastMtime = rec.mtime;
+      const events = await fetchSession(rec.sibling, rec.sessionId);
+      if (events) cell.update(key, events);
+    }
+  } catch (e) {
+    document.getElementById('active-status').textContent = 'error: ' + e.message;
+  } finally { tickBusy = false; }
+}
+
+buildGrid();
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
+"""
+
+# /app.css serves the main page's <style> block so the /active page shares the exact
+# same visual language (message/tool/diff styling, color vars) without duplication.
+_APP_CSS_CACHE: str | None = None
+
+
+def _app_css() -> str:
+    global _APP_CSS_CACHE
+    if _APP_CSS_CACHE is None:
+        m = re.search(r"<style>(.*?)</style>", INDEX_HTML, re.S)
+        _APP_CSS_CACHE = m.group(1) if m else ""
+    return _APP_CSS_CACHE
 
 
 def _sanitize(p: Path) -> str:
@@ -1852,6 +2179,18 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
     @app.route("/")
     def index():
         return render_template_string(INDEX_HTML)
+
+    @app.route("/active")
+    def active():
+        return Response(ACTIVE_HTML, mimetype="text/html")
+
+    @app.route("/render.js")
+    def render_js():
+        return Response(RENDER_JS, mimetype="application/javascript")
+
+    @app.route("/app.css")
+    def app_css():
+        return Response(_app_css(), mimetype="text/css")
 
     @app.route("/api/siblings")
     def api_siblings():
