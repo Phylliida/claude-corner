@@ -32,6 +32,7 @@ the sandbox (Claude just edits files). Everything is stdlib-only.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -323,6 +324,38 @@ the board, so anything you write here shows up there.
 
 Files starting with `.` or `_`, plus this README, are ignored by the board.
 """
+
+
+def _session_file(workdir: Path) -> Path:
+    return board_dir(workdir) / ".active_session.json"
+
+
+def record_session(workdir: Path, session_id: str) -> None:
+    """Record which claude session id belongs to this board (i.e. this lane), inside
+    board/. When several lanes share a working directory but have different board
+    dirs, this is how the UI tells their sessions apart instead of guessing 'most
+    recent in the workdir' (which thrashes between the lanes)."""
+    if not session_id:
+        return
+    try:
+        bdir = board_dir(workdir)
+        bdir.mkdir(parents=True, exist_ok=True)
+        _atomic_write(_session_file(workdir),
+                      json.dumps({"session_id": session_id, "recorded": _now()}) + "\n")
+    except OSError:
+        pass
+
+
+def read_session(workdir: Path) -> dict | None:
+    """The session recorded for this board, or None. {"session_id", "recorded"}."""
+    try:
+        p = _session_file(workdir)
+        if not p.is_file():
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) and d.get("session_id") else None
+    except (OSError, ValueError):
+        return None
 
 
 def ensure_board(workdir: Path) -> None:

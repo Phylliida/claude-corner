@@ -653,6 +653,10 @@ def ctrl_get_state() -> dict:
         lanes = []
         for l in _lanes.values():
             slots = int(l.get("slots", 0))
+            # The session this lane recorded in its board dir (so the UI renders this
+            # lane's own session even when lanes share a workdir). Empty if none yet.
+            bdir = board.resolve_dir(l.get("workdir"), l.get("board_dir"))
+            sess = board.read_session(bdir) if bdir else None
             lanes.append({
                 "id": l["id"], "name": l["name"], "kind": l["kind"],
                 "slots": slots,
@@ -661,6 +665,7 @@ def ctrl_get_state() -> dict:
                 "siblings": counts.get(l["id"], 0),
                 "workdir": l.get("workdir") or "",
                 "board_dir": l.get("board_dir") or "",
+                "active_session": (sess or {}).get("session_id", ""),
                 "continuous": bool(l.get("continuous", False)),
                 "until_board_clear": bool(l.get("until_board_clear", False)),
                 "message": l.get("message", ""),
@@ -1343,11 +1348,14 @@ def call_prompter(task_text: str, last_response: str, slot: int,
     return content or None
 
 
-def fire(work_dir: Path, prompt: str, label: str) -> tuple[int, str | None]:
+def fire(work_dir: Path, prompt: str, label: str,
+         board_dir: Path | None = None) -> tuple[int, str | None]:
     """Run claude under bwrap with a pty and stream parsed events live.
     Returns (returncode, final_response_text). The response text is claude's
     final result message (falling back to its concatenated assistant text), used
-    to feed the companion prompter for the next iteration."""
+    to feed the companion prompter for the next iteration. If board_dir is given,
+    the session id (from the stream) is recorded there so the UI can render this
+    lane's own session even when several lanes share a working directory."""
     env = os.environ.copy()
     env["CLAUDE_CODE_NO_FLICKER"] = "1"
     cmd = bwrap_cmd(work_dir, prompt)
@@ -1368,6 +1376,7 @@ def fire(work_dir: Path, prompt: str, label: str) -> tuple[int, str | None]:
             buf = b""
             final_result: str | None = None
             assistant_texts: list[str] = []
+            session_recorded = False
             while True:
                 try:
                     data = os.read(master_fd, 4096)
@@ -1383,6 +1392,14 @@ def fire(work_dir: Path, prompt: str, label: str) -> tuple[int, str | None]:
                         continue
                     try:
                         evt = json.loads(text)
+                        # Record this lane's session id (present on every stream event)
+                        # the first time we see it, so the UI can render exactly this
+                        # session — not just the newest one in a shared workdir.
+                        if board_dir is not None and not session_recorded:
+                            sid = evt.get("session_id")
+                            if sid:
+                                board.record_session(board_dir, sid)
+                                session_recorded = True
                         for human_line in _format_stream_event(evt):
                             sys.stdout.write(prefix + human_line + "\n")
                         # After each assistant event, append the latest probe status
@@ -1551,7 +1568,9 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 if _web_port > 0:
                     prompt = _task_notify_hint(_web_port, lane_id) + prompt
             log(label, f"firing {sibling} (iter {iters})")
-            rc, response_text = fire(work_dir, prompt, label)
+            # Record the session in the board dir for task lanes so the active view can
+            # render this lane's own session (avoids thrashing when lanes share a workdir).
+            rc, response_text = fire(work_dir, prompt, label, bdir if kind == "task" else None)
             if response_text:
                 last_response = response_text
             log(label, f"{sibling} returned ({rc})")
