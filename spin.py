@@ -977,8 +977,8 @@ def _board_hint(work_dir: Path, board_dir: Path) -> str:
     b = _board_ref(work_dir, board_dir)
     return f"""[task board — read this:
 
-there is a task board in {b} (one markdown file per task). you pick work FROM the
-board, or add new tasks TO it, by editing these files directly with your normal
+there is a task board in {b} (one markdown file per task). you pick work from the
+board, or add new tasks to it, by editing these files directly with your normal
 file tools — read {b}/README.md for the exact file format. the human browses this
 same board in the web UI, so it's how you show what you did.
 
@@ -986,18 +986,18 @@ current board:
 {digest}
 
 how to work the board:
-- PICK a task: open a `status: todo` file in {b}/, set `status: in_progress`, and
+- pick a task: open a `status: todo` file in {b}/, set `status: in_progress`, and
   put an id in `claimed_by`. prefer an unclaimed one. (nothing todo? add a task.)
-- ADD a task: create {b}/<slug>.md with `status: todo`. split big work into small,
+- add a task: create {b}/<slug>.md with `status: todo`. split big work into small,
   checkable tasks.
-- LOG progress under `## Progress` as you go — that thread is how the next you (a
+- log progress under `## Progress` as you go — that thread is how the next you (a
   fresh, memoryless instance) picks up where you left off.
-- FINISH: set `status: done` and fill in `## Writeup` — findings, how the code
+- finish: set `status: done` and fill in `## Writeup` — findings, how the code
   works, and any assumptions you made. be honest about what's partial or unverified.
-- COMMIT: once a task is done, commit your work with git (e.g. `git add -A && git
+- commit: once a task is done, commit your work with git (e.g. `git add -A && git
   commit -m "<what you did>"`) so the finished task and its writeup are checkpointed.
 
-do a little real work on ONE task this turn, then leave the board updated.]
+do a little real work on one task this turn, then leave the board updated.]
 
 ---
 
