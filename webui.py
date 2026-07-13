@@ -1731,13 +1731,21 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     .settings-row { display: flex; align-items: center; gap: 0.6rem; font-size: 0.82rem; }
     .settings-row label { color: var(--fg-dim); }
     .settings-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .settings-row input[type=number] {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--fg-dim);
+      border-radius: 3px; padding: 0.15rem 0.35rem; width: 3.4em; font-family: inherit; font-size: 0.82rem;
+    }
+    .settings-hint { color: var(--fg-dim); font-size: 0.7rem; margin-top: 0.25rem; }
     .settings-val { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg); min-width: 3.2em; text-align: right; }
     .active-grid {
-      display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+      display: grid;
+      grid-template-columns: var(--gcols, 1fr 1fr);
+      grid-template-rows: var(--grows, 1fr 1fr);
       gap: 0.6rem; height: calc(100vh - 5.2rem);
     }
     @media (max-width: 760px) {
-      .active-grid { grid-template-columns: 1fr; grid-template-rows: repeat(4, 70vh); height: auto; }
+      .active-grid { grid-template-columns: 1fr; grid-template-rows: none; height: auto; }
+      .active-cell { height: 72vh; }
     }
     .active-cell {
       display: flex; flex-direction: column; min-height: 0; overflow: hidden;
@@ -1797,15 +1805,25 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
         <input id="font-range" type="range" min="9" max="28" step="1" oninput="setFont(this.value)"/>
         <span id="font-val" class="settings-val"></span>
       </div>
+      <div class="settings-row" style="margin-top:0.6rem;">
+        <label for="cols-input">layout</label>
+        <input id="cols-input" type="number" min="1" max="4" onchange="setLayout(this.value, gridRows)"/>
+        <span style="color:var(--fg-dim)">cols ×</span>
+        <input id="rows-input" type="number" min="1" max="3" onchange="setLayout(gridCols, this.value)"/>
+        <span style="color:var(--fg-dim)">rows</span>
+      </div>
+      <div class="settings-hint">e.g. 2 × 1 = two tall columns · 3 × 1 = three tall columns · 2 × 2 = four cells</div>
       <div class="settings-row" style="justify-content:flex-end; margin-top:0.5rem;">
-        <button class="btn" onclick="setFont(14)">reset</button>
+        <button class="btn" onclick="setFont(14)">reset font</button>
       </div>
     </div>
   </div>
   <div id="active-grid" class="active-grid"></div>
 
 <script>
-const NCELLS = 4;
+function clampi(v, def, lo, hi) { v = parseInt(v, 10); if (!v || isNaN(v)) v = def; return Math.min(hi, Math.max(lo, v)); }
+let gridCols = clampi(localStorage.getItem('activeCols'), 2, 1, 4);   // grid columns
+let gridRows = clampi(localStorage.getItem('activeRows'), 2, 1, 3);   // grid rows (rows=1 → tall columns)
 let lanes = [];              // [{id,name,kind,...}] from /api/state
 let siblings = [];           // from /api/siblings
 let cellLanes = loadCellLanes();
@@ -1813,11 +1831,30 @@ let cellLanes = loadCellLanes();
 function loadCellLanes() {
   try {
     const v = JSON.parse(localStorage.getItem('activeCells') || '[]');
-    if (Array.isArray(v)) return [0,1,2,3].map(i => v[i] || '');
+    if (Array.isArray(v)) return v.map(x => x || '');
   } catch (e) {}
-  return ['','','',''];
+  return [];
 }
 function saveCellLanes() { localStorage.setItem('activeCells', JSON.stringify(cellLanes)); }
+
+function applyLayoutStyle() {
+  const grid = document.getElementById('active-grid');
+  grid.style.setProperty('--gcols', 'repeat(' + gridCols + ', 1fr)');
+  grid.style.setProperty('--grows', 'repeat(' + gridRows + ', 1fr)');
+}
+function updateLayoutUI() {
+  const c = document.getElementById('cols-input'); if (c) c.value = String(gridCols);
+  const r = document.getElementById('rows-input'); if (r) r.value = String(gridRows);
+}
+function setLayout(cols, rows) {
+  gridCols = clampi(cols, 2, 1, 4);
+  gridRows = clampi(rows, 2, 1, 3);
+  localStorage.setItem('activeCols', String(gridCols));
+  localStorage.setItem('activeRows', String(gridRows));
+  updateLayoutUI();
+  buildGrid();   // rebuild cells to cols×rows (keeps each cell's lane by index)
+  tick();
+}
 
 // --- view settings (font size) ---
 let tsize = parseInt(localStorage.getItem('activeFont') || '14', 10) || 14;
@@ -1875,6 +1912,7 @@ class Cell {
     this.updatePinUI();
     this.reset();
   }
+  destroy() { if (this.ro) this.ro.disconnect(); }
   setPinned(v) {
     this.pinned = v;
     this.updatePinUI();
@@ -1949,8 +1987,11 @@ const cells = [];
 
 function buildGrid() {
   const grid = document.getElementById('active-grid');
+  for (const c of cells) c.destroy();
+  cells.length = 0;
   grid.innerHTML = '';
-  for (let i = 0; i < NCELLS; i++) {
+  const n = gridCols * gridRows;
+  for (let i = 0; i < n; i++) {
     const cell = document.createElement('div');
     cell.className = 'active-cell';
     cell.innerHTML =
@@ -1964,6 +2005,7 @@ function buildGrid() {
     grid.appendChild(cell);
     cells.push(new Cell(i, cell));
   }
+  applyLayoutStyle();
 }
 
 function laneById(id) { return lanes.find(l => l.id === id) || null; }
@@ -2022,6 +2064,7 @@ async function tick() {
 }
 
 applyFont();
+updateLayoutUI();
 buildGrid();
 tick();
 setInterval(tick, 2000);
