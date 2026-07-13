@@ -400,6 +400,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span id="lane-workdir-hint" class="budget-numbers"></span>
     </div>
     <div class="controlbar">
+      <label for="lane-board-dir">board dir</label>
+      <input id="lane-board-dir" type="text" placeholder="(empty = same as workdir)" style="flex:1; min-width:14em;" />
+      <button class="btn" onclick="applyLaneBoardDir()">set</button>
+      <button class="btn" onclick="clearLaneBoardDir()">clear</button>
+      <span id="lane-board-dir-hint" class="budget-numbers"></span>
+    </div>
+    <div class="controlbar">
       <label for="lane-message">message</label>
       <span id="lane-message-hint" class="budget-numbers"></span>
       <span style="flex:1"></span>
@@ -575,7 +582,7 @@ function boardHandle() {
   const lane = currentLane();
   if (!lane) return null;
   if (lane.kind === 'corner') return null;   // corner = open space, not a task board
-  if (lane.workdir) return 'lane:' + lane.id;
+  if (lane.workdir || lane.board_dir) return 'lane:' + lane.id;
   const sibs = laneSiblings();   // newest first (server sorts by mtime desc)
   return sibs.length ? sibs[0].name : null;
 }
@@ -811,6 +818,22 @@ function clearLaneWorkdir() {
   setLaneWorkdir('');
 }
 
+async function setLaneBoardDir(boardDir) {
+  const lane = currentLane();
+  if (!lane) return;
+  try { await laneFetch('/api/control/lane/board-dir', { lane: lane.id, board_dir: boardDir }); heartbeat(); refreshBoard(); }
+  catch (e) { /* alerted */ }
+}
+
+function applyLaneBoardDir() {
+  setLaneBoardDir(document.getElementById('lane-board-dir').value.trim());
+}
+
+function clearLaneBoardDir() {
+  document.getElementById('lane-board-dir').value = '';
+  setLaneBoardDir('');
+}
+
 function toggleLaneRun() {
   const lane = currentLane();
   if (!lane) return;
@@ -964,6 +987,15 @@ function syncLanePanel(s) {
     wdHint.textContent = lane.workdir
       ? 'runs claude directly here — no worktree, no git, no template (max 1 worker)'
       : 'per-iteration git worktrees under runs/ (default)';
+  }
+
+  const bdInput = document.getElementById('lane-board-dir');
+  if (bdInput && document.activeElement !== bdInput) bdInput.value = lane.board_dir || '';
+  const bdHint = document.getElementById('lane-board-dir-hint');
+  if (bdHint) {
+    bdHint.textContent = lane.board_dir
+      ? 'board tasks live in this dir (relative → under workdir); keep it inside the workdir so claude can reach it'
+      : 'board tasks live in the working directory (default)';
   }
 
   // one-shot message box synced to the lane's pending message (don't clobber typing)
@@ -1872,7 +1904,28 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
     # lane. Claude edits the board files directly; these endpoints are the human
     # side of the same store (the web UI's add / move / edit / delete).
 
+    def _all_lanes():
+        if controls is not None and hasattr(controls, "get_state"):
+            try:
+                return controls.get_state().get("lanes", [])
+            except Exception:
+                pass
+        return []
+
     def _board_work_dir(handle: str):
+        """Resolve a board handle to the directory that holds its board/ folder. For
+        a fixed-workdir lane ('lane:<id>') that's the lane's board_dir (which may be a
+        subdir of, or separate from, the working dir), defaulting to the working dir.
+        For a sibling worktree it's the sibling's work dir."""
+        if handle.startswith("lane:"):
+            lane = next((l for l in _all_lanes() if l.get("id") == handle[len("lane:"):]), None)
+            if lane is None:
+                return None
+            bd = board.resolve_dir(lane.get("workdir") or None, lane.get("board_dir") or None)
+            if bd is None:
+                return None
+            board.ensure_board(bd)
+            return bd
         work = _resolve_work_dir(handle)
         if work is None:
             return None
@@ -2033,6 +2086,20 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if not isinstance(lane, str) or not isinstance(workdir, str):
             return jsonify({"error": "lane and workdir must be strings"}), 400
         res = controls.set_lane_workdir(lane, workdir)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify(res)
+
+    @app.route("/api/control/lane/board-dir", methods=["POST"])
+    def api_set_lane_board_dir():
+        if controls is None or not hasattr(controls, "set_lane_board_dir"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        board_dir = data.get("board_dir", "")
+        if not isinstance(lane, str) or not isinstance(board_dir, str):
+            return jsonify({"error": "lane and board_dir must be strings"}), 400
+        res = controls.set_lane_board_dir(lane, board_dir)
         if res is None:
             return jsonify({"error": f"unknown lane {lane!r}"}), 404
         return jsonify(res)

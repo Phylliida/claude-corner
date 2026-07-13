@@ -57,6 +57,22 @@ def board_dir(workdir: Path) -> Path:
     return Path(workdir) / BOARD_DIRNAME
 
 
+def resolve_dir(workdir, board_setting=None):
+    """The directory that holds a lane's ``board/`` folder. Defaults to the working
+    directory; when a board_setting is given it overrides that — an absolute path is
+    used as-is, a relative one is taken relative to the working directory (so e.g.
+    workdir=/prog/verus-cad + board_setting='claude-corner' -> the board lives in
+    /prog/verus-cad/claude-corner/board/). Returns None if there's nothing to resolve
+    against (no workdir and no setting)."""
+    setting = (str(board_setting).strip() if board_setting else "")
+    if not setting:
+        return Path(workdir) if workdir else None
+    p = Path(setting).expanduser()
+    if p.is_absolute():
+        return p
+    return (Path(workdir) / p) if workdir else p
+
+
 def _is_task_file(p: Path) -> bool:
     if p.suffix.lower() != ".md":
         return False

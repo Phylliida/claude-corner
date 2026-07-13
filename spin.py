@@ -272,6 +272,7 @@ def save_lanes() -> None:
         data = [
             {"id": l["id"], "name": l["name"], "kind": l["kind"],
              "slots": int(l.get("slots", 0)), "workdir": l.get("workdir") or None,
+             "board_dir": l.get("board_dir") or None,
              "continuous": bool(l.get("continuous", False)),
              "until_board_clear": bool(l.get("until_board_clear", False)),
              "message": l.get("message", "")}
@@ -295,9 +296,11 @@ def _norm_workdir(workdir: str | None) -> str | None:
 
 def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None,
               workdir: str | None = None, continuous: bool = False,
-              message: str = "", until_board_clear: bool = False) -> dict:
+              message: str = "", until_board_clear: bool = False,
+              board_dir: str | None = None) -> dict:
     lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots),
             "workdir": _norm_workdir(workdir), "continuous": bool(continuous),
+            "board_dir": (board_dir or "").strip() or None,
             "until_board_clear": bool(until_board_clear),
             "message": message or ""}
     _lanes[lane_id] = lane
@@ -320,7 +323,8 @@ def load_lanes() -> None:
                                   entry["kind"], entry.get("slots", 0), None,
                                   entry.get("workdir"), entry.get("continuous", False),
                                   entry.get("message", ""),
-                                  entry.get("until_board_clear", False))
+                                  entry.get("until_board_clear", False),
+                                  entry.get("board_dir"))
             except (json.JSONDecodeError, OSError, TypeError) as e:
                 print(f"[harness] could not read {LANES_JSON.name}: {e}; re-migrating", flush=True)
         if "corner" not in _lanes:
@@ -636,6 +640,7 @@ def ctrl_get_state() -> dict:
                 "prompt": lane_prompt(l["id"]),
                 "siblings": counts.get(l["id"], 0),
                 "workdir": l.get("workdir") or "",
+                "board_dir": l.get("board_dir") or "",
                 "continuous": bool(l.get("continuous", False)),
                 "until_board_clear": bool(l.get("until_board_clear", False)),
                 "message": l.get("message", ""),
@@ -725,6 +730,25 @@ def ctrl_set_lane_workdir(lane_id: str, workdir: str | None) -> dict | None:
     _reconcile_event.set()
     print(f"[harness] lane {lane_id!r} workdir → {norm or '(workspaces)'}", flush=True)
     return result
+
+
+def ctrl_set_lane_board_dir(lane_id: str, board_dir: str | None) -> dict | None:
+    """Point a lane's task board at a directory separate from its working directory.
+    The board then lives in <board_dir>/board/ instead of <workdir>/board/. A
+    relative path is taken relative to the working directory (e.g. 'claude-corner'
+    -> <workdir>/claude-corner/board/). Empty reverts to the working directory. Keep
+    it inside the working directory so claude — sandboxed to the workdir — can reach
+    it. Returns the stored setting and its resolved absolute path."""
+    val = (board_dir or "").strip() or None
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["board_dir"] = val
+        resolved = board.resolve_dir(l.get("workdir"), val)
+    save_lanes()
+    print(f"[harness] lane {lane_id!r} board_dir → {val or '(= workdir)'}", flush=True)
+    return {"board_dir": val or "", "resolved": str(resolved) if resolved else ""}
 
 
 def ctrl_set_lane_continuous(lane_id: str, enabled: bool) -> bool | None:
@@ -924,31 +948,48 @@ end this turn normally and next-you will pick up.]
 """
 
 
-def _board_hint(work_dir: Path) -> str:
+def _board_ref(work_dir: Path, board_dir: Path) -> str:
+    """How claude should reference the board dir, given its cwd is work_dir. Uses a
+    './sub/board' relative path when the board lives under the workdir (the common
+    case), else the absolute path."""
+    try:
+        rel = os.path.relpath(str(board_dir), str(work_dir))
+    except (ValueError, TypeError):
+        rel = None
+    if rel == ".":
+        return "./board"
+    if rel is None or rel.startswith(".."):
+        return str(Path(board_dir) / "board")   # outside the workdir — absolute
+    return "./" + rel + "/board"
+
+
+def _board_hint(work_dir: Path, board_dir: Path) -> str:
     """A note prepended to task-mode prompts pointing claude at the task board and
     showing its current state. The board is just markdown files under board/ in the
-    working directory, so claude picks up / creates / finishes tasks by editing them
+    board directory (the working directory by default, or a separate dir the lane
+    was pointed at), so claude picks up / creates / finishes tasks by editing them
     directly — no server, no JSON. The human sees the same files in the web UI."""
     try:
-        board.ensure_board(work_dir)
-        digest = board.summary(work_dir)
+        board.ensure_board(board_dir)
+        digest = board.summary(board_dir)
     except Exception:
         digest = "(board unavailable)"
+    b = _board_ref(work_dir, board_dir)
     return f"""[task board — read this:
 
-there is a task board in ./board/ (one markdown file per task). you pick work FROM
-the board, or add new tasks TO it, by editing these files directly with your normal
-file tools — read ./board/README.md for the exact file format. the human browses
-this same board in the web UI, so it's how you show what you did.
+there is a task board in {b} (one markdown file per task). you pick work FROM the
+board, or add new tasks TO it, by editing these files directly with your normal
+file tools — read {b}/README.md for the exact file format. the human browses this
+same board in the web UI, so it's how you show what you did.
 
 current board:
 {digest}
 
 how to work the board:
-- PICK a task: open a `status: todo` file in ./board/, set `status: in_progress`,
-  and put an id in `claimed_by`. prefer an unclaimed one. (nothing todo? add a task.)
-- ADD a task: create ./board/<slug>.md with `status: todo`. split big work into
-  small, checkable tasks.
+- PICK a task: open a `status: todo` file in {b}/, set `status: in_progress`, and
+  put an id in `claimed_by`. prefer an unclaimed one. (nothing todo? add a task.)
+- ADD a task: create {b}/<slug>.md with `status: todo`. split big work into small,
+  checkable tasks.
 - LOG progress under `## Progress` as you go — that thread is how the next you (a
   fresh, memoryless instance) picks up where you left off.
 - FINISH: set `status: done` and fill in `## Writeup` — findings, how the code
@@ -1341,6 +1382,10 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 break
             iters += 1
             task_text = lane_prompt(lane_id)
+            # The board may live in a directory separate from the working dir. Re-read
+            # the setting each iteration so a live change takes effect; defaults to the
+            # working dir. Used for the board hint, companion digest, and until-clear.
+            bdir = board.resolve_dir(work_dir, (get_lane(lane_id) or {}).get("board_dir"))
             # One-shot user feedback for this lane: drop it into the workspace so
             # claude can read it directly, and (if the companion runs) weave it into
             # the next prompt. Cleared once delivered, via compare-and-clear so a
@@ -1357,7 +1402,7 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             if _prompter_enabled and last_response:
                 # Give the companion the board's open task titles so it can nudge
                 # claude toward a card (empty for corner lanes / empty boards).
-                board_open = board.open_digest(work_dir)
+                board_open = board.open_digest(bdir)
                 gen = call_prompter(task_text, last_response, label,
                                     feedback if filed else "", board_open)
                 if gen:
@@ -1375,7 +1420,7 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             if kind == "task":
                 # Prepend the board hint (always, so claude sees/updates the board)
                 # then the notify-done hint (only when the web UI is up to receive it).
-                prompt = _board_hint(work_dir) + prompt
+                prompt = _board_hint(work_dir, bdir) + prompt
                 if _web_port > 0:
                     prompt = _task_notify_hint(_web_port, lane_id) + prompt
             log(label, f"firing {sibling} (iter {iters})")
@@ -1400,8 +1445,8 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
 
             # "until board clear" mode: once every task on this directory's board is
             # done, pause the lane — the directory stops spinning up new claudes.
-            if until_clear and board.all_done(work_dir):
-                c = board.counts(work_dir)
+            if until_clear and board.all_done(bdir):
+                c = board.counts(bdir)
                 log(label, f"{sibling}: board complete ({c['done']}/{c['total']} tasks done) — "
                            f"pausing lane {lane_id!r}")
                 _send_zulip(f"Board complete for lane {lane_id!r}: all {c['total']} task(s) done. "
@@ -1663,6 +1708,7 @@ def main():
                 set_lane_prompt=ctrl_set_lane_prompt,
                 set_lane_slots=ctrl_set_lane_slots,
                 set_lane_workdir=ctrl_set_lane_workdir,
+                set_lane_board_dir=ctrl_set_lane_board_dir,
                 set_lane_continuous=ctrl_set_lane_continuous,
                 set_lane_until_board_clear=ctrl_set_lane_until_board_clear,
                 set_lane_message=ctrl_set_lane_message,
