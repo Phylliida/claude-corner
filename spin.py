@@ -119,11 +119,11 @@ _web_port: int = 0
 # there's no event to hook). Configurable via env; disabled if there's no zulip script.
 BOARD_DONE_STREAM = os.environ.get("CLAUDE_CORNER_BOARD_STREAM", "Bot")
 BOARD_WATCH_INTERVAL = int(os.environ.get("CLAUDE_CORNER_BOARD_WATCH_INTERVAL", "20"))
-# key = "<board_dir>::<task_id>". _announced_done: already posted (or seeded at boot).
-# _pending_done: seen done but awaiting one stable poll (file mtime unchanged) so we
-# don't announce a half-written writeup mid-edit — maps key -> last-seen mtime.
+# Only announce a task once its file has been quiet for this long, so edits still
+# coming in (a writeup being finished) don't trigger an early/partial post.
+BOARD_SETTLE_SECONDS = int(os.environ.get("CLAUDE_CORNER_BOARD_SETTLE", "60"))
+# key = "<board_dir>::<task_id>" for tasks already posted (or seeded silently at boot).
 _announced_done: set[str] = set()
-_pending_done: dict[str, float] = {}
 _board_watch_seeded = False
 
 # Companion prompter: a local OpenAI-compatible model that, in task mode, reads
@@ -1121,45 +1121,36 @@ def _completed_task_message(task: dict) -> str:
 def _scan_boards_for_completions(seed: bool) -> None:
     """One pass of the completion watcher. On the seed pass, record every currently-done
     task as already-announced (so a restart doesn't re-post history) without messaging.
-    Afterwards, announce a task once it is done AND its file has been stable for one poll
-    (guards against posting a writeup that's still mid-edit)."""
+    Afterwards, announce a done task once its file has been quiet for BOARD_SETTLE_SECONDS
+    — long enough that a writeup still being edited isn't posted early."""
+    now = time.time()
     for bdir, lane_id in _board_dirs_to_watch().items():
         try:
             tasks = board.list_tasks(Path(bdir))
         except Exception:
             continue
-        live_done_keys = set()
         for t in tasks:
             key = f"{bdir}::{t['id']}"
             if t["status"] != "done":
-                # a task that left 'done' (reopened) becomes eligible to re-announce
-                _announced_done.discard(key)
-                _pending_done.pop(key, None)
+                _announced_done.discard(key)   # reopened → eligible to re-announce
                 continue
-            live_done_keys.add(key)
             if key in _announced_done:
                 continue
             if seed:
                 _announced_done.add(key)
                 continue
-            mtime = t.get("mtime", 0.0)
-            if _pending_done.get(key) == mtime:
-                # stable across a poll — safe to announce. Only mark it done on a
-                # successful post, so a transient zulip failure retries next poll.
-                res = _send_zulip_stream(BOARD_DONE_STREAM, bdir, _completed_task_message(t))
-                if res.get("zulip_sent"):
-                    _announced_done.add(key)
-                    _pending_done.pop(key, None)
-                    print(f"[board-watch] announced done task {t['id']!r} "
-                          f"(lane {lane_id!r}) to #{BOARD_DONE_STREAM} topic={bdir}", flush=True)
-                else:
-                    print(f"[board-watch] failed to announce {t['id']!r}: "
-                          f"{res.get('zulip_error')} (will retry)", flush=True)
+            if now - t.get("mtime", 0.0) < BOARD_SETTLE_SECONDS:
+                continue   # changed recently — wait, more edits may still be coming
+            # Only mark it announced on a successful post, so a transient zulip
+            # failure retries on the next poll.
+            res = _send_zulip_stream(BOARD_DONE_STREAM, bdir, _completed_task_message(t))
+            if res.get("zulip_sent"):
+                _announced_done.add(key)
+                print(f"[board-watch] announced done task {t['id']!r} "
+                      f"(lane {lane_id!r}) to #{BOARD_DONE_STREAM} topic={bdir}", flush=True)
             else:
-                _pending_done[key] = mtime   # wait one more poll for the file to settle
-        # forget pending entries whose task disappeared
-        for k in [k for k in _pending_done if k.startswith(bdir + "::") and k not in live_done_keys]:
-            _pending_done.pop(k, None)
+                print(f"[board-watch] failed to announce {t['id']!r}: "
+                      f"{res.get('zulip_error')} (will retry)", flush=True)
 
 
 def board_watch_loop(interval_sec: int) -> None:
@@ -1865,7 +1856,8 @@ def main():
     if _zulip_script is not None and BOARD_WATCH_INTERVAL > 0:
         threading.Thread(target=board_watch_loop, args=(BOARD_WATCH_INTERVAL,), daemon=True).start()
         print(f"[harness] board-completion watcher on: finished tasks post to "
-              f"#{BOARD_DONE_STREAM} (topic = board dir), every {BOARD_WATCH_INTERVAL}s", flush=True)
+              f"#{BOARD_DONE_STREAM} (topic = board dir) after {BOARD_SETTLE_SECONDS}s quiet, "
+              f"polling every {BOARD_WATCH_INTERVAL}s", flush=True)
     else:
         print("[harness] board-completion watcher off (no --zulip-script)", flush=True)
 
