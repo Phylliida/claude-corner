@@ -1893,8 +1893,9 @@ function toggleEdits() { setHideEdits(!hideEdits); }
 
 // Concise render of one event: the initial prompt (very first user message) is kept in
 // full; assistant turns keep text and reduce tool calls to their title (e.g. "▸ Bash"),
-// dropping thinking. Everything else — later user turns, tool results, thinking-only
-// assistant turns — returns null (hidden).
+// dropping thinking. File edits are the exception — when they're not being hidden they
+// keep their full diff (that's usually the thing you want to see). Everything else —
+// later user turns, tool results, thinking-only assistant turns — returns null (hidden).
 function renderConcise(ev, isFirstPrompt) {
   if (ev.role !== 'assistant') {
     if (!isFirstPrompt) return null;   // hide all user turns except the initial prompt
@@ -1913,9 +1914,13 @@ function renderConcise(ev, isFirstPrompt) {
     if (b.type === 'text') {
       if ((b.text || '').trim()) parts.push(div('msg-text', b.text));
     } else if (b.type === 'tool_use') {
-      const t = div('block-tool');
-      t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
-      parts.push(t);
+      if (isFileEdit(b)) {
+        parts.push(renderToolUse(b));   // keep the full edit + diff (hide-edits already removed it if on)
+      } else {
+        const t = div('block-tool');
+        t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
+        parts.push(t);
+      }
     }
   }
   if (!parts.length) return null;
