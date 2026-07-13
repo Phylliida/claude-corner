@@ -1775,6 +1775,7 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     .active-pin:hover { color: var(--fg); }
     .active-pin.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
     #concise-btn.on { background: var(--accent2); color: var(--bg); border-color: var(--accent2); }
+    #edits-btn.on { background: var(--tool); color: var(--bg); border-color: var(--tool); }
     .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
     /* Font size is user-adjustable via the settings popover (--tsize, px). Everything
        in the transcript scales off it, and text reflows within the cell width (calc()
@@ -1799,7 +1800,8 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     <a class="btn" href="/">← board</a>
     <h1>active view</h1>
     <span id="active-status" class="active-cell-meta">connecting…</span>
-    <button id="concise-btn" class="btn" title="concise mode — only assistant messages and tool-call titles (no user turns, tool results, or thinking)" onclick="toggleConcise()">concise</button>
+    <button id="edits-btn" class="btn" title="hide file-edit tool calls (Edit / Write / MultiEdit) and their diffs" onclick="toggleEdits()">hide edits</button>
+    <button id="concise-btn" class="btn" title="concise mode — the initial prompt, then only assistant messages and tool-call titles (no other user turns, tool results, or thinking)" onclick="toggleConcise()">concise</button>
     <div id="settings-pop" class="settings-pop" style="display:none">
       <div class="settings-title">view settings</div>
       <div class="settings-row">
@@ -1858,8 +1860,13 @@ function setLayout(cols, rows) {
   tick();
 }
 
-// --- concise mode: only assistant text + tool-call titles ---
+// --- view filters: concise mode + hide file edits (independent toggles) ---
 let conciseMode = localStorage.getItem('activeConcise') === '1';
+let hideEdits = localStorage.getItem('activeHideEdits') === '1';
+
+const FILE_EDIT_TOOLS = ['Edit', 'MultiEdit', 'NotebookEdit', 'Write'];
+function isFileEdit(b) { return b.type === 'tool_use' && FILE_EDIT_TOOLS.indexOf(b.name) !== -1; }
+
 function updateConciseUI() {
   const b = document.getElementById('concise-btn');
   if (b) b.classList.toggle('on', conciseMode);
@@ -1872,11 +1879,35 @@ function setConcise(v) {
 }
 function toggleConcise() { setConcise(!conciseMode); }
 
-// Concise render of one event: assistant only, text kept, tool calls reduced to their
-// title (e.g. "▸ Bash"), thinking dropped. Returns null for anything to hide (user
-// turns, tool results, assistant turns that had only thinking).
-function renderConcise(ev) {
-  if (ev.role !== 'assistant') return null;
+function updateEditsUI() {
+  const b = document.getElementById('edits-btn');
+  if (b) b.classList.toggle('on', hideEdits);
+}
+function setHideEdits(v) {
+  hideEdits = v;
+  localStorage.setItem('activeHideEdits', v ? '1' : '0');
+  updateEditsUI();
+  for (const cell of cells) cell.rerenderAll();
+}
+function toggleEdits() { setHideEdits(!hideEdits); }
+
+// Concise render of one event: the initial prompt (very first user message) is kept in
+// full; assistant turns keep text and reduce tool calls to their title (e.g. "▸ Bash"),
+// dropping thinking. Everything else — later user turns, tool results, thinking-only
+// assistant turns — returns null (hidden).
+function renderConcise(ev, isFirstPrompt) {
+  if (ev.role !== 'assistant') {
+    if (!isFirstPrompt) return null;   // hide all user turns except the initial prompt
+    const parts = [];
+    for (const b of ev.blocks) {
+      if (b.type === 'text' && (b.text || '').trim()) parts.push(div('msg-text', b.text));
+    }
+    if (!parts.length) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'msg msg-user';
+    for (const p of parts) wrap.appendChild(p);
+    return wrap;
+  }
   const parts = [];
   for (const b of ev.blocks) {
     if (b.type === 'text') {
@@ -1974,16 +2005,32 @@ class Cell {
   // message stays in the DOM so the scrollbar spans the whole session; off-screen ones
   // are skipped by the browser via `content-visibility: auto` (see the cell CSS), so a
   // long transcript stays fast without breaking the scrollbar.
-  makeNode(ev) { return conciseMode ? renderConcise(ev) : renderMessage(ev); }  // null = hide
+  // Index of the very first user message (the initial prompt) — kept in concise mode.
+  firstPromptIdx() {
+    for (let i = 0; i < this.events.length; i++) {
+      const ev = this.events[i];
+      if (ev.role === 'user' && ev.blocks.some(b => b.type === 'text')) return i;
+    }
+    return -1;
+  }
+  makeNode(ev, idx, fp) {   // returns a DOM node, or null to hide this event
+    if (hideEdits) {
+      const blocks = ev.blocks.filter(b => !isFileEdit(b));
+      if (blocks.length !== ev.blocks.length) ev = { role: ev.role, blocks };
+    }
+    if (!ev.blocks.length) return null;
+    return conciseMode ? renderConcise(ev, idx === fp) : renderMessage(ev);
+  }
   renderAll() {
+    const fp = this.firstPromptIdx();
     const frag = document.createDocumentFragment();
-    for (const ev of this.events) { const n = this.makeNode(ev); if (n) frag.appendChild(n); }
+    for (let i = 0; i < this.events.length; i++) { const n = this.makeNode(this.events[i], i, fp); if (n) frag.appendChild(n); }
     this.content.innerHTML = '';
     if (frag.childNodes.length) this.content.appendChild(frag);
     else this.setEmpty(conciseMode ? '(no assistant output yet)' : '(no messages)');
     this.scrollBottom();   // ResizeObserver keeps it pinned as heights settle
   }
-  rerenderAll() { if (this.sessionKey) this.renderAll(); }   // on concise toggle
+  rerenderAll() { if (this.sessionKey) this.renderAll(); }   // on a filter toggle
   update(sessionKey, events) {
     if (sessionKey !== this.sessionKey) {          // new (or first) session → full render
       this.sessionKey = sessionKey;
@@ -1993,10 +2040,11 @@ class Cell {
     }
     if (events.length <= this.events.length) { this.events = events; return; }
     const start = this.events.length;
+    const fp = this.firstPromptIdx();
     this.events = events;
     this.clearEmpty();
     const frag = document.createDocumentFragment();
-    for (let i = start; i < events.length; i++) { const n = this.makeNode(events[i]); if (n) frag.appendChild(n); }
+    for (let i = start; i < events.length; i++) { const n = this.makeNode(events[i], i, fp); if (n) frag.appendChild(n); }
     if (frag.childNodes.length) this.content.appendChild(frag);
     if (this.pinned) this.scrollBottom();   // ResizeObserver re-pins after layout settles
   }
@@ -2128,6 +2176,7 @@ async function tick() {
 
 applyFont();
 updateConciseUI();
+updateEditsUI();
 updateLayoutUI();
 buildGrid();
 tick();
