@@ -1079,11 +1079,12 @@ def _set_last_companion(sibling: str, iters: int, prompt: str) -> None:
 
 
 def call_prompter(task_text: str, last_response: str, slot: int,
-                  feedback: str | None = None) -> str | None:
+                  feedback: str | None = None, board_open: str | None = None) -> str | None:
     """Ask the companion model to write the next claude prompt from the task and
     claude's most recent response. An optional one-shot feedback message from the
-    human is woven in. Returns None on any failure so the caller can fall back to
-    the static task prompt."""
+    human is woven in, along with the board's currently-open task titles (todo /
+    in progress) so the companion can nudge claude toward a card. Returns None on
+    any failure so the caller can fall back to the static task prompt."""
     if not _prompter_enabled:
         return None
     snippet = last_response.strip()
@@ -1093,6 +1094,15 @@ def call_prompter(task_text: str, last_response: str, slot: int,
         "ORIGINAL PROMPT (the task or invitation Claude was given):\n" + task_text.strip() +
         "\n\n---\n\nCLAUDE'S MOST RECENT RESPONSE (end of the last iteration):\n" + snippet
     )
+    if board_open and board_open.strip():
+        user += (
+            "\n\n---\n\nTHE TASK BOARD — tasks currently open (marked todo or in "
+            "progress). The board lives in ./board/ as one markdown file per task, and "
+            "Claude works it by editing those files (claim a todo, log progress, finish "
+            "with a writeup). If it fits naturally, point Claude at one of these as a "
+            "peer might ('want to pick up X?'), or suggest a fresh card — but don't force "
+            "it; Claude picks:\n" + board_open.strip()
+        )
     if feedback and feedback.strip():
         user += (
             "\n\n---\n\nEXTRA FEEDBACK FROM DANIELLE (the human watching this loop, "
@@ -1314,7 +1324,11 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             # claude's most recent response. First iteration (no response yet) and
             # any companion failure fall back to the static lane prompt.
             if _prompter_enabled and last_response:
-                gen = call_prompter(task_text, last_response, label, feedback if filed else "")
+                # Give the companion the board's open task titles so it can nudge
+                # claude toward a card (empty for corner lanes / empty boards).
+                board_open = board.open_digest(work_dir)
+                gen = call_prompter(task_text, last_response, label,
+                                    feedback if filed else "", board_open)
                 if gen:
                     prompt = gen
                     _set_last_companion(sibling, iters, gen)

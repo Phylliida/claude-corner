@@ -318,6 +318,26 @@ def ensure_board(workdir: Path) -> None:
         pass
 
 
+def open_digest(workdir: Path, max_items: int = 20) -> str:
+    """Titles of the tasks that are todo or in progress, for the companion model's
+    context. Empty string when there's no board or nothing open (e.g. corner lanes,
+    which have no board dir — this never creates one)."""
+    open_tasks = [t for t in list_tasks(workdir) if t["status"] in ("todo", "in_progress")]
+    if not open_tasks:
+        return ""
+    # in-progress first, then todo; each keeps its newest-first order from list_tasks
+    ordered = ([t for t in open_tasks if t["status"] == "in_progress"]
+               + [t for t in open_tasks if t["status"] == "todo"])
+    lines: list[str] = []
+    for t in ordered[:max_items]:
+        label = "in progress" if t["status"] == "in_progress" else "todo"
+        who = f" (claimed by {t['claimed_by']})" if t["claimed_by"] else ""
+        lines.append(f"- [{label}] {t['title']}{who}")
+    if len(ordered) > max_items:
+        lines.append(f"- … and {len(ordered) - max_items} more")
+    return "\n".join(lines)
+
+
 def summary(workdir: Path, max_items: int = 12) -> str:
     """A compact text digest of the board for injecting into a prompt."""
     tasks = list_tasks(workdir)
