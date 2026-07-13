@@ -2022,6 +2022,23 @@ function mostRecentSession(laneId) {
   return best;
 }
 
+// The session to show for a cell. Prefer the one this lane recorded in its board dir
+// (so lanes that share a workdir but keep separate boards don't thrash between each
+// other's sessions); fall back to most-recent for lanes without a recording.
+function sessionForCell(lane) {
+  if (!lane) return null;
+  if (lane.active_session && lane.workdir) {
+    const handle = 'lane:' + lane.id;
+    let mtime = 0;
+    for (const s of siblings) {
+      if (s.name !== handle) continue;
+      for (const sess of (s.sessions || [])) if (sess.id === lane.active_session) mtime = sess.mtime;
+    }
+    return { sibling: handle, sessionId: lane.active_session, mtime };
+  }
+  return mostRecentSession(lane.id);
+}
+
 async function fetchSession(sibling, sessionId) {
   try {
     const r = await fetch('/api/session/' + sibling + '/' + sessionId, { cache: 'no-store' });
@@ -2046,14 +2063,15 @@ async function tick() {
 
     for (const cell of cells) {
       cell.refreshOptions();
-      if (!cell.laneId) { cell.setMeta(null); continue; }
-      const rec = mostRecentSession(cell.laneId);
       const lane = laneById(cell.laneId);
+      if (!cell.laneId) { cell.setMeta(null); continue; }
+      const rec = sessionForCell(lane);
       if (!rec) { if (cell.sessionKey) cell.reset(); cell.setMeta(null); continue; }
       const key = rec.sibling + '/' + rec.sessionId;
       cell.setMeta(rec, lane && lane.running);
-      // Skip the fetch if nothing changed since last time (same session, same mtime).
-      if (key === cell.sessionKey && rec.mtime === cell.lastMtime) continue;
+      // Skip the fetch if nothing changed since last time (same session, same known
+      // mtime). When mtime is unknown (0), always fetch so live updates aren't missed.
+      if (key === cell.sessionKey && rec.mtime > 0 && rec.mtime === cell.lastMtime) continue;
       cell.lastMtime = rec.mtime;
       const events = await fetchSession(rec.sibling, rec.sessionId);
       if (events) cell.update(key, events);
