@@ -317,6 +317,9 @@ the board, so anything you write here shows up there.
   human) can follow the thread.
 - **Finish:** set `status: done` and fill in `## Writeup` — findings, how the
   code works, assumptions. Be honest about what's partial or unverified.
+- **Commit:** once a task is done, commit your work with git
+  (`git add -A && git commit -m "<what you did>"`) so the finished task and its
+  writeup are checkpointed.
 
 Files starting with `.` or `_`, plus this README, are ignored by the board.
 """
