@@ -383,6 +383,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="controlbar">
       <button id="lane-run" class="btn">…</button>
       <button id="lane-continuous" class="btn" title="keep this lane running even if claude marks done or calls notify-done">…</button>
+      <button id="lane-until-board" class="btn" title="keep running until every task on this lane's board is done, then pause the lane (the directory stops spinning up new claudes)">…</button>
       <label for="lane-slots">workers</label>
       <input id="lane-slots" type="number" min="0" step="1" />
       <button class="btn" onclick="applyLaneSlots()">set</button>
@@ -827,6 +828,17 @@ function toggleLaneContinuous() {
   setLaneContinuous(lane.id, !lane.continuous);
 }
 
+async function setLaneUntilBoard(id, on) {
+  try { await laneFetch('/api/control/lane/until-board-clear', { lane: id, until_board_clear: on }); heartbeat(); }
+  catch (e) { /* alerted */ }
+}
+
+function toggleLaneUntilBoard() {
+  const lane = currentLane();
+  if (!lane) return;
+  setLaneUntilBoard(lane.id, !lane.until_board_clear);
+}
+
 async function setLaneMessage(id, text) {
   try {
     await laneFetch('/api/control/lane/message', { lane: id, message: text });
@@ -897,6 +909,23 @@ function syncLanePanel(s) {
       contBtn.className = 'btn';
     }
     contBtn.onclick = toggleLaneContinuous;
+  }
+  const ubBtn = document.getElementById('lane-until-board');
+  if (ubBtn) {
+    // Only meaningful for task lanes (corner is the open space, no board).
+    if (lane.kind === 'corner') {
+      ubBtn.style.display = 'none';
+    } else {
+      ubBtn.style.display = '';
+      if (lane.until_board_clear) {
+        ubBtn.textContent = '✓ until board done: ON';
+        ubBtn.className = 'btn btn-start';
+      } else {
+        ubBtn.textContent = '✓ until board done: off';
+        ubBtn.className = 'btn';
+      }
+      ubBtn.onclick = toggleLaneUntilBoard;
+    }
   }
   const slotsInput = document.getElementById('lane-slots');
   slotsInput.max = (lane.kind === 'corner' && !lane.workdir) ? (s.max_slots_per_lane || 4) : 1;
@@ -2002,6 +2031,20 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if res is None:
             return jsonify({"error": f"unknown lane {lane!r}"}), 404
         return jsonify({"continuous": res})
+
+    @app.route("/api/control/lane/until-board-clear", methods=["POST"])
+    def api_set_lane_until_board_clear():
+        if controls is None or not hasattr(controls, "set_lane_until_board_clear"):
+            return jsonify({"error": "no controls wired"}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        lane = data.get("lane")
+        enabled = data.get("until_board_clear")
+        if not isinstance(lane, str) or not isinstance(enabled, bool):
+            return jsonify({"error": "lane must be a string and until_board_clear a bool"}), 400
+        res = controls.set_lane_until_board_clear(lane, enabled)
+        if res is None:
+            return jsonify({"error": f"unknown lane {lane!r}"}), 404
+        return jsonify({"until_board_clear": res})
 
     @app.route("/api/control/lane/message", methods=["POST"])
     def api_set_lane_message():
