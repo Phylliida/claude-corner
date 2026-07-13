@@ -273,6 +273,7 @@ def save_lanes() -> None:
             {"id": l["id"], "name": l["name"], "kind": l["kind"],
              "slots": int(l.get("slots", 0)), "workdir": l.get("workdir") or None,
              "continuous": bool(l.get("continuous", False)),
+             "until_board_clear": bool(l.get("until_board_clear", False)),
              "message": l.get("message", "")}
             for l in _lanes.values()
         ]
@@ -294,9 +295,10 @@ def _norm_workdir(workdir: str | None) -> str | None:
 
 def _add_lane(lane_id: str, name: str, kind: str, slots: int, prompt: str | None,
               workdir: str | None = None, continuous: bool = False,
-              message: str = "") -> dict:
+              message: str = "", until_board_clear: bool = False) -> dict:
     lane = {"id": lane_id, "name": name, "kind": kind, "slots": int(slots),
             "workdir": _norm_workdir(workdir), "continuous": bool(continuous),
+            "until_board_clear": bool(until_board_clear),
             "message": message or ""}
     _lanes[lane_id] = lane
     if prompt is not None or not _lane_prompt_path(lane_id).exists():
@@ -317,7 +319,8 @@ def load_lanes() -> None:
                         _add_lane(entry["id"], entry.get("name", entry["id"]),
                                   entry["kind"], entry.get("slots", 0), None,
                                   entry.get("workdir"), entry.get("continuous", False),
-                                  entry.get("message", ""))
+                                  entry.get("message", ""),
+                                  entry.get("until_board_clear", False))
             except (json.JSONDecodeError, OSError, TypeError) as e:
                 print(f"[harness] could not read {LANES_JSON.name}: {e}; re-migrating", flush=True)
         if "corner" not in _lanes:
@@ -634,6 +637,7 @@ def ctrl_get_state() -> dict:
                 "siblings": counts.get(l["id"], 0),
                 "workdir": l.get("workdir") or "",
                 "continuous": bool(l.get("continuous", False)),
+                "until_board_clear": bool(l.get("until_board_clear", False)),
                 "message": l.get("message", ""),
             })
     lanes.sort(key=lambda x: (x["kind"] != "corner", x["name"].lower(), x["id"]))
@@ -740,6 +744,24 @@ def ctrl_set_lane_continuous(lane_id: str, enabled: bool) -> bool | None:
     return val
 
 
+def ctrl_set_lane_until_board_clear(lane_id: str, enabled: bool) -> bool | None:
+    """Toggle a lane's 'run until the board is clear' mode. When on, after each
+    iteration the lane checks its task board (./board/ in the workdir); once every
+    task is marked done (and there is at least one task), the lane pauses itself —
+    that directory stops spinning up new claudes. Until then it keeps firing, even
+    if claude marks .done, so it grinds through the whole board. An empty board
+    keeps running so claude/you can populate it first."""
+    val = bool(enabled)
+    with _lanes_lock:
+        l = _lanes.get(lane_id)
+        if not l:
+            return None
+        l["until_board_clear"] = val
+    save_lanes()
+    print(f"[harness] lane {lane_id!r} until_board_clear → {val}", flush=True)
+    return val
+
+
 def ctrl_set_lane_message(lane_id: str, text: str) -> str | None:
     """Set a one-shot feedback message for a lane. It's folded into the prompt the
     companion model reads when it writes the next claude prompt, then cleared the
@@ -823,12 +845,11 @@ def ctrl_delete_lane(lane_id: str) -> bool:
     return True
 
 
-def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
-    """Called by a sibling via HTTP when a task is complete. Sends the message
-    via the configured zulip script (if any) and pauses the lane that called it.
-    Pausing only the calling lane (not the global brake) keeps every other lane
-    running — one task finishing no longer stops the others."""
-    result: dict = {"message": message, "lane": lane_id, "zulip_sent": False, "paused": False}
+def _send_zulip(message: str) -> dict:
+    """Send a DM via the configured zulip script (if any). Returns a dict with
+    'zulip_sent' and either 'zulip_output' or 'zulip_error'. Shared by the
+    notify-done path and the 'board complete' auto-notification."""
+    out: dict = {"zulip_sent": False}
     if _zulip_script is not None and _zulip_script.is_file():
         try:
             r = subprocess.run(
@@ -836,14 +857,24 @@ def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
-                result["zulip_sent"] = True
-                result["zulip_output"] = (r.stdout or "").strip()[:500]
+                out["zulip_sent"] = True
+                out["zulip_output"] = (r.stdout or "").strip()[:500]
             else:
-                result["zulip_error"] = (r.stderr or r.stdout or "non-zero exit").strip()[:500]
+                out["zulip_error"] = (r.stderr or r.stdout or "non-zero exit").strip()[:500]
         except Exception as e:
-            result["zulip_error"] = f"{type(e).__name__}: {e}"
+            out["zulip_error"] = f"{type(e).__name__}: {e}"
     else:
-        result["zulip_error"] = "no --zulip-script configured"
+        out["zulip_error"] = "no --zulip-script configured"
+    return out
+
+
+def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
+    """Called by a sibling via HTTP when a task is complete. Sends the message
+    via the configured zulip script (if any) and pauses the lane that called it.
+    Pausing only the calling lane (not the global brake) keeps every other lane
+    running — one task finishing no longer stops the others."""
+    result: dict = {"message": message, "lane": lane_id, "paused": False}
+    result.update(_send_zulip(message))
 
     lane = get_lane(lane_id) if lane_id else None
     if lane is not None and lane.get("continuous"):
@@ -1362,17 +1393,40 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 if save_iteration(work_dir, f"iter {iters} - {stamp}", bool(remote)):
                     log(label, f"committed iter {iters} for {sibling}")
 
-            # Re-read continuous each iteration so toggling it takes effect live.
-            continuous = bool((get_lane(lane_id) or {}).get("continuous"))
+            # Re-read the run modes each iteration so toggling them takes effect live.
+            lane_now = get_lane(lane_id) or {}
+            continuous = bool(lane_now.get("continuous"))
+            until_clear = bool(lane_now.get("until_board_clear"))
+
+            # "until board clear" mode: once every task on this directory's board is
+            # done, pause the lane — the directory stops spinning up new claudes.
+            if until_clear and board.all_done(work_dir):
+                c = board.counts(work_dir)
+                log(label, f"{sibling}: board complete ({c['done']}/{c['total']} tasks done) — "
+                           f"pausing lane {lane_id!r}")
+                _send_zulip(f"Board complete for lane {lane_id!r}: all {c['total']} task(s) done. "
+                            f"That directory has stopped spinning up new claudes.")
+                try:
+                    (work_dir / DONE).unlink()   # clear a stray marker for a clean future resume
+                except OSError:
+                    pass
+                ctrl_set_lane_slots(lane_id, 0)
+                return
+
+            # Both continuous and until-board-clear ignore claude's own .done and keep
+            # firing — continuous forever, until-clear until the board is done (checked
+            # just above). Only a plain lane lets .done retire/pause it.
+            keep_firing = continuous or until_clear
             if is_done(work_dir):
-                if continuous:
-                    # Continuous lane: claude's stop signal is ignored. Clear the
-                    # marker so it doesn't re-trip, and keep firing fresh sessions.
+                if keep_firing:
+                    # claude's stop signal is ignored. Clear the marker so it doesn't
+                    # re-trip, and keep firing fresh sessions.
                     try:
                         (work_dir / DONE).unlink()
                     except OSError:
                         pass
-                    log(label, f"{sibling} marked .done, but lane is continuous — clearing and continuing")
+                    why = "continuous" if continuous else "until-board-clear (board not yet done)"
+                    log(label, f"{sibling} marked .done, but lane is {why} — clearing and continuing")
                 elif managed and not sticky:
                     log(label, f"{sibling} marked .done, retiring")
                     break
@@ -1610,6 +1664,7 @@ def main():
                 set_lane_slots=ctrl_set_lane_slots,
                 set_lane_workdir=ctrl_set_lane_workdir,
                 set_lane_continuous=ctrl_set_lane_continuous,
+                set_lane_until_board_clear=ctrl_set_lane_until_board_clear,
                 set_lane_message=ctrl_set_lane_message,
                 create_lane=ctrl_create_lane,
                 rename_lane=ctrl_rename_lane,

@@ -318,6 +318,27 @@ def ensure_board(workdir: Path) -> None:
         pass
 
 
+def all_done(workdir: Path) -> bool:
+    """True when the board has at least one task and every task is done — i.e. the
+    board is 'clear' of open work. An empty board returns False (nothing has been
+    completed yet, so a 'run until the board is done' lane keeps running and gives
+    claude a chance to populate it)."""
+    tasks = list_tasks(workdir)
+    if not tasks:
+        return False
+    return all(t["status"] == "done" for t in tasks)
+
+
+def counts(workdir: Path) -> dict:
+    """{status: n} plus 'total', for status lines / notifications."""
+    tasks = list_tasks(workdir)
+    out = {s: 0 for s in STATUSES}
+    for t in tasks:
+        out[t["status"]] = out.get(t["status"], 0) + 1
+    out["total"] = len(tasks)
+    return out
+
+
 def open_digest(workdir: Path, max_items: int = 20) -> str:
     """Titles of the tasks that are todo or in progress, for the companion model's
     context. Empty string when there's no board or nothing open (e.g. corner lanes,
