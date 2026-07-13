@@ -1122,12 +1122,57 @@ def _board_dirs_to_watch() -> dict[str, str]:
 
 
 def _completed_task_message(task: dict) -> str:
-    """The Zulip body for a completed task: a header line plus its full content."""
+    """The Zulip body for a completed task: a header line plus its full content. No
+    truncation — long ones are split across messages by _send_zulip_stream_parts."""
     who = f" · by {task['claimed_by']}" if task.get("claimed_by") else ""
     body = (task.get("body") or "").strip() or "_(no content)_"
-    if len(body) > 9000:
-        body = body[:9000] + "\n\n…(truncated)…"
     return f"**✓ task done: {task['title']}**  (`{task['id']}`{who})\n\n{body}"
+
+
+def _chunk_text(text: str, size: int) -> list[str]:
+    """Split text into chunks of at most `size` chars, preferring line boundaries and
+    hard-splitting any single line that's longer than `size`."""
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        piece = line
+        while len(piece) > size:            # a single over-long line: hard-split it
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(piece[:size])
+            piece = piece[size:]
+        candidate = piece if not cur else cur + "\n" + piece
+        if len(candidate) > size:
+            if cur:
+                chunks.append(cur)
+            cur = piece
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _send_zulip_stream_parts(stream: str, topic: str, message: str, limit: int = 9500) -> dict:
+    """Post a possibly-long message to a Zulip stream, split across several messages if
+    it exceeds Zulip's ~10k-char limit (each part tagged 'part i/n'). Returns
+    {zulip_sent (all parts ok), parts}."""
+    chunks = _chunk_text(message, limit)
+    n = len(chunks)
+    ok = True
+    last: dict = {"zulip_sent": False}
+    for i, chunk in enumerate(chunks, 1):
+        body = chunk if n == 1 else f"*(part {i}/{n})*\n\n{chunk}"
+        last = _send_zulip_stream(stream, topic, body)
+        if not last.get("zulip_sent"):
+            ok = False
+    out = dict(last)
+    out["zulip_sent"] = ok
+    out["parts"] = n
+    return out
 
 
 def _scan_boards_for_completions(seed: bool) -> None:
@@ -1155,11 +1200,13 @@ def _scan_boards_for_completions(seed: bool) -> None:
                 continue   # changed recently — wait, more edits may still be coming
             # Only mark it announced on a successful post, so a transient zulip
             # failure retries on the next poll.
-            res = _send_zulip_stream(BOARD_DONE_STREAM, bdir, _completed_task_message(t))
+            res = _send_zulip_stream_parts(BOARD_DONE_STREAM, bdir, _completed_task_message(t))
             if res.get("zulip_sent"):
                 _announced_done.add(key)
+                parts = res.get("parts", 1)
                 print(f"[board-watch] announced done task {t['id']!r} "
-                      f"(lane {lane_id!r}) to #{BOARD_DONE_STREAM} topic={bdir}", flush=True)
+                      f"(lane {lane_id!r}) to #{BOARD_DONE_STREAM} topic={bdir}"
+                      + (f" in {parts} parts" if parts > 1 else ""), flush=True)
             else:
                 print(f"[board-watch] failed to announce {t['id']!r}: "
                       f"{res.get('zulip_error')} (will retry)", flush=True)
