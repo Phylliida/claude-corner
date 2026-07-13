@@ -1774,6 +1774,7 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     }
     .active-pin:hover { color: var(--fg); }
     .active-pin.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    #concise-btn.on { background: var(--accent2); color: var(--bg); border-color: var(--accent2); }
     .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
     /* Font size is user-adjustable via the settings popover (--tsize, px). Everything
        in the transcript scales off it, and text reflows within the cell width (calc()
@@ -1798,6 +1799,7 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     <a class="btn" href="/">← board</a>
     <h1>active view</h1>
     <span id="active-status" class="active-cell-meta">connecting…</span>
+    <button id="concise-btn" class="btn" title="concise mode — only assistant messages and tool-call titles (no user turns, tool results, or thinking)" onclick="toggleConcise()">concise</button>
     <div id="settings-pop" class="settings-pop" style="display:none">
       <div class="settings-title">view settings</div>
       <div class="settings-row">
@@ -1854,6 +1856,42 @@ function setLayout(cols, rows) {
   updateLayoutUI();
   buildGrid();   // rebuild cells to cols×rows (keeps each cell's lane by index)
   tick();
+}
+
+// --- concise mode: only assistant text + tool-call titles ---
+let conciseMode = localStorage.getItem('activeConcise') === '1';
+function updateConciseUI() {
+  const b = document.getElementById('concise-btn');
+  if (b) b.classList.toggle('on', conciseMode);
+}
+function setConcise(v) {
+  conciseMode = v;
+  localStorage.setItem('activeConcise', v ? '1' : '0');
+  updateConciseUI();
+  for (const cell of cells) cell.rerenderAll();
+}
+function toggleConcise() { setConcise(!conciseMode); }
+
+// Concise render of one event: assistant only, text kept, tool calls reduced to their
+// title (e.g. "▸ Bash"), thinking dropped. Returns null for anything to hide (user
+// turns, tool results, assistant turns that had only thinking).
+function renderConcise(ev) {
+  if (ev.role !== 'assistant') return null;
+  const parts = [];
+  for (const b of ev.blocks) {
+    if (b.type === 'text') {
+      if ((b.text || '').trim()) parts.push(div('msg-text', b.text));
+    } else if (b.type === 'tool_use') {
+      const t = div('block-tool');
+      t.appendChild(div('block-tool-name', '▸ ' + (b.name || '?')));
+      parts.push(t);
+    }
+  }
+  if (!parts.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-assistant';
+  for (const p of parts) wrap.appendChild(p);
+  return wrap;
 }
 
 // --- view settings (font size) ---
@@ -1936,23 +1974,30 @@ class Cell {
   // message stays in the DOM so the scrollbar spans the whole session; off-screen ones
   // are skipped by the browser via `content-visibility: auto` (see the cell CSS), so a
   // long transcript stays fast without breaking the scrollbar.
+  makeNode(ev) { return conciseMode ? renderConcise(ev) : renderMessage(ev); }  // null = hide
+  renderAll() {
+    const frag = document.createDocumentFragment();
+    for (const ev of this.events) { const n = this.makeNode(ev); if (n) frag.appendChild(n); }
+    this.content.innerHTML = '';
+    if (frag.childNodes.length) this.content.appendChild(frag);
+    else this.setEmpty(conciseMode ? '(no assistant output yet)' : '(no messages)');
+    this.scrollBottom();   // ResizeObserver keeps it pinned as heights settle
+  }
+  rerenderAll() { if (this.sessionKey) this.renderAll(); }   // on concise toggle
   update(sessionKey, events) {
     if (sessionKey !== this.sessionKey) {          // new (or first) session → full render
       this.sessionKey = sessionKey;
       this.events = events;
-      const frag = document.createDocumentFragment();
-      for (const ev of events) frag.appendChild(renderMessage(ev));
-      this.content.innerHTML = '';
-      this.content.appendChild(frag);
-      this.scrollBottom();   // ResizeObserver keeps it pinned as heights settle
+      this.renderAll();
       return;
     }
     if (events.length <= this.events.length) { this.events = events; return; }
-    const frag = document.createDocumentFragment();
-    for (let i = this.events.length; i < events.length; i++) frag.appendChild(renderMessage(events[i]));
+    const start = this.events.length;
     this.events = events;
     this.clearEmpty();
-    this.content.appendChild(frag);
+    const frag = document.createDocumentFragment();
+    for (let i = start; i < events.length; i++) { const n = this.makeNode(events[i]); if (n) frag.appendChild(n); }
+    if (frag.childNodes.length) this.content.appendChild(frag);
     if (this.pinned) this.scrollBottom();   // ResizeObserver re-pins after layout settles
   }
 
@@ -2082,6 +2127,7 @@ async function tick() {
 }
 
 applyFont();
+updateConciseUI();
 updateLayoutUI();
 buildGrid();
 tick();
