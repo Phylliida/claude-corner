@@ -360,6 +360,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span id="state-pill" class="pill pill-down">connecting…</span>
     <button id="btn-toggle" class="btn">…</button>
     <div id="status" class="status-bar">loading...</div>
+    <button id="btn-msgorder" class="btn" title="order of messages within each session transcript" onclick="toggleMsgOrder()">…</button>
     <button class="refresh" onclick="refreshAll()">↻ refresh</button>
   </div>
   <div class="controlbar">
@@ -447,6 +448,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const expanded = { siblings: new Set(), sessions: new Set(), cards: new Set() };
 const loadedSessions = new Map();
+// Order messages within a session transcript. Persisted so it sticks across reloads.
+let messagesNewestFirst = localStorage.getItem('msgNewestFirst') === '1';
+
+// Place a rendered message into a session body honoring the current order: newest
+// first means prepend (top), oldest first means append (bottom). Iterating events in
+// chronological order and prepending each lands the newest at the very top.
+function placeMsg(body, el) {
+  if (messagesNewestFirst) body.insertBefore(el, body.firstChild);
+  else body.appendChild(el);
+}
+
+function updateMsgOrderButton() {
+  const b = document.getElementById('btn-msgorder');
+  if (b) b.textContent = messagesNewestFirst ? 'newest ↑' : 'oldest ↓';
+}
+
+function rerenderOpenSessions() {
+  for (const key of expanded.sessions) {
+    const el = document.querySelector('.session[data-session-key="' + CSS.escape(key) + '"]');
+    if (!el) continue;
+    const body = el.querySelector('.session-body');
+    const events = loadedSessions.get(key);
+    if (!body || !events) continue;
+    body.innerHTML = '';
+    for (const m of events) placeMsg(body, renderMessage(m));
+  }
+}
+
+function toggleMsgOrder() {
+  messagesNewestFirst = !messagesNewestFirst;
+  localStorage.setItem('msgNewestFirst', messagesNewestFirst ? '1' : '0');
+  updateMsgOrderButton();
+  rerenderOpenSessions();
+}
 let lastBoard = null;         // { handle, tasks: [...] }
 let boardHandleCur = null;    // handle currently displayed
 let boardEditingId = null;    // task id whose raw editor is open (suppresses re-render)
@@ -1247,7 +1282,7 @@ function createSessionEl(sibling, sess) {
   const loadIntoBody = async () => {
     if (loadedSessions.has(key)) {
       body.innerHTML = '';
-      for (const m of loadedSessions.get(key)) body.appendChild(renderMessage(m));
+      for (const m of loadedSessions.get(key)) placeMsg(body, renderMessage(m));
       return;
     }
     body.innerHTML = '<div class="loading">loading transcript...</div>';
@@ -1259,7 +1294,7 @@ function createSessionEl(sibling, sess) {
       if (events.length === 0) {
         body.innerHTML = '<div class="empty">(no messages)</div>';
       } else {
-        for (const m of events) body.appendChild(renderMessage(m));
+        for (const m of events) placeMsg(body, renderMessage(m));
       }
     } catch (e) {
       body.innerHTML = '<div class="loading">error: ' + e.message + '</div>';
@@ -1498,9 +1533,9 @@ async function updateOpenSession(sibling, sessId) {
     const body = el.querySelector('.session-body');
     // Clear any "(no messages)" / "loading..." placeholder if we now have content
     if (old.length === 0 && events.length > 0) body.innerHTML = '';
-    // Append only the new ones
+    // Add only the new ones, honoring the current order (prepend when newest-first)
     for (let i = old.length; i < events.length; i++) {
-      body.appendChild(renderMessage(events[i]));
+      placeMsg(body, renderMessage(events[i]));
     }
   } catch (e) {}
 }
@@ -1652,6 +1687,7 @@ function renderBlock(b) {
   return div('msg-text', '[' + b.type + ']');
 }
 
+updateMsgOrderButton();
 refreshAll();
 setInterval(heartbeat, 5000);  // 5-s heartbeat: state, statusline, budget, connection
 </script>
