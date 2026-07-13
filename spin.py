@@ -972,33 +972,6 @@ def ctrl_notify_done(message: str, lane_id: str | None = None) -> dict:
     return result
 
 
-def _task_notify_hint(port: int, lane_id: str) -> str:
-    """The harness-note prepended to task-mode prompts so claude knows how to
-    signal task completion. Sits above the companion/task message that follows.
-    The lane id is baked into the curl so notify-done pauses only this lane."""
-    return f"""[harness note — read this:
-
-you are running in unsupervised task mode. nobody is going to respond to you.
-when you finish the task (truly done, fully blocked, or at a natural stopping
-point that should end the whole run), notify Danielle and stop the looper by
-running this Bash command from inside your sandbox:
-
-curl -s -X POST http://127.0.0.1:{port}/api/notify-done \\
-  -H 'Content-Type: application/json' \\
-  -d '{{"message": "<your one-paragraph completion summary>", "lane": "{lane_id}"}}'
-
-replace the message with a real summary: what you did, what's left, where you
-left off. the harness sends it to her via zulip and pauses this lane.
-
-please don't call this just because you're stopping one iteration — only when
-the overall task is done or fully blocked. for iteration-boundary stopping, just
-end this turn normally and next-you will pick up.]
-
----
-
-"""
-
-
 def _board_ref(work_dir: Path, board_dir: Path) -> str:
     """How claude should reference the board dir, given its cwd is work_dir. Uses a
     './sub/board' relative path when the board lives under the workdir (the common
@@ -1609,11 +1582,9 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             if feedback.strip() and filed and ctrl_consume_lane_message(lane_id, feedback):
                 log(label, "cleared the one-shot message")
             if kind == "task":
-                # Prepend the board hint (always, so claude sees/updates the board)
-                # then the notify-done hint (only when the web UI is up to receive it).
+                # Prepend the board hint. Task lanes no longer use .done / notify-done to
+                # stop — the board (and the 'until board done' setting) governs completion.
                 prompt = _board_hint(work_dir, bdir) + prompt
-                if _web_port > 0:
-                    prompt = _task_notify_hint(_web_port, lane_id) + prompt
             log(label, f"firing {sibling} (iter {iters})")
             # Record the session in the board dir for task lanes so the active view can
             # render this lane's own session (avoids thrashing when lanes share a workdir).
@@ -1651,26 +1622,27 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 ctrl_set_lane_slots(lane_id, 0)
                 return
 
-            # Both continuous and until-board-clear ignore claude's own .done and keep
-            # firing — continuous forever, until-clear until the board is done (checked
-            # just above). Only a plain lane lets .done retire/pause it.
-            keep_firing = continuous or until_clear
+            # Task lanes ignore claude's own .done entirely — their completion is the
+            # board ('until board done' pauses when the board is clear; otherwise they
+            # run until you pause them). Continuous and until-board-clear also keep firing.
+            # Only a corner lane still uses .done, to retire and rotate to a fresh room.
+            keep_firing = continuous or until_clear or kind == "task"
             if is_done(work_dir):
                 if keep_firing:
-                    # claude's stop signal is ignored. Clear the marker so it doesn't
-                    # re-trip, and keep firing fresh sessions.
+                    # .done is ignored. Clear the marker so it doesn't re-trip, keep firing.
                     try:
                         (work_dir / DONE).unlink()
                     except OSError:
                         pass
-                    why = "continuous" if continuous else "until-board-clear (board not yet done)"
+                    why = ("continuous" if continuous
+                           else "until-board-clear (board not yet done)" if until_clear
+                           else "a task lane (.done ignored — use 'until board done' or pause to stop)")
                     log(label, f"{sibling} marked .done, but lane is {why} — clearing and continuing")
                 elif managed and not sticky:
-                    log(label, f"{sibling} marked .done, retiring")
+                    log(label, f"{sibling} marked .done, retiring")   # corner: rotate to a fresh room
                     break
                 else:
-                    # sticky lane (task or fixed workdir): no fresh workspace to spawn —
-                    # treat .done as task-complete and pause the lane (stays in this dir).
+                    # non-task sticky lane (e.g. a fixed-workdir corner): pause on .done.
                     log(label, f"{sibling} marked .done, pausing lane (stays in this workspace)")
                     ctrl_set_lane_slots(lane_id, 0)
                     return

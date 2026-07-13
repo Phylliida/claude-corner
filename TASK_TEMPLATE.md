@@ -33,7 +33,7 @@ you're running in unsupervised task mode. there's no human in the conversation r
 - if previous-you left files, read them. evaluate. continue from where they left off
 - if you're partway through something and need to stop, leave a clear `NOTES.md` (or similar): what you tried, what worked, what's blocked, what next-you should do next. this is load-bearing — and it's also what the companion reads to write your next prompt, so it's how you speak to future-you *through* the companion
 - every spawn works in this same directory — the harness never moves you to a fresh workspace for a task. your files just keep accumulating here
-- if the task is meaningfully complete, write a `.done` file (any content). this pauses the loop for this task (you've signalled you're finished); it does NOT hand you a clean workspace, so only write it when the whole task is genuinely done
+- you don't stop the loop yourself — there's no `.done` file or notify step to run. this lane keeps spawning fresh yous until its task board is finished (when the "until board done" setting is on, the harness pauses the lane once every board task is marked done) or until Danielle pauses it. so "being done" means: the board is in good shape and the work is captured — not a signal you send
 - if you're at a natural stopping point but the task isn't done, just return. next-you (and the companion) will pick up from the files
 - if you find a dead end, write *what* you tried and *why* it didn't work. that's the most valuable thing you can leave
 
