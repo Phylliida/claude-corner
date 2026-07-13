@@ -1720,8 +1720,18 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
   <script src="/render.js"></script>
   <link rel="stylesheet" href="/app.css"/>
   <style>
-    .active-topbar { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.7rem; flex-wrap: wrap; }
+    .active-topbar { position: relative; display: flex; align-items: center; gap: 1rem; margin-bottom: 0.7rem; flex-wrap: wrap; }
     .active-topbar h1 { font-size: 1.2rem; }
+    .settings-pop {
+      position: absolute; top: 2.4rem; left: 0; z-index: 30; min-width: 16rem;
+      background: var(--bg2); border: 1px solid var(--bg3); border-radius: 6px;
+      padding: 0.7rem 0.9rem; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    .settings-title { color: var(--accent2); font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .settings-row { display: flex; align-items: center; gap: 0.6rem; font-size: 0.82rem; }
+    .settings-row label { color: var(--fg-dim); }
+    .settings-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .settings-val { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg); min-width: 3.2em; text-align: right; }
     .active-grid {
       display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
       gap: 0.6rem; height: calc(100vh - 5.2rem);
@@ -1750,6 +1760,14 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
     .active-cell-live.on { color: var(--user); }
     .active-cell-live.on::before { content: '● '; }
     .active-cell-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.5rem 0.7rem; background: var(--bg); }
+    /* Font size is user-adjustable via the settings popover (--tsize, px). Everything
+       in the transcript scales off it, and text reflows within the cell width (calc()
+       keeps the ratios so nested elements don't compound). */
+    .active-cell-body { font-size: var(--tsize, 14px); }
+    .active-cell-body .block-tool, .active-cell-body .diff-block { font-size: calc(var(--tsize, 14px) * 0.9); }
+    .active-cell-body .msg-role, .active-cell-body .tool-path, .active-cell-body .tool-desc,
+    .active-cell-body .tool-flag, .active-cell-body .tool-section-label,
+    .active-cell-body .block-result-label { font-size: calc(var(--tsize, 14px) * 0.78); }
     /* Native virtualization: skip layout/paint of off-screen messages while keeping
        them in the DOM, so the scrollbar spans the whole session. `auto` remembers each
        message's real height once seen (falling back to ~3rem before first render). */
@@ -1759,9 +1777,21 @@ ACTIVE_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <div class="active-topbar">
+    <button id="settings-btn" class="btn" title="view settings" onclick="toggleSettings(event)">⚙</button>
     <a class="btn" href="/">← board</a>
     <h1>active view</h1>
     <span id="active-status" class="active-cell-meta">connecting…</span>
+    <div id="settings-pop" class="settings-pop" style="display:none">
+      <div class="settings-title">view settings</div>
+      <div class="settings-row">
+        <label for="font-range">font size</label>
+        <input id="font-range" type="range" min="9" max="28" step="1" oninput="setFont(this.value)"/>
+        <span id="font-val" class="settings-val"></span>
+      </div>
+      <div class="settings-row" style="justify-content:flex-end; margin-top:0.5rem;">
+        <button class="btn" onclick="setFont(14)">reset</button>
+      </div>
+    </div>
   </div>
   <div id="active-grid" class="active-grid"></div>
 
@@ -1781,6 +1811,31 @@ function loadCellLanes() {
 function saveCellLanes() { localStorage.setItem('activeCells', JSON.stringify(cellLanes)); }
 
 function nearBottom(el, px) { return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 60); }
+
+// --- view settings (font size) ---
+let tsize = parseInt(localStorage.getItem('activeFont') || '14', 10) || 14;
+function applyFont() {
+  document.documentElement.style.setProperty('--tsize', tsize + 'px');
+  const v = document.getElementById('font-val'); if (v) v.textContent = tsize + 'px';
+  const r = document.getElementById('font-range'); if (r) r.value = String(tsize);
+}
+function setFont(px) {
+  tsize = Math.min(28, Math.max(9, parseInt(px, 10) || 14));
+  localStorage.setItem('activeFont', String(tsize));
+  applyFont();
+}
+function toggleSettings(ev) {
+  if (ev) ev.stopPropagation();
+  const p = document.getElementById('settings-pop');
+  p.style.display = (p.style.display === 'none' || !p.style.display) ? 'block' : 'none';
+}
+document.addEventListener('click', (e) => {
+  const pop = document.getElementById('settings-pop');
+  const btn = document.getElementById('settings-btn');
+  if (pop && pop.style.display === 'block' && !pop.contains(e.target) && !btn.contains(e.target)) {
+    pop.style.display = 'none';
+  }
+});
 
 // One virtualized cell: keeps a bounded window of a session's messages in the DOM.
 class Cell {
@@ -1941,6 +1996,7 @@ async function tick() {
   } finally { tickBusy = false; }
 }
 
+applyFont();
 buildGrid();
 tick();
 setInterval(tick, 2000);
