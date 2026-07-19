@@ -285,6 +285,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: var(--fg-dim); font-size: 0.85rem;
     }
     .board-head .board-title { color: var(--accent2); font-size: 0.95rem; }
+    .taiga-chip { margin-left: auto; display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; }
+    .taiga-chip a { color: var(--accent2); text-decoration: none; }
+    .taiga-chip a:hover { text-decoration: underline; }
+    .taiga-chip button { font: inherit; font-size: 0.78rem; cursor: pointer; background: var(--bg2);
+      color: var(--fg-dim); border: 1px solid var(--border, #444); border-radius: 4px; padding: 0.1rem 0.5rem; }
+    .taiga-chip button:hover { color: var(--fg); }
+    .taiga-chip button:disabled { opacity: 0.5; cursor: default; }
+    .taiga-chip .taiga-note { color: var(--fg-dim); }
+    .taiga-chip .taiga-conflict { color: var(--accent, #e0a); }
     .board-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.7rem; align-items: start; }
     @media (max-width: 780px) { .board-cols { grid-template-columns: 1fr; } }
     .board-col { background: var(--bg2); border-radius: 6px; padding: 0.5rem; min-height: 3rem; }
@@ -613,6 +622,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="board-head">
       <span class="board-title">task board</span>
       <span id="board-hint" class="budget-numbers"></span>
+      <span id="taiga-chip" class="taiga-chip" style="display:none"></span>
     </div>
     <div id="board-cols" class="board-cols"></div>
   </div>
@@ -798,7 +808,93 @@ async function refreshBoard() {
     const j = await r.json();
     lastBoard = j; boardHandleCur = handle;
     renderBoard(j);
+    refreshTaigaChip(handle);
   } catch (e) { /* leave last render up */ }
+}
+
+// --- Taiga sync chip in the board head --------------------------------------
+let taigaChipHandle = null;
+async function refreshTaigaChip(handle) {
+  const chip = document.getElementById('taiga-chip');
+  if (!chip) return;
+  if (!handle || !handle.startsWith('lane:')) { chip.style.display = 'none'; return; }
+  // Only re-query when the handle changes; a sync/link re-renders directly.
+  if (handle === taigaChipHandle && chip.dataset.loaded) return;
+  taigaChipHandle = handle;
+  try {
+    const r = await fetch('/api/taiga/status/' + encodeURIComponent(handle), { cache: 'no-store' });
+    const s = await r.json();
+    renderTaigaChip(handle, s);
+  } catch (e) { chip.style.display = 'none'; }
+}
+
+function renderTaigaChip(handle, s, extra) {
+  const chip = document.getElementById('taiga-chip');
+  if (!chip || !s || !s.available) { if (chip) chip.style.display = 'none'; return; }
+  chip.style.display = 'inline-flex';
+  chip.dataset.loaded = '1';
+  chip.innerHTML = '';
+  if (s.linked && s.url) {
+    const a = document.createElement('a');
+    a.href = s.url; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = 'Taiga ↗';
+    a.title = 'open project ' + (s.project_slug || '') + ' on Taiga';
+    chip.appendChild(a);
+    const btn = document.createElement('button');
+    btn.textContent = 'sync';
+    btn.onclick = () => syncTaiga(handle);
+    chip.appendChild(btn);
+  } else {
+    const btn = document.createElement('button');
+    btn.textContent = 'link to Taiga';
+    btn.title = 'create a Taiga project for this lane and link it';
+    btn.onclick = () => linkTaiga(handle);
+    chip.appendChild(btn);
+  }
+  if (extra) {
+    const note = document.createElement('span');
+    note.className = extra.conflict ? 'taiga-conflict' : 'taiga-note';
+    note.textContent = extra.text;
+    chip.appendChild(note);
+  }
+}
+
+async function linkTaiga(handle) {
+  const chip = document.getElementById('taiga-chip');
+  chip.querySelectorAll('button').forEach(b => { b.disabled = true; b.textContent = 'linking…'; });
+  try {
+    const r = await fetch('/api/taiga/link/' + encodeURIComponent(handle), { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'link failed');
+    chip.dataset.loaded = '';
+    await refreshTaigaChip(handle);
+    renderTaigaChip(handle, await (await fetch('/api/taiga/status/' + encodeURIComponent(handle))).json(),
+                    { text: j.created ? 'project created' : 'linked' });
+  } catch (e) {
+    renderTaigaChip(handle, { available: true, linked: false }, { text: String(e.message || e), conflict: true });
+  }
+}
+
+async function syncTaiga(handle) {
+  const chip = document.getElementById('taiga-chip');
+  chip.querySelectorAll('button').forEach(b => { if (b.textContent === 'sync') { b.disabled = true; b.textContent = 'syncing…'; } });
+  try {
+    const r = await fetch('/api/taiga/sync/' + encodeURIComponent(handle), { method: 'POST' });
+    const j = await r.json();
+    const status = await (await fetch('/api/taiga/status/' + encodeURIComponent(handle))).json();
+    if (!r.ok) throw new Error(j.error || 'sync failed');
+    const s = j.summary || {};
+    const bits = Object.entries(s).filter(([, n]) => n > 0).map(([k, n]) => k.replace('_', ' ') + ' ' + n);
+    const nConf = (j.conflicts || []).length;
+    renderTaigaChip(handle, status, {
+      text: (bits.length ? bits.join(', ') : 'up to date') + (nConf ? ' · ' + nConf + ' conflict' + (nConf === 1 ? '' : 's') + '!' : ''),
+      conflict: nConf > 0,
+    });
+    refreshBoard();  // pull/create may have changed the local files
+  } catch (e) {
+    const status = await (await fetch('/api/taiga/status/' + encodeURIComponent(handle))).json();
+    renderTaigaChip(handle, status, { text: String(e.message || e), conflict: true });
+  }
 }
 
 function boardCardKey(t) { return boardHandleCur + '/' + t.id; }
@@ -2594,6 +2690,93 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
         if not board.delete_task(work, task_id):
             return jsonify({"error": "task not found"}), 404
         return jsonify({"deleted": task_id})
+
+    # --- Taiga sync -------------------------------------------------------
+    # A board handle 'lane:<id>' maps one lane to one Taiga project. These
+    # endpoints are the human side of the two-way sync in taiga_sync.py; the
+    # actual reconcile runs host-side (sandboxed Claude can't reach the net).
+
+    def _taiga_lane_id(handle: str):
+        return handle[len("lane:"):] if handle.startswith("lane:") else None
+
+    @app.route("/api/taiga/status/<handle>")
+    def api_taiga_status(handle):
+        """Link state + a deep link for the board head. Never errors on a
+        missing/ misconfigured Taiga — the UI just shows an unlinked chip."""
+        lane_id = _taiga_lane_id(handle)
+        if lane_id is None:
+            return jsonify({"available": False, "reason": "not a lane board"})
+        try:
+            import taiga_sync
+            cfg = taiga_sync.load_config()
+        except Exception as e:
+            return jsonify({"available": False, "reason": str(e)})
+        link = (cfg.get("lanes") or {}).get(lane_id)
+        host = (cfg.get("host") or "").rstrip("/")
+        out = {"available": True, "lane": lane_id, "linked": bool(link), "host": host}
+        if link:
+            out["project_id"] = link.get("project_id")
+            out["project_slug"] = link.get("project_slug")
+            if host and link.get("project_slug"):
+                out["url"] = f"{host}/project/{link['project_slug']}/kanban"
+        return jsonify(out)
+
+    @app.route("/api/taiga/link/<handle>", methods=["POST"])
+    def api_taiga_link(handle):
+        """Link the lane to a Taiga project, creating it if absent."""
+        lane_id = _taiga_lane_id(handle)
+        if lane_id is None:
+            return jsonify({"error": "not a lane board"}), 400
+        try:
+            import taiga_sync
+            cfg = taiga_sync.load_config()
+            client = taiga_sync.client_from(cfg)
+            lane = taiga_sync._lane_by_id(lane_id)
+            if lane is None:
+                return jsonify({"error": f"no lane {lane_id!r}"}), 404
+            slug = f"claude-corner-{lane_id}"
+            project = client.project_by_slug(slug)
+            created = False
+            if project is None:
+                project = client.create_project(
+                    f"claude-corner: {lane_id}",
+                    f"Task board for the {lane_id} lane of claude-corner.")
+                created = True
+            cfg.setdefault("lanes", {})[lane_id] = {
+                "project_id": project["id"], "project_slug": project["slug"]}
+            taiga_sync.save_config(cfg)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        host = (cfg.get("host") or "").rstrip("/")
+        return jsonify({"linked": True, "created": created,
+                        "project_id": project["id"], "project_slug": project["slug"],
+                        "url": f"{host}/project/{project['slug']}/kanban"})
+
+    @app.route("/api/taiga/sync/<handle>", methods=["POST"])
+    def api_taiga_sync(handle):
+        lane_id = _taiga_lane_id(handle)
+        if lane_id is None:
+            return jsonify({"error": "not a lane board"}), 400
+        try:
+            import taiga_sync
+            cfg = taiga_sync.load_config()
+            link = (cfg.get("lanes") or {}).get(lane_id)
+            if not link:
+                return jsonify({"error": "lane not linked to Taiga yet"}), 400
+            lane = taiga_sync._lane_by_id(lane_id)
+            root = taiga_sync.lane_board_root(lane) if lane else None
+            if root is None:
+                return jsonify({"error": "lane has no workdir"}), 400
+            client = taiga_sync.client_from(cfg)
+            rep = taiga_sync.sync_lane(client, root, link["project_id"],
+                                       on_remote_delete=cfg.get("on_remote_delete", "orphan"))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        summary = {k: len(v) for k, v in rep.items()
+                   if k != "status_notes" and isinstance(v, list)}
+        return jsonify({"ok": True, "summary": summary,
+                        "conflicts": rep.get("conflicts", []),
+                        "status_notes": rep.get("status_notes", [])})
 
     @app.route("/api/state")
     def api_state():
