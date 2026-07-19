@@ -63,6 +63,13 @@ TOKEN_PATH = HERE / ".taiga_token.json"
 LANES_PATH = HERE / "lanes" / "lanes.json"
 SIDECAR_NAME = ".taiga_sync.json"
 
+# Every project this tool creates also gets this person as a Product Owner.
+# Override per-instance with a "product_owner" key in taiga_config.json (set it
+# to "" to disable). Taiga builds a fresh "Product Owner" role per project, so
+# we look the role up by name rather than by a fixed id.
+PRODUCT_OWNER_EMAIL = "phylliidadev@gmail.com"
+PRODUCT_OWNER_ROLE = "Product Owner"
+
 CONFLICT_START = "<!-- taiga-conflict:start -->"
 CONFLICT_END = "<!-- taiga-conflict:end -->"
 
@@ -82,10 +89,13 @@ class TaigaClient:
     """Thin Taiga REST client. Caches its auth token on disk between runs."""
 
     def __init__(self, host: str, username: str, password: str,
-                 token_path: Path = TOKEN_PATH):
+                 token_path: Path = TOKEN_PATH,
+                 product_owner: str | None = None):
         self.host = host.rstrip("/")
         self.username = username
         self.password = password
+        self.product_owner = (product_owner if product_owner is not None
+                              else PRODUCT_OWNER_EMAIL)
         self.token_path = Path(token_path)
         self._token: str | None = None
         self._refresh: str | None = None
@@ -184,14 +194,81 @@ class TaigaClient:
                 return None
             raise
 
+    def project_templates(self) -> list[dict]:
+        return self.request("GET", "project-templates") or []
+
+    def kanban_template_id(self) -> int | None:
+        """The id of the built-in Kanban template, or None if absent.
+
+        Passing this as ``creation_template`` is what actually makes a new
+        project Kanban — the ``is_kanban_activated`` flag alone is overridden by
+        whichever template Taiga applies (the default is Scrum).
+        """
+        for tp in self.project_templates():
+            if (tp.get("slug") or "").strip().lower() == "kanban":
+                return tp.get("id")
+        return None
+
     def create_project(self, name: str, description: str = "") -> dict:
-        return self.request("POST", "projects", {
+        payload = {
             "name": name,
             "description": description or name,
             "is_private": True,
             "is_kanban_activated": True,
             "is_backlog_activated": False,
+        }
+        template_id = self.kanban_template_id()
+        if template_id is not None:
+            payload["creation_template"] = template_id
+        project = self.request("POST", "projects", payload)
+        # Fold in the newly-applied template's members so a caller inspecting
+        # the return value sees the true membership.
+        self.ensure_product_owner(project["id"])
+        return project
+
+    def roles(self, project_id: int) -> list[dict]:
+        return self.request("GET", f"roles?project={project_id}") or []
+
+    def memberships(self, project_id: int) -> list[dict]:
+        return self.request("GET", f"memberships?project={project_id}") or []
+
+    def ensure_kanban(self, project: dict) -> str | None:
+        """Switch an existing project to a Kanban board. Returns a note or None."""
+        if project.get("is_kanban_activated") and not project.get("is_backlog_activated"):
+            return None
+        self.request("PATCH", f"projects/{project['id']}", {
+            "is_kanban_activated": True,
+            "is_backlog_activated": False,
         })
+        return "switched to Kanban"
+
+    def ensure_product_owner(self, project_id: int) -> str | None:
+        """Ensure ``self.product_owner`` is a Product Owner of the project.
+
+        Idempotent: no-op if they already hold the role, promotes them if they
+        are a member with a different role, otherwise adds them. Returns a
+        human-readable note describing what changed, or None if nothing did.
+        """
+        email = (self.product_owner or "").strip()
+        if not email:
+            return None
+        role = next((r for r in self.roles(project_id)
+                     if (r.get("name") or "").strip().lower()
+                     == PRODUCT_OWNER_ROLE.lower()), None)
+        if role is None:
+            raise TaigaError(
+                f"project {project_id} has no {PRODUCT_OWNER_ROLE!r} role")
+        for m in self.memberships(project_id):
+            if (m.get("user_email") or "").strip().lower() == email.lower():
+                if m.get("role") == role["id"]:
+                    return None
+                self.request("PATCH", f"memberships/{m['id']}",
+                             {"role": role["id"]})
+                return f"promoted {email} to {PRODUCT_OWNER_ROLE}"
+        self.request("POST", "memberships", {
+            "project": project_id, "role": role["id"], "username": email,
+        })
+        return f"added {email} as {PRODUCT_OWNER_ROLE}"
 
     def stories(self, project_id: int) -> list[dict]:
         return self.request("GET", f"userstories?project={project_id}") or []
@@ -236,7 +313,8 @@ def client_from(cfg: dict) -> TaigaClient:
     missing = [k for k in ("host", "username", "password") if not cfg.get(k)]
     if missing:
         raise TaigaError(f"config is missing: {', '.join(missing)}")
-    return TaigaClient(cfg["host"], cfg["username"], cfg["password"])
+    return TaigaClient(cfg["host"], cfg["username"], cfg["password"],
+                       product_owner=cfg.get("product_owner", PRODUCT_OWNER_EMAIL))
 
 
 def load_lanes() -> list[dict]:
@@ -633,7 +711,8 @@ def cmd_link(args) -> int:
         project = client.create_project(
             args.name or f"claude-corner: {lane['id']}",
             f"Task board for the {lane['id']} lane of claude-corner.")
-        print(f"created project #{project['id']} ({project['slug']})")
+        print(f"created project #{project['id']} ({project['slug']})"
+              f" (Kanban, {PRODUCT_OWNER_EMAIL} as {PRODUCT_OWNER_ROLE})")
 
     cfg.setdefault("lanes", {})[lane["id"]] = {
         "project_id": project["id"], "project_slug": project["slug"],
@@ -643,6 +722,18 @@ def cmd_link(args) -> int:
     print(f"linked lane {lane['id']!r} -> project #{project['id']} ({project['slug']})")
     for note in notes:
         print(f"  note: {note}")
+
+    # A freshly created project starts empty; push the lane's tasks up now so
+    # it isn't blank until the next scheduled sync.
+    if args.create:
+        try:
+            rep = sync_lane(client, root, project["id"],
+                            on_remote_delete=cfg.get("on_remote_delete", "orphan"))
+            parts = [f"{k}={len(v)}" for k, v in rep.items()
+                     if k != "status_notes" and v]
+            print(f"  initial sync: " + (", ".join(parts) or "no changes"))
+        except TaigaError as exc:
+            print(f"  initial sync failed: {exc}", file=sys.stderr)
     return 0
 
 
@@ -687,6 +778,41 @@ def cmd_sync(args) -> int:
             print(f"    note            {note}")
         if rep.get("conflicts"):
             rc = max(rc, 2)
+    return rc
+
+
+def cmd_owners(args) -> int:
+    """Backfill: make every project Kanban with the Product Owner set.
+
+    Idempotent, so it's safe to re-run. By default it walks every project the
+    sync user can see; pass slugs/ids to limit it.
+    """
+    cfg = load_config()
+    client = client_from(cfg)
+    projects = client.projects()
+    if args.projects:
+        wanted = set(args.projects)
+        projects = [p for p in projects
+                    if p.get("slug") in wanted or str(p.get("id")) in wanted]
+    if not projects:
+        print("no matching projects")
+        return 0
+    rc = 0
+    for p in projects:
+        notes = []
+        try:
+            if not args.owner_only:
+                k = client.ensure_kanban(p)
+                if k:
+                    notes.append(k)
+            o = client.ensure_product_owner(p["id"])
+            if o:
+                notes.append(o)
+        except TaigaError as exc:
+            print(f"#{p['id']} {p['slug']}: {exc}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"#{p['id']} {p['slug']}: " + (", ".join(notes) or "already set"))
     return rc
 
 
@@ -773,6 +899,14 @@ def main(argv=None) -> int:
     p.add_argument("lanes", nargs="*")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("owners",
+                       help="backfill Kanban + Product Owner on existing projects")
+    p.add_argument("projects", nargs="*",
+                   help="limit to these project slugs/ids (default: all visible)")
+    p.add_argument("--owner-only", action="store_true",
+                   help="only set the Product Owner, leave the board type alone")
+    p.set_defaults(func=cmd_owners)
 
     sub.add_parser("conflicts", help="list unresolved conflicts") \
         .set_defaults(func=cmd_conflicts)

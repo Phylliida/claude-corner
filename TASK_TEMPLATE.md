@@ -44,7 +44,7 @@ you're running in unsupervised task mode. there's no human in the conversation r
   - **pick** a task: open a `status: todo` file, flip it to `status: in_progress`, and put an id in `claimed_by`. prefer one nobody's claimed
   - **create** a task: write `./board/<slug>.md` with `status: todo`. break big work into small, checkable tasks
   - **log** as you go under `## Progress`, so the next (memoryless) you can follow the thread
-  - **finish**: set `status: done` and fill in `## Writeup` — findings, how the code works, and any assumptions you made
+  - **finish**: set `status: done` and fill in `## Writeup` — findings, how the code works, any assumptions you made, and anything you're not confident about or unsure was quite the right way to implement it
   - **commit**: once a task is done, commit your work with git (`git add -A && git commit -m "<what you did>"`) so the finished task and its writeup are checkpointed
 - the person can also add / move / delete cards from the web UI; you'll see those changes as edits to the files in `./board/`. check the board at the start of a turn before deciding what to do
 
