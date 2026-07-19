@@ -2745,6 +2745,17 @@ def make_app(runs_dir: Path, statusline_last: Path, controls=None) -> Flask:
             cfg.setdefault("lanes", {})[lane_id] = {
                 "project_id": project["id"], "project_slug": project["slug"]}
             taiga_sync.save_config(cfg)
+            # A newly created project starts empty; push the lane's tasks up now
+            # rather than leaving it blank until the next sync. Best-effort.
+            if created:
+                root = taiga_sync.lane_board_root(lane)
+                if root is not None:
+                    try:
+                        taiga_sync.sync_lane(
+                            client, root, project["id"],
+                            on_remote_delete=cfg.get("on_remote_delete", "orphan"))
+                    except Exception:
+                        pass  # linking succeeded; a failed initial sync isn't fatal
         except Exception as e:
             return jsonify({"error": str(e)}), 502
         host = (cfg.get("host") or "").rstrip("/")

@@ -126,6 +126,18 @@ BOARD_SETTLE_SECONDS = int(os.environ.get("CLAUDE_CORNER_BOARD_SETTLE", "60"))
 _announced_done: set[str] = set()
 _board_watch_seeded = False
 
+# Taiga edit watcher: mirror a claim/edit to the Taiga board shortly after it
+# happens, instead of only at a run's before/after syncs. Same "no event to hook"
+# reason as above — poll the board files, and only sync once they've been quiet
+# for the settle window (so a card still being edited isn't pushed half-written).
+TAIGA_WATCH_INTERVAL = int(os.environ.get("CLAUDE_CORNER_TAIGA_WATCH_INTERVAL", "10"))
+TAIGA_WATCH_SETTLE = int(os.environ.get("CLAUDE_CORNER_TAIGA_WATCH_SETTLE", "5"))
+# Per-lane locks so the watcher and a run's before/after syncs never write the
+# same board at once; and the newest board mtime as of each lane's last sync.
+_taiga_locks: dict[str, threading.Lock] = {}
+_taiga_locks_guard = threading.Lock()
+_taiga_last_mtime: dict[str, float] = {}
+
 # Companion prompter: a local OpenAI-compatible model that, in task mode, reads
 # the original task plus claude's most-recent response and writes the prompt for
 # the next fresh claude instance. Gives the loop a second mind instead of a
@@ -1492,6 +1504,121 @@ def _interruptible_sleep(seconds: int, stop_event: threading.Event) -> None:
         time.sleep(1)
 
 
+def _taiga_lock(lane_id: str) -> threading.Lock:
+    """The per-lane sync lock, created on first use."""
+    with _taiga_locks_guard:
+        lk = _taiga_locks.get(lane_id)
+        if lk is None:
+            lk = _taiga_locks[lane_id] = threading.Lock()
+        return lk
+
+
+def _board_max_mtime(root: Path) -> float:
+    """Newest mtime among a board's task files, or 0.0 if none/unreadable."""
+    try:
+        bdir = board.board_dir(root)
+        newest = 0.0
+        for p in bdir.iterdir():
+            if p.is_file() and board._is_task_file(p):
+                newest = max(newest, p.stat().st_mtime)
+        return newest
+    except OSError:
+        return 0.0
+
+
+def _taiga_sync_lane(lane_id: str):
+    """Reconcile one linked lane with Taiga under its per-lane lock.
+
+    Returns the sync report, or None if the lane isn't linked / has no board.
+    Records the post-sync board mtime so the watcher won't re-fire on the
+    frontmatter writes sync itself makes. Raises on network/API errors — callers
+    decide how loudly to complain.
+    """
+    import taiga_sync
+    cfg = taiga_sync.load_config()
+    link = (cfg.get("lanes") or {}).get(lane_id)
+    lane = taiga_sync._lane_by_id(lane_id)
+    if not link or not lane:
+        return None
+    root = taiga_sync.lane_board_root(lane)
+    if root is None:
+        return None
+    client = taiga_sync.client_from(cfg)
+    with _taiga_lock(lane_id):
+        rep = taiga_sync.sync_lane(
+            client, root, link["project_id"],
+            on_remote_delete=cfg.get("on_remote_delete", "orphan"))
+        _taiga_last_mtime[lane_id] = _board_max_mtime(root)
+    return rep
+
+
+def taiga_reconcile(lane_id: str, label: str, when: str) -> None:
+    """Reconcile this lane's board with Taiga around an instance's run.
+
+    Host-side and best-effort: a sandboxed claude can't reach the network, so the
+    host mirrors the markdown board to Taiga for it. Called on both sides of a
+    run — ``when="before"`` pulls remote edits down so the fresh instance reads
+    them; ``when="after"`` pushes up whatever it just claimed or edited. A sync
+    problem must never block a run, so every failure is swallowed with a log
+    line. No-op for unlinked lanes.
+    """
+    try:
+        rep = _taiga_sync_lane(lane_id)
+        if not rep:
+            return
+        parts = [f"{k}={len(v)}" for k, v in rep.items()
+                 if k != "status_notes" and v]
+        if parts:
+            log(label, f"taiga sync ({when}): " + ", ".join(parts))
+    except Exception as e:  # noqa: BLE001 — a sync must never stop a run
+        log(label, f"taiga sync ({when}) skipped: {e}")
+
+
+def taiga_watch_loop(interval_sec: int, settle_sec: int) -> None:
+    """Background thread: sync a linked lane to Taiga shortly after its board
+    files change, so a claim or edit reaches the Taiga board *while* the instance
+    is still running — not only at the run's before/after syncs.
+
+    Shares _taiga_sync_lane (hence the per-lane lock and mtime bookkeeping) with
+    those syncs, so a lane is never synced by two threads at once and the watcher
+    never re-fires on sync's own writes. Each lane is seeded silently on first
+    sighting, so a board that's merely sitting there isn't synced at boot; only a
+    change newer than the last sync — and quiet for the settle window — fires.
+    """
+    while True:
+        try:
+            import taiga_sync
+            try:
+                cfg = taiga_sync.load_config()
+            except taiga_sync.TaigaError:
+                cfg = {}
+            now = time.time()
+            for lane_id in list((cfg.get("lanes") or {}).keys()):
+                try:
+                    lane = taiga_sync._lane_by_id(lane_id)
+                    root = taiga_sync.lane_board_root(lane) if lane else None
+                    if root is None:
+                        continue
+                    newest = _board_max_mtime(root)
+                    if newest <= 0.0:
+                        continue
+                    if lane_id not in _taiga_last_mtime:
+                        _taiga_last_mtime[lane_id] = newest   # seed; don't sync
+                        continue
+                    if newest > _taiga_last_mtime[lane_id] and now - newest >= settle_sec:
+                        rep = _taiga_sync_lane(lane_id)
+                        if rep:
+                            parts = [f"{k}={len(v)}" for k, v in rep.items()
+                                     if k != "status_notes" and v]
+                            if parts:
+                                log("taiga-watch", f"{lane_id}: " + ", ".join(parts))
+                except Exception as e:  # noqa: BLE001 — keep watching other lanes
+                    log("taiga-watch", f"{lane_id} skipped: {e}")
+        except Exception as e:  # noqa: BLE001 — the watcher must never die
+            print(f"[taiga-watch] error: {e}", flush=True)
+        time.sleep(interval_sec)
+
+
 def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
            remote: str | None, args, spawn_lock: threading.Lock) -> None:
     """One worker's life for a lane. Task (and fixed-workdir) lanes are sticky:
@@ -1585,6 +1712,9 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
                 # Prepend the board hint. Task lanes no longer use .done / notify-done to
                 # stop — the board (and the 'until board done' setting) governs completion.
                 prompt = _board_hint(work_dir, bdir) + prompt
+            # Pull remote board edits into the markdown before this fresh instance
+            # reads it (and push up whatever the last iteration left behind).
+            taiga_reconcile(lane_id, label, "before")
             log(label, f"firing {sibling} (iter {iters})")
             # Record the session in the board dir for task lanes so the active view can
             # render this lane's own session (avoids thrashing when lanes share a workdir).
@@ -1592,6 +1722,11 @@ def worker(label: str, lane_id: str, kind: str, stop_event: threading.Event,
             if response_text:
                 last_response = response_text
             log(label, f"{sibling} returned ({rc})")
+
+            # Push whatever this instance just claimed or edited up to Taiga now,
+            # rather than waiting for the next launch's pre-sync — so a lane that
+            # then pauses or stops still has its board reflected on Taiga.
+            taiga_reconcile(lane_id, label, "after")
 
             status = collect_statusline()
             if status:
@@ -1905,6 +2040,22 @@ def main():
               f"polling every {BOARD_WATCH_INTERVAL}s", flush=True)
     else:
         print("[harness] board-completion watcher off (no --zulip-script)", flush=True)
+
+    # Taiga edit watcher: sync a linked lane to Taiga shortly after its board files
+    # change, so mid-run claims/edits show up without waiting for the run to end.
+    try:
+        import taiga_sync as _ts
+        _taiga_configured = _ts.CONFIG_PATH.exists()
+    except Exception:
+        _taiga_configured = False
+    if _taiga_configured and TAIGA_WATCH_INTERVAL > 0:
+        threading.Thread(target=taiga_watch_loop,
+                         args=(TAIGA_WATCH_INTERVAL, TAIGA_WATCH_SETTLE),
+                         daemon=True).start()
+        print(f"[harness] taiga edit watcher on: linked lanes sync to Taiga after "
+              f"{TAIGA_WATCH_SETTLE}s quiet, polling every {TAIGA_WATCH_INTERVAL}s", flush=True)
+    else:
+        print("[harness] taiga edit watcher off (no taiga_config.json)", flush=True)
 
     if args.probe_interval > 0:
         print(f"[harness] running startup probe...", flush=True)

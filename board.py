@@ -306,7 +306,10 @@ the board, so anything you write here shows up there.
 
     ## Writeup
     (fill this in when done: findings, how the code works, and any assumptions
-     you made — this is what the human reads to understand what happened)
+     you made — this is what the human reads to understand what happened.
+     also include anything you're not confident about: guesses, shortcuts, and
+     spots where you weren't sure your approach was the right one — flagging
+     the shaky parts is as useful as the polished ones)
 
 ## Workflow
 
@@ -317,7 +320,9 @@ the board, so anything you write here shows up there.
 - **Log progress:** append to `## Progress` as you go, so the next you (and the
   human) can follow the thread.
 - **Finish:** set `status: done` and fill in `## Writeup` — findings, how the
-  code works, assumptions. Be honest about what's partial or unverified.
+  code works, assumptions. Be honest about what's partial or unverified, and
+  call out anything you're not confident about or suspect isn't quite the
+  right way to implement it.
 - **Commit:** once a task is done, commit your work with git
   (`git add -A && git commit -m "<what you did>"`) so the finished task and its
   writeup are checkpointed.
