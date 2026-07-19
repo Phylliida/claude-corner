@@ -6,6 +6,10 @@ __pycache__/
 # Persistent garden state lives here per-machine
 garden/garden.json
 
+# Taiga credentials + sync state (per-machine, never committed)
+taiga_config.json
+.taiga_token.json
+
 # Per-instance working directories
 runs/
 
